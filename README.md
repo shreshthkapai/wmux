@@ -71,8 +71,8 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 2 daemon
-skeleton:
+The current skeleton builds a small `wmux` executable with the Phase 3
+daemon-owned session manager:
 
 ```bash
 cmake -S . -B build
@@ -82,7 +82,6 @@ cmake --build build
 ./build/wmux server status
 ./build/wmux new -s finance
 ./build/wmux ls
-./build/wmux attach -t finance
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -91,10 +90,12 @@ ctest --test-dir build --output-on-failure
 
 On Windows, CMake will produce `wmux.exe`.
 
-Phase 2 uses Windows named pipes on native Windows. For development from WSL or
-Linux, the same IPC abstraction uses a Unix-domain socket fallback so daemon
-lifecycle behavior can be validated before ConPTY work begins. The Linux
-fallback is for development only; Windows named pipes remain the product target.
+Phase 3 uses Windows named pipes on native Windows and keeps session state in
+the daemon process. Sessions currently persist while the daemon is running.
+For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
+socket fallback so daemon lifecycle behavior can be validated before ConPTY
+work begins. The Linux fallback is for development only; Windows named pipes
+remain the product target.
 
 The build prefers installed `CLI11` and `spdlog` CMake packages. If they are not
 installed, configure with dependency fetching enabled:

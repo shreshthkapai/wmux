@@ -54,6 +54,7 @@ endif()
 
 set(WMUX_COMMON_SOURCES
   src/commands/commands.cpp
+  src/core/session_manager.cpp
   src/core/version.cpp
   src/ipc/protocol.cpp
 )
@@ -87,6 +88,7 @@ if(WMUX_BUILD_TESTS)
   add_executable(wmux_tests
     tests/command_parser_test.cpp
     tests/ipc_protocol_test.cpp
+    tests/session_manager_test.cpp
     ${WMUX_COMMON_SOURCES}
   )
   target_include_directories(wmux_tests PRIVATE include)

@@ -2,6 +2,7 @@
 
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/session_manager.hpp"
 
 #include <sstream>
 #include <string>
@@ -21,28 +22,110 @@
 namespace wmux {
 namespace {
 
-std::string placeholder_for_request(const IpcRequest& request) {
+std::string quoted(std::string_view value) {
+  std::ostringstream out;
+  out << "'" << value << "'";
+  return out.str();
+}
+
+std::string session_error_message(SessionError error, std::string_view name) {
   std::ostringstream out;
 
-  if (request.type == "DefaultSession") {
-    out << "wmux: interactive session startup is not implemented yet\n";
-  } else if (request.type == "NewSession") {
-    out << "wmux: would create session '" << request.session_name << "'\n";
-  } else if (request.type == "ListSessions") {
-    out << "wmux: would list sessions\n";
-  } else if (request.type == "AttachSession") {
-    out << "wmux: would attach to session '" << request.session_name << "'\n";
-  } else if (request.type == "RenameSession") {
-    out << "wmux: would rename session '" << request.target_name << "' to '"
-        << request.new_name << "'\n";
-  } else if (request.type == "KillSession") {
-    out << "wmux: would kill session '" << request.session_name << "'\n";
+  switch (error) {
+    case SessionError::EmptyName:
+      out << "wmux: session name cannot be empty\n";
+      break;
+    case SessionError::DuplicateName:
+      out << "wmux: session " << quoted(name) << " already exists\n";
+      break;
+    case SessionError::NotFound:
+      out << "wmux: session " << quoted(name) << " not found\n";
+      break;
+    case SessionError::None:
+      out << "wmux: session operation failed\n";
+      break;
   }
 
   return out.str();
 }
 
-std::string handle_request(std::string_view raw_request, bool& should_stop) {
+std::string handle_session_request(const IpcRequest& request, SessionManager& sessions) {
+  if (request.type == "DefaultSession") {
+    return make_response_json(true, "wmux: interactive session startup is not implemented yet\n");
+  }
+
+  if (request.type == "NewSession") {
+    const auto result = sessions.create_session(request.session_name);
+    if (!result.ok) {
+      return make_response_json(false, session_error_message(result.error, request.session_name));
+    }
+
+    std::ostringstream out;
+    out << "wmux: created session " << quoted(request.session_name) << "\n";
+    return make_response_json(true, out.str());
+  }
+
+  if (request.type == "ListSessions") {
+    const auto listed = sessions.list_sessions();
+    if (listed.empty()) {
+      return make_response_json(true, "wmux: no sessions\n");
+    }
+
+    std::ostringstream out;
+    for (const auto& session : listed) {
+      out << session.name << "\n";
+    }
+    return make_response_json(true, out.str());
+  }
+
+  if (request.type == "AttachSession") {
+    if (request.session_name.empty()) {
+      return make_response_json(false, session_error_message(SessionError::EmptyName, {}));
+    }
+
+    if (!sessions.has_session(request.session_name)) {
+      return make_response_json(
+          false, session_error_message(SessionError::NotFound, request.session_name));
+    }
+
+    std::ostringstream out;
+    out << "wmux: attach for session " << quoted(request.session_name)
+        << " is not implemented yet\n";
+    return make_response_json(true, out.str());
+  }
+
+  if (request.type == "RenameSession") {
+    const auto result = sessions.rename_session(request.target_name, request.new_name);
+    if (!result.ok) {
+      const auto name =
+          result.error == SessionError::DuplicateName ? request.new_name : request.target_name;
+      return make_response_json(false, session_error_message(result.error, name));
+    }
+
+    std::ostringstream out;
+    out << "wmux: renamed session " << quoted(request.target_name) << " to "
+        << quoted(request.new_name) << "\n";
+    return make_response_json(true, out.str());
+  }
+
+  if (request.type == "KillSession") {
+    const auto result = sessions.kill_session(request.session_name);
+    if (!result.ok) {
+      return make_response_json(false, session_error_message(result.error, request.session_name));
+    }
+
+    std::ostringstream out;
+    out << "wmux: killed session " << quoted(request.session_name) << "\n";
+    return make_response_json(true, out.str());
+  }
+
+  return {};
+}
+
+std::string handle_request(
+    std::string_view raw_request,
+    bool& should_stop,
+    SessionManager& sessions) {
   const auto request = parse_request_json(raw_request);
   if (!request) {
     return make_response_json(false, "wmux: malformed daemon request\n");
@@ -61,9 +144,9 @@ std::string handle_request(std::string_view raw_request, bool& should_stop) {
     return make_response_json(true, "wmux: daemon stopping\n");
   }
 
-  const auto placeholder = placeholder_for_request(*request);
-  if (!placeholder.empty()) {
-    return make_response_json(true, placeholder);
+  const auto session_response = handle_session_request(*request, sessions);
+  if (!session_response.empty()) {
+    return session_response;
   }
 
   return make_response_json(false, "wmux: daemon does not understand request\n");
@@ -101,6 +184,7 @@ bool read_request(HANDLE pipe, std::string& request) {
 
 int run_windows_daemon() {
   bool should_stop = false;
+  SessionManager sessions;
   const auto endpoint = widen(command_endpoint_name());
 
   while (!should_stop) {
@@ -123,7 +207,7 @@ int run_windows_daemon() {
     if (connected) {
       std::string request;
       if (read_request(pipe, request)) {
-        const auto response = handle_request(request, should_stop);
+        const auto response = handle_request(request, should_stop, sessions);
         DWORD bytes_written = 0;
         WriteFile(
             pipe,
@@ -289,6 +373,7 @@ int run_posix_daemon() {
   }
 
   bool should_stop = false;
+  SessionManager sessions;
   while (!should_stop) {
     Fd client{accept(server.get(), nullptr, nullptr)};
     if (!client) {
@@ -300,7 +385,7 @@ int run_posix_daemon() {
 
     std::string request;
     if (read_request(client.get(), request)) {
-      const auto response = handle_request(request, should_stop);
+      const auto response = handle_request(request, should_stop, sessions);
       write_all(client.get(), response);
     }
   }

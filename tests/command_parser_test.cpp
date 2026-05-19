@@ -6,6 +6,7 @@
 #include <vector>
 
 void run_ipc_protocol_tests();
+void run_session_manager_tests();
 
 namespace {
 
@@ -142,4 +143,5 @@ int main() {
   expects_placeholder_response();
   expects_unknown_command_error();
   run_ipc_protocol_tests();
+  run_session_manager_tests();
 }

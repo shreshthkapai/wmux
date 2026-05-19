@@ -1,0 +1,7 @@
+C:\Users\shres\Desktop\wmux\tests\command_parser_test.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\command_parser_test.obj
+C:\Users\shres\Desktop\wmux\tests\ipc_protocol_test.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\ipc_protocol_test.obj
+C:\Users\shres\Desktop\wmux\tests\session_manager_test.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\session_manager_test.obj
+C:\Users\shres\Desktop\wmux\src\commands\commands.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\commands.obj
+C:\Users\shres\Desktop\wmux\src\core\session_manager.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\session_manager.obj
+C:\Users\shres\Desktop\wmux\src\core\version.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\version.obj
+C:\Users\shres\Desktop\wmux\src\ipc\protocol.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux_tests.dir\Debug\protocol.obj

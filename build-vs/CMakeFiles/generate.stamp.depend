@@ -1,0 +1,53 @@
+# CMake generation dependency list for this directory.
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDependentOption.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeFindDependencyMacro.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CheckCXXSourceCompiles.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CheckIncludeFileCXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CheckLibraryExists.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/ExternalProject/shared_internal_commands.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/FetchContent.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/FindPackageMessage.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/FindThreads.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Internal/CheckSourceCompiles.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Linker/MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake
+C:/Users/shres/Desktop/wmux/CMakeLists.txt
+C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/4.3.2/CMakeCXXCompiler.cmake
+C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/4.3.2/CMakeRCCompiler.cmake
+C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/4.3.2/CMakeSystem.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/cli11/CLI11Config-debug.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/cli11/CLI11Config-release.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/cli11/CLI11Config.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/cli11/CLI11ConfigVersion.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/fmt/fmt-config-version.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/fmt/fmt-config.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/fmt/fmt-targets-debug.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/fmt/fmt-targets-release.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/fmt/fmt-targets.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/spdlog/spdlogConfig.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/spdlog/spdlogConfigTargets-debug.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/spdlog/spdlogConfigTargets-release.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/spdlog/spdlogConfigTargets.cmake
+C:/Users/shres/dev/vcpkg/installed/x64-windows/share/spdlog/spdlogConfigVersion.cmake
+C:/Users/shres/dev/vcpkg/scripts/buildsystems/vcpkg.cmake

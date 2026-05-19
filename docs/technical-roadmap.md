@@ -198,6 +198,15 @@ Current implementation notes:
 - Prevent duplicate names
 - Keep sessions alive while daemon runs
 
+Current implementation notes:
+
+- Session state is daemon-owned and in-memory.
+- `wmux new -s <name>`, `wmux ls`, `wmux rename-session -t <old> <new>`,
+  and `wmux kill-session -t <name>` now mutate daemon state.
+- Duplicate names are rejected by the daemon, not only by client-side parsing.
+- Session state intentionally lasts only for the daemon lifetime until process
+  persistence is introduced with ConPTY-backed panes.
+
 ### Phase 4: First ConPTY Shell
 
 - Add `PtyProcess` abstraction
