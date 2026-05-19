@@ -16,10 +16,16 @@
     <ClCompile Include="C:\Users\shres\Desktop\wmux\src\ipc\protocol.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="C:\Users\shres\Desktop\wmux\src\client\attach_client.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="C:\Users\shres\Desktop\wmux\src\daemon\daemon.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="C:\Users\shres\Desktop\wmux\src\ipc\transport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\shres\Desktop\wmux\src\pty\pty_process.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

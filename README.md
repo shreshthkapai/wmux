@@ -71,8 +71,8 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 3
-daemon-owned session manager:
+The current skeleton builds a small `wmux` executable with the Phase 4
+daemon-owned ConPTY shell path:
 
 ```bash
 cmake -S . -B build
@@ -82,6 +82,7 @@ cmake --build build
 ./build/wmux server status
 ./build/wmux new -s finance
 ./build/wmux ls
+./build/wmux attach -t finance
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -90,8 +91,16 @@ ctest --test-dir build --output-on-failure
 
 On Windows, CMake will produce `wmux.exe`.
 
-Phase 3 uses Windows named pipes on native Windows and keeps session state in
-the daemon process. Sessions currently persist while the daemon is running.
+Phase 4 uses Windows named pipes on native Windows and keeps session state,
+ConPTY handles, shell processes, and a bounded recent output buffer in the
+daemon process. `wmux new -s <name>` starts a daemon-owned
+`powershell.exe -NoLogo -NoProfile` shell, and `wmux attach -t <name>` opens a
+streaming attach connection to it.
+
+Interactive attach is intentionally still raw passthrough. It is good enough to
+prove ConPTY process ownership and first shell output, but the richer terminal
+model, resize handling, detach polish, and pane rendering come in later phases.
+
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY
 work begins. The Linux fallback is for development only; Windows named pipes

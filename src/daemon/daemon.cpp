@@ -2,11 +2,20 @@
 
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/pty_process.hpp"
 #include "wmux/session_manager.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -21,6 +30,18 @@
 
 namespace wmux {
 namespace {
+
+#ifdef _WIN32
+constexpr std::string_view kDefaultShell = "powershell.exe -NoLogo -NoProfile";
+constexpr short kInitialPtyColumns = 120;
+constexpr short kInitialPtyRows = 30;
+#endif
+
+struct DaemonState {
+  std::mutex mutex;
+  SessionManager sessions;
+  std::unordered_map<std::string, std::shared_ptr<PtyProcess>> shells;
+};
 
 std::string quoted(std::string_view value) {
   std::ostringstream out;
@@ -49,102 +70,153 @@ std::string session_error_message(SessionError error, std::string_view name) {
   return out.str();
 }
 
-std::string handle_session_request(const IpcRequest& request, SessionManager& sessions) {
+std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
+  if (request.session_name.empty()) {
+    return make_response_json(false, session_error_message(SessionError::EmptyName, {}));
+  }
+
+  {
+    std::lock_guard lock(state.mutex);
+    if (state.sessions.has_session(request.session_name)) {
+      return make_response_json(
+          false, session_error_message(SessionError::DuplicateName, request.session_name));
+    }
+  }
+
+  std::shared_ptr<PtyProcess> shell_process;
+#ifdef _WIN32
+  auto shell = PtyProcess::start(kDefaultShell, kInitialPtyColumns, kInitialPtyRows);
+  if (!shell.process) {
+    return make_response_json(false, shell.error);
+  }
+  shell_process = std::move(shell.process);
+#endif
+  {
+    std::lock_guard lock(state.mutex);
+    const auto result = state.sessions.create_session(request.session_name);
+    if (!result.ok) {
+      if (shell_process) {
+        shell_process->terminate();
+      }
+      return make_response_json(false, session_error_message(result.error, request.session_name));
+    }
+
+    if (shell_process) {
+      state.shells[request.session_name] = std::move(shell_process);
+    }
+  }
+
+  std::ostringstream out;
+  out << "wmux: created session " << quoted(request.session_name) << "\n";
+  return make_response_json(true, out.str());
+}
+
+std::string handle_list_sessions(DaemonState& state) {
+  std::lock_guard lock(state.mutex);
+  const auto listed = state.sessions.list_sessions();
+  if (listed.empty()) {
+    return make_response_json(true, "wmux: no sessions\n");
+  }
+
+  std::ostringstream out;
+  for (const auto& session : listed) {
+    out << session.name << "\n";
+  }
+  return make_response_json(true, out.str());
+}
+
+std::string handle_rename_session(const IpcRequest& request, DaemonState& state) {
+  std::lock_guard lock(state.mutex);
+  const auto result = state.sessions.rename_session(request.target_name, request.new_name);
+  if (!result.ok) {
+    const auto name =
+        result.error == SessionError::DuplicateName ? request.new_name : request.target_name;
+    return make_response_json(false, session_error_message(result.error, name));
+  }
+
+  auto node = state.shells.extract(request.target_name);
+  if (!node.empty()) {
+    node.key() = request.new_name;
+    state.shells.insert(std::move(node));
+  }
+
+  std::ostringstream out;
+  out << "wmux: renamed session " << quoted(request.target_name) << " to "
+      << quoted(request.new_name) << "\n";
+  return make_response_json(true, out.str());
+}
+
+std::string handle_kill_session(const IpcRequest& request, DaemonState& state) {
+  std::shared_ptr<PtyProcess> killed_shell;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto result = state.sessions.kill_session(request.session_name);
+    if (!result.ok) {
+      return make_response_json(false, session_error_message(result.error, request.session_name));
+    }
+
+    const auto shell = state.shells.find(request.session_name);
+    if (shell != state.shells.end()) {
+      killed_shell = std::move(shell->second);
+      state.shells.erase(shell);
+    }
+  }
+
+  if (killed_shell) {
+    killed_shell->terminate();
+  }
+
+  std::ostringstream out;
+  out << "wmux: killed session " << quoted(request.session_name) << "\n";
+  return make_response_json(true, out.str());
+}
+
+std::string handle_session_request(const IpcRequest& request, DaemonState& state) {
   if (request.type == "DefaultSession") {
     return make_response_json(true, "wmux: interactive session startup is not implemented yet\n");
   }
 
   if (request.type == "NewSession") {
-    const auto result = sessions.create_session(request.session_name);
-    if (!result.ok) {
-      return make_response_json(false, session_error_message(result.error, request.session_name));
-    }
-
-    std::ostringstream out;
-    out << "wmux: created session " << quoted(request.session_name) << "\n";
-    return make_response_json(true, out.str());
+    return handle_new_session(request, state);
   }
 
   if (request.type == "ListSessions") {
-    const auto listed = sessions.list_sessions();
-    if (listed.empty()) {
-      return make_response_json(true, "wmux: no sessions\n");
-    }
-
-    std::ostringstream out;
-    for (const auto& session : listed) {
-      out << session.name << "\n";
-    }
-    return make_response_json(true, out.str());
+    return handle_list_sessions(state);
   }
 
   if (request.type == "AttachSession") {
-    if (request.session_name.empty()) {
-      return make_response_json(false, session_error_message(SessionError::EmptyName, {}));
-    }
-
-    if (!sessions.has_session(request.session_name)) {
-      return make_response_json(
-          false, session_error_message(SessionError::NotFound, request.session_name));
-    }
-
-    std::ostringstream out;
-    out << "wmux: attach for session " << quoted(request.session_name)
-        << " is not implemented yet\n";
-    return make_response_json(true, out.str());
+    return make_response_json(false, "wmux: attach requires the streaming client transport\n");
   }
 
   if (request.type == "RenameSession") {
-    const auto result = sessions.rename_session(request.target_name, request.new_name);
-    if (!result.ok) {
-      const auto name =
-          result.error == SessionError::DuplicateName ? request.new_name : request.target_name;
-      return make_response_json(false, session_error_message(result.error, name));
-    }
-
-    std::ostringstream out;
-    out << "wmux: renamed session " << quoted(request.target_name) << " to "
-        << quoted(request.new_name) << "\n";
-    return make_response_json(true, out.str());
+    return handle_rename_session(request, state);
   }
 
   if (request.type == "KillSession") {
-    const auto result = sessions.kill_session(request.session_name);
-    if (!result.ok) {
-      return make_response_json(false, session_error_message(result.error, request.session_name));
-    }
-
-    std::ostringstream out;
-    out << "wmux: killed session " << quoted(request.session_name) << "\n";
-    return make_response_json(true, out.str());
+    return handle_kill_session(request, state);
   }
 
   return {};
 }
 
 std::string handle_request(
-    std::string_view raw_request,
+    const IpcRequest& request,
     bool& should_stop,
-    SessionManager& sessions) {
-  const auto request = parse_request_json(raw_request);
-  if (!request) {
-    return make_response_json(false, "wmux: malformed daemon request\n");
-  }
-
-  if (request->type == "Ping") {
+    DaemonState& state) {
+  if (request.type == "Ping") {
     return make_response_json(true, "wmux: daemon is running\n");
   }
 
-  if (request->type == "ServerStatus") {
+  if (request.type == "ServerStatus") {
     return make_response_json(true, "wmux: daemon is running\n");
   }
 
-  if (request->type == "ServerStop") {
+  if (request.type == "ServerStop") {
     should_stop = true;
     return make_response_json(true, "wmux: daemon stopping\n");
   }
 
-  const auto session_response = handle_session_request(*request, sessions);
+  const auto session_response = handle_session_request(request, state);
   if (!session_response.empty()) {
     return session_response;
   }
@@ -182,9 +254,133 @@ bool read_request(HANDLE pipe, std::string& request) {
   return !request.empty();
 }
 
+bool write_all(HANDLE pipe, std::string_view bytes) {
+  while (!bytes.empty()) {
+    const auto bytes_to_write =
+        static_cast<DWORD>(std::min<std::size_t>(bytes.size(), 64 * 1024));
+    DWORD bytes_written = 0;
+    const BOOL ok = WriteFile(pipe, bytes.data(), bytes_to_write, &bytes_written, nullptr);
+    if (!ok || bytes_written == 0) {
+      return false;
+    }
+
+    bytes.remove_prefix(bytes_written);
+  }
+
+  return true;
+}
+
+std::shared_ptr<PtyProcess> shell_for_attach(
+    DaemonState& state,
+    const IpcRequest& request,
+    std::string& error) {
+  if (request.session_name.empty()) {
+    error = session_error_message(SessionError::EmptyName, {});
+    return {};
+  }
+
+  std::lock_guard lock(state.mutex);
+  if (!state.sessions.has_session(request.session_name)) {
+    error = session_error_message(SessionError::NotFound, request.session_name);
+    return {};
+  }
+
+  const auto shell = state.shells.find(request.session_name);
+  if (shell == state.shells.end() || !shell->second) {
+    error = "wmux: session has no shell process\n";
+    return {};
+  }
+
+  return shell->second;
+}
+
+void close_pipe(HANDLE pipe) {
+  FlushFileBuffers(pipe);
+  DisconnectNamedPipe(pipe);
+  CloseHandle(pipe);
+}
+
+void run_attach_connection(HANDLE pipe, std::shared_ptr<PtyProcess> shell) {
+  if (!write_all(pipe, make_response_json(true, ""))) {
+    close_pipe(pipe);
+    return;
+  }
+
+  const auto snapshot = shell->output_snapshot();
+  if (!snapshot.bytes.empty() && !write_all(pipe, snapshot.bytes)) {
+    close_pipe(pipe);
+    return;
+  }
+
+  std::atomic_bool stop_requested{false};
+  auto next_sequence = snapshot.next_sequence;
+  std::thread output_thread{[&] {
+    while (!stop_requested) {
+      const auto output = shell->wait_for_output(next_sequence, std::chrono::milliseconds{100});
+      if (!output.bytes.empty()) {
+        if (!write_all(pipe, output.bytes)) {
+          stop_requested = true;
+          break;
+        }
+        next_sequence = output.next_sequence;
+      }
+
+      if (!output.alive && output.bytes.empty()) {
+        stop_requested = true;
+        break;
+      }
+    }
+  }};
+
+  char buffer[4096];
+  while (!stop_requested) {
+    DWORD bytes_read = 0;
+    const BOOL ok = ReadFile(pipe, buffer, static_cast<DWORD>(sizeof(buffer)), &bytes_read, nullptr);
+    if (!ok || bytes_read == 0) {
+      break;
+    }
+
+    if (!shell->write_input(std::string_view{buffer, bytes_read})) {
+      break;
+    }
+  }
+
+  stop_requested = true;
+  if (output_thread.joinable()) {
+    output_thread.join();
+  }
+
+  close_pipe(pipe);
+}
+
+enum class AttachDispatch {
+  NotAttach,
+  Completed,
+  HandedOff,
+};
+
+AttachDispatch dispatch_attach_connection(
+    HANDLE pipe,
+    const IpcRequest& request,
+    DaemonState& state) {
+  if (request.type != "AttachSession") {
+    return AttachDispatch::NotAttach;
+  }
+
+  std::string error;
+  auto shell = shell_for_attach(state, request, error);
+  if (!shell) {
+    write_all(pipe, make_response_json(false, error));
+    return AttachDispatch::Completed;
+  }
+
+  std::thread{[pipe, shell = std::move(shell)] { run_attach_connection(pipe, shell); }}.detach();
+  return AttachDispatch::HandedOff;
+}
+
 int run_windows_daemon() {
   bool should_stop = false;
-  SessionManager sessions;
+  DaemonState state;
   const auto endpoint = widen(command_endpoint_name());
 
   while (!should_stop) {
@@ -192,7 +388,7 @@ int run_windows_daemon() {
         endpoint.c_str(),
         PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,
+        PIPE_UNLIMITED_INSTANCES,
         4096,
         4096,
         0,
@@ -207,20 +403,26 @@ int run_windows_daemon() {
     if (connected) {
       std::string request;
       if (read_request(pipe, request)) {
-        const auto response = handle_request(request, should_stop, sessions);
-        DWORD bytes_written = 0;
-        WriteFile(
-            pipe,
-            response.data(),
-            static_cast<DWORD>(response.size()),
-            &bytes_written,
-            nullptr);
+        const auto parsed = parse_request_json(request);
+        if (!parsed) {
+          write_all(pipe, make_response_json(false, "wmux: malformed daemon request\n"));
+        } else {
+          const auto attach_dispatch = dispatch_attach_connection(pipe, *parsed, state);
+          if (attach_dispatch == AttachDispatch::HandedOff) {
+            pipe = INVALID_HANDLE_VALUE;
+            continue;
+          }
+
+          if (attach_dispatch == AttachDispatch::NotAttach) {
+            write_all(pipe, handle_request(*parsed, should_stop, state));
+          }
+        }
       }
     }
 
-    FlushFileBuffers(pipe);
-    DisconnectNamedPipe(pipe);
-    CloseHandle(pipe);
+    if (pipe != INVALID_HANDLE_VALUE) {
+      close_pipe(pipe);
+    }
   }
 
   return 0;
@@ -373,7 +575,7 @@ int run_posix_daemon() {
   }
 
   bool should_stop = false;
-  SessionManager sessions;
+  DaemonState state;
   while (!should_stop) {
     Fd client{accept(server.get(), nullptr, nullptr)};
     if (!client) {
@@ -385,7 +587,9 @@ int run_posix_daemon() {
 
     std::string request;
     if (read_request(client.get(), request)) {
-      const auto response = handle_request(request, should_stop, sessions);
+      const auto parsed = parse_request_json(request);
+      const auto response = parsed ? handle_request(*parsed, should_stop, state)
+                                   : make_response_json(false, "wmux: malformed daemon request\n");
       write_all(client.get(), response);
     }
   }

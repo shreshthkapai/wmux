@@ -3,5 +3,7 @@ C:\Users\shres\Desktop\wmux\src\commands\commands.cpp;C:\Users\shres\Desktop\wmu
 C:\Users\shres\Desktop\wmux\src\core\session_manager.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\session_manager.obj
 C:\Users\shres\Desktop\wmux\src\core\version.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\version.obj
 C:\Users\shres\Desktop\wmux\src\ipc\protocol.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\protocol.obj
+C:\Users\shres\Desktop\wmux\src\client\attach_client.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\attach_client.obj
 C:\Users\shres\Desktop\wmux\src\daemon\daemon.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\daemon.obj
 C:\Users\shres\Desktop\wmux\src\ipc\transport.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\transport.obj
+C:\Users\shres\Desktop\wmux\src\pty\pty_process.cpp;C:\Users\shres\Desktop\wmux\build-vs\wmux.dir\Debug\pty_process.obj

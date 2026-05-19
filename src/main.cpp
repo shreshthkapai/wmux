@@ -1,3 +1,4 @@
+#include "wmux/client.hpp"
 #include "wmux/commands.hpp"
 #include "wmux/daemon.hpp"
 #include "wmux/ipc_protocol.hpp"
@@ -40,6 +41,10 @@ int main(int argc, char** argv) {
       if (!wmux::ensure_daemon_running(std::filesystem::path{executable_name}, error)) {
         std::cerr << error;
         return 1;
+      }
+
+      if (command.kind == wmux::CommandKind::AttachSession) {
+        return wmux::run_attach_client(command);
       }
 
       const auto response = wmux::send_ipc_request(wmux::make_command_request_json(command));

@@ -185,7 +185,7 @@ Current implementation notes:
 - Native Windows builds use a named pipe endpoint.
 - WSL/Linux development builds use a Unix-domain socket fallback.
 - Command IPC is line-delimited JSON for low-volume request/response commands.
-- Attach streaming IPC is intentionally not implemented yet.
+- Attach now has a separate streaming pipe path on Windows.
 - Existing Phase 1 commands round-trip through the daemon and still return
   placeholder responses until Phase 3 session state exists.
 
@@ -205,7 +205,8 @@ Current implementation notes:
   and `wmux kill-session -t <name>` now mutate daemon state.
 - Duplicate names are rejected by the daemon, not only by client-side parsing.
 - Session state intentionally lasts only for the daemon lifetime until process
-  persistence is introduced with ConPTY-backed panes.
+  recovery is introduced. ConPTY-backed shell persistence now exists while the
+  daemon is running.
 
 ### Phase 4: First ConPTY Shell
 
@@ -216,6 +217,20 @@ Current implementation notes:
 - Read output asynchronously
 - Send input to shell
 
+Current implementation notes:
+
+- `PtyProcess` owns the ConPTY handle, input/output pipes, child process handle,
+  reader thread, and bounded recent output chunks.
+- `wmux new -s <name>` starts `powershell.exe -NoLogo -NoProfile` under the
+  daemon and stores it by session name.
+- `wmux attach -t <name>` uses a long-lived named-pipe connection. The daemon
+  replays recent buffered output and then streams live ConPTY output while
+  forwarding client input to the shell.
+- The attach stream is still raw byte passthrough. A real Windows terminal
+  emulator is expected to handle ConPTY terminal negotiation for this phase.
+- This phase proves daemon-owned shell lifetime and first attach output. It is
+  not the final pane renderer or terminal parser.
+
 ### Phase 5: Raw Interactive Attach
 
 - Put client terminal into raw mode
@@ -224,6 +239,14 @@ Current implementation notes:
 - Detect prefix key
 - Implement `Ctrl+b d` detach
 - Restore terminal state on client exit
+
+Current overlap from Phase 4:
+
+- The client already switches the local console into a raw-ish VT input/output
+  mode and restores it on exit.
+- `Ctrl+b d` currently detaches from the streaming attach connection.
+- Phase 5 should harden this path with better terminal-size propagation,
+  explicit detach status, redirected-stdin behavior, and crash cleanup tests.
 
 This proves ConPTY, IPC, daemon lifetime, input routing, detach, and reattach
 before pane rendering becomes complex.

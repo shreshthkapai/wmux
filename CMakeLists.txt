@@ -60,8 +60,10 @@ set(WMUX_COMMON_SOURCES
 )
 
 set(WMUX_RUNTIME_SOURCES
+  src/client/attach_client.cpp
   src/daemon/daemon.cpp
   src/ipc/transport.cpp
+  src/pty/pty_process.cpp
 )
 
 add_executable(wmux
@@ -75,6 +77,10 @@ target_link_libraries(wmux PRIVATE "${WMUX_CLI11_TARGET}" "${WMUX_SPDLOG_TARGET}
 target_compile_definitions(wmux PRIVATE
   WMUX_VERSION="${PROJECT_VERSION}"
 )
+
+if(WIN32)
+  target_compile_definitions(wmux PRIVATE _WIN32_WINNT=0x0A00)
+endif()
 
 if(MSVC)
   target_compile_options(wmux PRIVATE /W4 /permissive-)
@@ -96,6 +102,10 @@ if(WMUX_BUILD_TESTS)
   target_compile_definitions(wmux_tests PRIVATE
     WMUX_VERSION="${PROJECT_VERSION}"
   )
+
+  if(WIN32)
+    target_compile_definitions(wmux_tests PRIVATE _WIN32_WINNT=0x0A00)
+  endif()
 
   if(MSVC)
     target_compile_options(wmux_tests PRIVATE /W4 /permissive-)
