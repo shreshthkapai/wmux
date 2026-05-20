@@ -38,6 +38,7 @@ class PtyProcess final {
   static PtyProcessResult start(std::string_view command_line, short columns, short rows);
 
   bool write_input(std::string_view bytes);
+  bool resize(short columns, short rows);
   PtyOutputSnapshot output_snapshot() const;
   PtyOutputChunk wait_for_output(
       std::uint64_t next_sequence,

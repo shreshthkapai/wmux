@@ -42,6 +42,10 @@ Use RAII for all Windows resources:
 Avoid raw owning pointers. Prefer value types, smart pointers with clear
 ownership, and small wrapper types such as `unique_handle`.
 
+Runtime ownership should be keyed by stable IDs, not mutable display names.
+Session, window, pane, and client names are lookup metadata. Renaming a visible
+object must not move or recreate process ownership.
+
 ## Concurrency Model
 
 Use one explicit concurrency model.
@@ -155,11 +159,25 @@ Phase 2 command IPC is intentionally small and conservative:
 - Keep JSON on command traffic only; do not use per-keystroke JSON for attach
   streaming.
 
+## Attach Streaming IPC
+
+Attach streaming must keep shell data and lifecycle/control data separate.
+
+- Use a dedicated attach transport endpoint for long-lived interactive streams.
+- Use bounded framed messages for client input, detach, resize, mouse, and
+  future render events.
+- Treat intentional detach differently from broken pipe, malformed protocol,
+  session kill, and server shutdown.
+- Track active clients by stable client ID so cleanup paths can disconnect them
+  deliberately.
+- Do not parse JSON per keystroke.
+
 ## Stability Gates
 
 Each implementation phase should include local validation. Early gates should
 include:
 
+- repeated session create/kill cycles without leaked shell processes
 - 100 attach/detach cycles without handle leaks
 - client crash does not kill daemon
 - terminal state restores after client exit
@@ -183,6 +201,7 @@ Use fast unit tests for pure logic:
 Use integration tests for Windows behavior:
 
 - ConPTY process spawn
+- session kill cleanup with no leaked daemon-owned shell processes
 - input/output round trips
 - resizing pseudo consoles
 - attach/detach
@@ -191,6 +210,7 @@ Use integration tests for Windows behavior:
 
 Use stress tests for real-world pressure:
 
+- repeated session create/kill
 - huge output
 - long-running processes
 - many panes

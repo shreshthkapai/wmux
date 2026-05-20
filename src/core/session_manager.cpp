@@ -1,25 +1,16 @@
 #include "wmux/session_manager.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace wmux {
-
-std::optional<std::size_t> SessionManager::find_index(std::string_view name) const {
-  for (std::size_t i = 0; i < sessions_.size(); ++i) {
-    if (sessions_[i].name == name) {
-      return i;
-    }
-  }
-
-  return std::nullopt;
-}
 
 SessionOperationResult SessionManager::create_session(std::string name) {
   if (name.empty()) {
     return {false, SessionError::EmptyName};
   }
 
-  if (find_index(name)) {
+  if (name_index_.contains(name)) {
     return {false, SessionError::DuplicateName};
   }
 
@@ -27,9 +18,13 @@ SessionOperationResult SessionManager::create_session(std::string name) {
   session.id = next_id_++;
   session.name = std::move(name);
   session.created_at = std::chrono::system_clock::now();
-  sessions_.push_back(std::move(session));
 
-  return {true, SessionError::None};
+  const auto id = session.id;
+  name_index_.emplace(session.name, id);
+  sessions_.emplace(id, std::move(session));
+  order_.push_back(id);
+
+  return {true, SessionError::None, id};
 }
 
 SessionOperationResult SessionManager::rename_session(
@@ -39,17 +34,27 @@ SessionOperationResult SessionManager::rename_session(
     return {false, SessionError::EmptyName};
   }
 
-  const auto current_index = find_index(current_name);
-  if (!current_index) {
+  const auto id = session_id_for_name(current_name);
+  if (!id) {
     return {false, SessionError::NotFound};
   }
 
-  if (current_name != new_name && find_index(new_name)) {
+  const auto session = sessions_.find(*id);
+  if (session == sessions_.end()) {
+    return {false, SessionError::NotFound};
+  }
+
+  if (session->second.name != new_name && name_index_.contains(new_name)) {
     return {false, SessionError::DuplicateName};
   }
 
-  sessions_[*current_index].name = std::move(new_name);
-  return {true, SessionError::None};
+  if (session->second.name != new_name) {
+    name_index_.erase(session->second.name);
+    session->second.name = std::move(new_name);
+    name_index_.emplace(session->second.name, *id);
+  }
+
+  return {true, SessionError::None, *id};
 }
 
 SessionOperationResult SessionManager::kill_session(std::string_view name) {
@@ -57,21 +62,49 @@ SessionOperationResult SessionManager::kill_session(std::string_view name) {
     return {false, SessionError::EmptyName};
   }
 
-  const auto index = find_index(name);
-  if (!index) {
+  const auto id = session_id_for_name(name);
+  if (!id) {
     return {false, SessionError::NotFound};
   }
 
-  sessions_.erase(sessions_.begin() + static_cast<std::ptrdiff_t>(*index));
-  return {true, SessionError::None};
+  const auto session = sessions_.find(*id);
+  if (session != sessions_.end()) {
+    name_index_.erase(session->second.name);
+    sessions_.erase(session);
+  }
+
+  order_.erase(std::remove(order_.begin(), order_.end(), *id), order_.end());
+  return {true, SessionError::None, *id};
 }
 
 bool SessionManager::has_session(std::string_view name) const {
-  return find_index(name).has_value();
+  return session_id_for_name(name).has_value();
+}
+
+std::optional<SessionId> SessionManager::session_id_for_name(std::string_view name) const {
+  const auto found = name_index_.find(std::string{name});
+  if (found == name_index_.end()) {
+    return std::nullopt;
+  }
+
+  return found->second;
+}
+
+std::size_t SessionManager::session_count() const {
+  return sessions_.size();
 }
 
 std::vector<SessionSummary> SessionManager::list_sessions() const {
-  return sessions_;
+  std::vector<SessionSummary> listed;
+  listed.reserve(order_.size());
+  for (const auto id : order_) {
+    const auto session = sessions_.find(id);
+    if (session != sessions_.end()) {
+      listed.push_back(session->second);
+    }
+  }
+
+  return listed;
 }
 
 }  // namespace wmux

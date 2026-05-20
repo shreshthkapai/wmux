@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -19,6 +21,14 @@ namespace wmux {
 namespace {
 
 #ifdef _WIN32
+
+constexpr auto kAttachConnectAttempts = 40;
+constexpr auto kAttachConnectSleep = std::chrono::milliseconds{50};
+
+struct TerminalSize {
+  std::uint16_t columns{0};
+  std::uint16_t rows{0};
+};
 
 class UniqueHandle {
  public:
@@ -98,6 +108,28 @@ class ConsoleModeGuard {
   bool active_{false};
 };
 
+bool valid_handle(HANDLE handle) {
+  return handle != nullptr && handle != INVALID_HANDLE_VALUE;
+}
+
+std::uint16_t clamp_terminal_dimension(int value) {
+  if (value <= 0) {
+    return 0;
+  }
+  return static_cast<std::uint16_t>(std::min(value, 32767));
+}
+
+TerminalSize current_terminal_size(HANDLE output) {
+  CONSOLE_SCREEN_BUFFER_INFO info{};
+  if (!GetConsoleScreenBufferInfo(output, &info)) {
+    return {};
+  }
+
+  const int columns = info.srWindow.Right - info.srWindow.Left + 1;
+  const int rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+  return {clamp_terminal_dimension(columns), clamp_terminal_dimension(rows)};
+}
+
 std::wstring widen(std::string_view value) {
   if (value.empty()) {
     return {};
@@ -128,19 +160,9 @@ bool write_all(HANDLE handle, std::string_view bytes) {
 }
 
 bool connect_pipe(UniqueHandle& pipe) {
-  const auto endpoint = widen(command_endpoint_name());
-  HANDLE raw_pipe = CreateFileW(
-      endpoint.c_str(),
-      GENERIC_READ | GENERIC_WRITE,
-      0,
-      nullptr,
-      OPEN_EXISTING,
-      0,
-      nullptr);
-
-  if (raw_pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY) {
-    WaitNamedPipeW(endpoint.c_str(), 1000);
-    raw_pipe = CreateFileW(
+  const auto endpoint = widen(attach_endpoint_name());
+  for (int attempt = 0; attempt < kAttachConnectAttempts; ++attempt) {
+    HANDLE raw_pipe = CreateFileW(
         endpoint.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0,
@@ -148,14 +170,38 @@ bool connect_pipe(UniqueHandle& pipe) {
         OPEN_EXISTING,
         0,
         nullptr);
+
+    if (raw_pipe != INVALID_HANDLE_VALUE) {
+      pipe.reset(raw_pipe);
+      return true;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_PIPE_BUSY) {
+      WaitNamedPipeW(endpoint.c_str(), static_cast<DWORD>(kAttachConnectSleep.count()));
+      continue;
+    }
+
+    std::this_thread::sleep_for(kAttachConnectSleep);
   }
 
-  if (raw_pipe == INVALID_HANDLE_VALUE) {
-    return false;
+  return false;
+}
+
+bool write_attach_frame(HANDLE pipe, std::string_view frame) {
+  return write_all(pipe, frame);
+}
+
+bool send_attach_input(HANDLE pipe, std::string_view bytes) {
+  if (bytes.empty()) {
+    return true;
   }
 
-  pipe.reset(raw_pipe);
-  return true;
+  return write_attach_frame(pipe, make_attach_input_frame(bytes));
+}
+
+bool send_attach_detach(HANDLE pipe) {
+  return write_attach_frame(pipe, make_attach_detach_frame());
 }
 
 bool read_response_line(HANDLE pipe, std::string& response) {
@@ -185,9 +231,10 @@ bool send_processed_input(
     if (prefix_pending) {
       prefix_pending = false;
       if (byte == 'd') {
+        const bool sent = send_attach_detach(pipe);
         stop_requested = true;
         SetEvent(stop_event);
-        return true;
+        return sent;
       }
 
       to_send.push_back('\x02');
@@ -203,7 +250,7 @@ bool send_processed_input(
     to_send.push_back(byte);
   }
 
-  return to_send.empty() || write_all(pipe, to_send);
+  return send_attach_input(pipe, to_send);
 }
 
 void stream_output(HANDLE pipe, HANDLE output, std::atomic_bool& stop_requested, HANDLE stop_event) {
@@ -231,13 +278,29 @@ void stream_output(HANDLE pipe, HANDLE output, std::atomic_bool& stop_requested,
 
 int run_attach_client(const CommandLine& command) {
 #ifdef _WIN32
-  UniqueHandle pipe;
-  if (!connect_pipe(pipe)) {
-    std::cerr << "wmux: daemon is not running\n";
+  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (!valid_handle(input) || !valid_handle(output)) {
+    std::cerr << "wmux: attach requires valid standard input and output handles\n";
     return 1;
   }
 
-  if (!write_all(pipe.get(), make_command_request_json(command))) {
+  ConsoleModeGuard input_guard{input};
+  ConsoleModeGuard output_guard{output};
+  if (!input_guard.active() || !output_guard.active()) {
+    std::cerr << "wmux: attach requires an interactive Windows console\n";
+    return 1;
+  }
+
+  const auto size = current_terminal_size(output);
+
+  UniqueHandle pipe;
+  if (!connect_pipe(pipe)) {
+    std::cerr << "wmux: daemon attach endpoint is not running\n";
+    return 1;
+  }
+
+  if (!write_all(pipe.get(), make_attach_request_json(command, size.columns, size.rows))) {
     std::cerr << "wmux: failed to send attach request\n";
     return 1;
   }
@@ -259,24 +322,27 @@ int run_attach_client(const CommandLine& command) {
     return 1;
   }
 
-  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-  ConsoleModeGuard input_guard{input};
-  ConsoleModeGuard output_guard{output};
-
-  if (input_guard.active()) {
+  {
     DWORD mode = input_guard.original_mode();
     mode &= ~ENABLE_ECHO_INPUT;
     mode &= ~ENABLE_LINE_INPUT;
     mode &= ~ENABLE_PROCESSED_INPUT;
+    mode &= ~ENABLE_QUICK_EDIT_MODE;
+    mode |= ENABLE_EXTENDED_FLAGS;
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-    input_guard.set_mode(mode);
+    if (!input_guard.set_mode(mode)) {
+      std::cerr << "wmux: failed to enter raw input mode\n";
+      return 1;
+    }
   }
 
-  if (output_guard.active()) {
+  {
     DWORD mode = output_guard.original_mode();
     mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    output_guard.set_mode(mode);
+    if (!output_guard.set_mode(mode)) {
+      std::cerr << "wmux: failed to enable virtual terminal output mode\n";
+      return 1;
+    }
   }
 
   UniqueHandle stop_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};

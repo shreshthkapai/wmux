@@ -71,8 +71,8 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 4
-daemon-owned ConPTY shell path:
+The current skeleton builds a small `wmux` executable with the Phase 5
+daemon-owned ConPTY shell and raw interactive attach path:
 
 ```bash
 cmake -S . -B build
@@ -86,20 +86,40 @@ cmake --build build
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
+./build/wmux server stop --force
 ctest --test-dir build --output-on-failure
 ```
 
 On Windows, CMake will produce `wmux.exe`.
 
-Phase 4 uses Windows named pipes on native Windows and keeps session state,
-ConPTY handles, shell processes, and a bounded recent output buffer in the
-daemon process. `wmux new -s <name>` starts a daemon-owned
+The daemon uses separate Windows named-pipe endpoints for command
+request/response traffic and long-lived attach streaming. It keeps session
+state, ConPTY handles, shell processes, and a bounded recent output buffer in
+the daemon process. `wmux new -s <name>` starts a daemon-owned
 `powershell.exe -NoLogo -NoProfile` shell, and `wmux attach -t <name>` opens a
 streaming attach connection to it.
 
-Interactive attach is intentionally still raw passthrough. It is good enough to
-prove ConPTY process ownership and first shell output, but the richer terminal
-model, resize handling, detach polish, and pane rendering come in later phases.
+`wmux server stop` refuses to stop while live sessions exist. Use
+`wmux server stop --force` only when you explicitly want the daemon to terminate
+active session runtimes.
+
+For the current Windows shell-lifetime stability check, run:
+
+```powershell
+.\scripts\test-kill-session-cleanup.ps1 -Wmux .\build-vs\Debug\wmux.exe -Iterations 20
+```
+
+The script creates and kills uniquely named sessions, then verifies that no new
+daemon-owned `powershell.exe`, `pwsh.exe`, or `cmd.exe` processes remain. It
+does not stop the daemon or touch sessions it did not create.
+
+Interactive attach is intentionally still raw output passthrough. It is good
+enough to prove ConPTY process ownership and first shell IO. Client input uses
+small length-prefixed attach frames so `Ctrl+b d` is an explicit detach event
+instead of an accidental pipe close. The client also sends its initial terminal
+size on attach so the daemon can resize ConPTY before replaying output, but
+live resize events, the richer terminal model, and pane rendering come in later
+phases.
 
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY

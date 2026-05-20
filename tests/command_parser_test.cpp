@@ -85,6 +85,15 @@ void expects_server_stop_command() {
   const std::vector<std::string_view> args{"server", "stop"};
   const auto result = wmux::parse_command_line(args);
   assert(result.kind == wmux::CommandKind::ServerStop);
+  assert(!result.force);
+  assert(result.error.empty());
+}
+
+void expects_forced_server_stop_command() {
+  const std::vector<std::string_view> args{"server", "stop", "--force"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::ServerStop);
+  assert(result.force);
   assert(result.error.empty());
 }
 
@@ -107,6 +116,13 @@ void expects_server_subcommand_error() {
   const auto result = wmux::parse_command_line(args);
   assert(result.kind == wmux::CommandKind::Unknown);
   assert(result.error == "unknown server subcommand 'restart'");
+}
+
+void expects_server_stop_argument_error() {
+  const std::vector<std::string_view> args{"server", "stop", "--now"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "server stop accepts only optional --force");
 }
 
 void expects_placeholder_response() {
@@ -137,9 +153,11 @@ int main() {
   expects_kill_session_command();
   expects_server_status_command();
   expects_server_stop_command();
+  expects_forced_server_stop_command();
   expects_missing_session_name_error();
   expects_wrong_target_flag_error();
   expects_server_subcommand_error();
+  expects_server_stop_argument_error();
   expects_placeholder_response();
   expects_unknown_command_error();
   run_ipc_protocol_tests();

@@ -1,5 +1,0 @@
-C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/wmux.dir
-C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/wmux_tests.dir
-C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/RUN_TESTS.dir
-C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/ALL_BUILD.dir
-C:/Users/shres/Desktop/wmux/build-vs/CMakeFiles/ZERO_CHECK.dir

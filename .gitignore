@@ -1,14 +1,28 @@
+# Build outputs
 build/
 build-*/
 out/
+
+# CMake-generated local files
+CMakeUserPresets.json
+compile_commands.json
+
+# Editor and IDE state
 .vs/
 .vscode/
 *.user
 *.suo
+
+# Native build artifacts
 *.obj
 *.pdb
 *.ilk
 *.exe
 *.dll
 *.lib
+
+# Logs
 *.log
+
+# Accidental Node/npm installs; wmux is a C++ project.
+node_modules/

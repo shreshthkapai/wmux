@@ -1,5 +1,6 @@
 #include "wmux/ipc_protocol.hpp"
 
+#include <cstdint>
 #include <sstream>
 #include <utility>
 
@@ -79,6 +80,14 @@ void append_json_field(std::ostringstream& out, std::string_view key, std::strin
   out << ",\"" << key << "\":\"" << escape_json_string(value) << '"';
 }
 
+void append_json_bool(std::ostringstream& out, std::string_view key, bool value) {
+  out << ",\"" << key << "\":" << (value ? "true" : "false");
+}
+
+void append_json_uint(std::ostringstream& out, std::string_view key, std::uint16_t value) {
+  out << ",\"" << key << "\":" << value;
+}
+
 std::optional<std::string> find_json_string(std::string_view json, std::string_view key) {
   const std::string pattern = "\"" + std::string{key} + "\":\"";
   const auto start = json.find(pattern);
@@ -126,6 +135,36 @@ std::optional<bool> find_json_bool(std::string_view json, std::string_view key) 
   return std::nullopt;
 }
 
+std::optional<std::uint16_t> find_json_uint(std::string_view json, std::string_view key) {
+  const std::string pattern = "\"" + std::string{key} + "\":";
+  const auto start = json.find(pattern);
+  if (start == std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  const auto value_start = start + pattern.size();
+  std::uint32_t value = 0;
+  bool saw_digit = false;
+  for (std::size_t i = value_start; i < json.size(); ++i) {
+    const char ch = json[i];
+    if (ch < '0' || ch > '9') {
+      break;
+    }
+
+    saw_digit = true;
+    value = (value * 10) + static_cast<std::uint32_t>(ch - '0');
+    if (value > 32767) {
+      return std::nullopt;
+    }
+  }
+
+  if (!saw_digit) {
+    return std::nullopt;
+  }
+
+  return static_cast<std::uint16_t>(value);
+}
+
 std::string request_type_for_command(CommandKind kind) {
   switch (kind) {
     case CommandKind::DefaultSession:
@@ -154,6 +193,22 @@ std::string request_type_for_command(CommandKind kind) {
   return {};
 }
 
+std::string make_attach_frame(AttachFrameType type, std::string_view payload) {
+  std::string frame;
+  frame.reserve(kAttachFrameHeaderSize + payload.size());
+  frame.push_back('W');
+  frame.push_back('M');
+  frame.push_back(static_cast<char>(type));
+
+  const auto payload_size = static_cast<std::uint32_t>(payload.size());
+  frame.push_back(static_cast<char>(payload_size & 0xFF));
+  frame.push_back(static_cast<char>((payload_size >> 8) & 0xFF));
+  frame.push_back(static_cast<char>((payload_size >> 16) & 0xFF));
+  frame.push_back(static_cast<char>((payload_size >> 24) & 0xFF));
+  frame.append(payload);
+  return frame;
+}
+
 }  // namespace
 
 std::string make_ping_request_json() {
@@ -173,6 +228,28 @@ std::string make_command_request_json(const CommandLine& command) {
   }
   if (!command.new_name.empty()) {
     append_json_field(out, "new_name", command.new_name);
+  }
+  if (command.force) {
+    append_json_bool(out, "force", command.force);
+  }
+
+  out << "}\n";
+  return out.str();
+}
+
+std::string make_attach_request_json(
+    const CommandLine& command,
+    std::uint16_t terminal_columns,
+    std::uint16_t terminal_rows) {
+  std::ostringstream out;
+  out << "{\"type\":\"AttachSession\"";
+
+  if (!command.session_name.empty()) {
+    append_json_field(out, "session_name", command.session_name);
+  }
+  if (terminal_columns > 0 && terminal_rows > 0) {
+    append_json_uint(out, "terminal_columns", terminal_columns);
+    append_json_uint(out, "terminal_rows", terminal_rows);
   }
 
   out << "}\n";
@@ -197,6 +274,15 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   if (const auto new_name = find_json_string(json, "new_name")) {
     request.new_name = *new_name;
   }
+  if (const auto force = find_json_bool(json, "force")) {
+    request.force = *force;
+  }
+  if (const auto terminal_columns = find_json_uint(json, "terminal_columns")) {
+    request.terminal_columns = *terminal_columns;
+  }
+  if (const auto terminal_rows = find_json_uint(json, "terminal_rows")) {
+    request.terminal_rows = *terminal_rows;
+  }
 
   return request;
 }
@@ -220,6 +306,43 @@ std::optional<IpcResponse> parse_response_json(std::string_view json) {
   response.ok = *ok;
   response.message = *message;
   return response;
+}
+
+std::string make_attach_input_frame(std::string_view bytes) {
+  return make_attach_frame(AttachFrameType::Input, bytes);
+}
+
+std::string make_attach_detach_frame() {
+  return make_attach_frame(AttachFrameType::Detach, {});
+}
+
+std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
+  if (header.size() != kAttachFrameHeaderSize || header[0] != 'W' || header[1] != 'M') {
+    return std::nullopt;
+  }
+
+  AttachFrameHeader parsed;
+  switch (static_cast<std::uint8_t>(header[2])) {
+    case static_cast<std::uint8_t>(AttachFrameType::Input):
+      parsed.type = AttachFrameType::Input;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::Detach):
+      parsed.type = AttachFrameType::Detach;
+      break;
+    default:
+      return std::nullopt;
+  }
+
+  parsed.payload_size =
+      static_cast<std::uint32_t>(static_cast<unsigned char>(header[3])) |
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[4])) << 8) |
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[5])) << 16) |
+      (static_cast<std::uint32_t>(static_cast<unsigned char>(header[6])) << 24);
+  if (parsed.payload_size > kMaxAttachFramePayloadSize) {
+    return std::nullopt;
+  }
+
+  return parsed;
 }
 
 }  // namespace wmux

@@ -80,19 +80,26 @@ CommandLine parse_rename_session(const std::vector<std::string_view>& args) {
 }
 
 CommandLine parse_server_command(const std::vector<std::string_view>& args) {
-  if (args.size() != 2) {
+  if (args.size() < 2) {
     return invalid("server requires one subcommand: status or stop");
   }
 
   if (args[1] == "status") {
+    if (args.size() != 2) {
+      return invalid("server status does not accept arguments");
+    }
     CommandLine command;
     command.kind = CommandKind::ServerStatus;
     return command;
   }
 
   if (args[1] == "stop") {
+    if (args.size() > 3 || (args.size() == 3 && args[2] != "--force")) {
+      return invalid("server stop accepts only optional --force");
+    }
     CommandLine command;
     command.kind = CommandKind::ServerStop;
+    command.force = args.size() == 3;
     return command;
   }
 
@@ -173,7 +180,7 @@ std::string render_help(std::string_view executable_name) {
   out << "  rename-session -t <old> <new>  Rename a session\n";
   out << "  kill-session -t <name>         Kill a session\n";
   out << "  server status                  Show daemon status\n";
-  out << "  server stop                    Stop daemon\n";
+  out << "  server stop [--force]          Stop daemon\n";
   out << "  version                        Print wmux version information\n";
   out << "  help                           Print this help message\n\n";
   out << "Options:\n";
@@ -218,7 +225,11 @@ std::string render_placeholder_response(const CommandLine& command) {
       out << "wmux: daemon status is not implemented yet\n";
       break;
     case CommandKind::ServerStop:
-      out << "wmux: daemon stop is not implemented yet\n";
+      out << "wmux: daemon stop is not implemented yet";
+      if (command.force) {
+        out << " (forced)";
+      }
+      out << "\n";
       break;
     case CommandKind::Help:
     case CommandKind::Version:

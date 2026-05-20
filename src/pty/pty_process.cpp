@@ -212,6 +212,7 @@ struct PtyProcess::Impl {
   UniqueHandle input_read;
   UniqueHandle input_write;
   UniqueHandle output_read;
+  UniqueHandle job;
   UniqueHandle process;
   UniquePseudoConsole console;
 #endif
@@ -224,6 +225,7 @@ struct PtyProcess::Impl {
   bool reader_done{false};
 
   mutable std::mutex write_mutex;
+  mutable std::mutex console_mutex;
   std::thread reader_thread;
   std::atomic_bool terminating{false};
 
@@ -340,6 +342,20 @@ struct PtyProcess::Impl {
     return true;
   }
 
+  bool resize(short columns, short rows) {
+    if (columns <= 0 || rows <= 0) {
+      return false;
+    }
+
+    std::lock_guard lock(console_mutex);
+    if (terminating.load() || !console.valid()) {
+      return false;
+    }
+
+    const COORD size{columns, rows};
+    return SUCCEEDED(ResizePseudoConsole(console.get(), size));
+  }
+
   void terminate() {
     bool expected = false;
     if (!terminating.compare_exchange_strong(expected, true)) {
@@ -347,7 +363,11 @@ struct PtyProcess::Impl {
     }
 
     input_write.reset();
-    console.reset();
+    {
+      std::lock_guard lock(console_mutex);
+      console.reset();
+    }
+    job.reset();
 
     if (reader_thread.joinable()) {
       CancelSynchronousIo(reader_thread.native_handle());
@@ -369,6 +389,10 @@ struct PtyProcess::Impl {
   }
 #else
   bool write(std::string_view) {
+    return false;
+  }
+
+  bool resize(short, short) {
     return false;
   }
 
@@ -424,6 +448,24 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
   }
   UniquePseudoConsole console{raw_console};
 
+  UniqueHandle job{CreateJobObjectW(nullptr, nullptr)};
+  if (!job.valid()) {
+    return {
+        nullptr, windows_error_message("wmux: failed to create shell job object", GetLastError())};
+  }
+
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits{};
+  job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(
+          job.get(),
+          JobObjectExtendedLimitInformation,
+          &job_limits,
+          sizeof(job_limits))) {
+    return {
+        nullptr,
+        windows_error_message("wmux: failed to configure shell job object", GetLastError())};
+  }
+
   SIZE_T attribute_size = 0;
   InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
   if (attribute_size == 0) {
@@ -465,7 +507,7 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
       nullptr,
       nullptr,
       TRUE,
-      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
       nullptr,
       nullptr,
       &startup.StartupInfo,
@@ -478,12 +520,26 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
 
   UniqueHandle process{process_info.hProcess};
   UniqueHandle thread{process_info.hThread};
+  if (!AssignProcessToJobObject(job.get(), process.get())) {
+    TerminateProcess(process.get(), 1);
+    return {
+        nullptr,
+        windows_error_message("wmux: failed to assign shell process to job object", GetLastError())};
+  }
+
+  if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
+    TerminateProcess(process.get(), 1);
+    return {
+        nullptr, windows_error_message("wmux: failed to resume shell process", GetLastError())};
+  }
+
   output_write.reset();
 
   auto impl = std::make_unique<Impl>();
   impl->input_read = std::move(input_read);
   impl->input_write = std::move(input_write);
   impl->output_read = std::move(output_read);
+  impl->job = std::move(job);
   impl->process = std::move(process);
   impl->console = std::move(console);
 
@@ -500,6 +556,10 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
 
 bool PtyProcess::write_input(std::string_view bytes) {
   return impl_->write(bytes);
+}
+
+bool PtyProcess::resize(short columns, short rows) {
+  return impl_->resize(columns, rows);
 }
 
 PtyOutputSnapshot PtyProcess::output_snapshot() const {

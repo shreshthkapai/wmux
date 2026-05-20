@@ -6,12 +6,15 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace wmux {
 
+using SessionId = std::uint64_t;
+
 struct SessionSummary {
-  std::uint64_t id{0};
+  SessionId id{0};
   std::string name;
   std::chrono::system_clock::time_point created_at;
 };
@@ -26,6 +29,7 @@ enum class SessionError {
 struct SessionOperationResult {
   bool ok{false};
   SessionError error{SessionError::None};
+  SessionId id{0};
 };
 
 class SessionManager {
@@ -35,13 +39,15 @@ class SessionManager {
   SessionOperationResult kill_session(std::string_view name);
 
   bool has_session(std::string_view name) const;
+  std::optional<SessionId> session_id_for_name(std::string_view name) const;
+  std::size_t session_count() const;
   std::vector<SessionSummary> list_sessions() const;
 
  private:
-  std::optional<std::size_t> find_index(std::string_view name) const;
-
-  std::vector<SessionSummary> sessions_;
-  std::uint64_t next_id_{1};
+  std::unordered_map<SessionId, SessionSummary> sessions_;
+  std::unordered_map<std::string, SessionId> name_index_;
+  std::vector<SessionId> order_;
+  SessionId next_id_{1};
 };
 
 }  // namespace wmux

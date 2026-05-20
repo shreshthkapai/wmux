@@ -27,6 +27,7 @@ struct CommandLine {
   std::string session_name;
   std::string target_name;
   std::string new_name;
+  bool force{false};
 };
 
 CommandLine parse_command_line(const std::vector<std::string_view>& args);

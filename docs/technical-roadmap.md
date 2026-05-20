@@ -169,6 +169,7 @@ wmux rename-session -t <old> <new>
 wmux kill-session -t <name>
 wmux server status
 wmux server stop
+wmux server stop --force
 ```
 
 ### Phase 2: Daemon Skeleton
@@ -185,7 +186,10 @@ Current implementation notes:
 - Native Windows builds use a named pipe endpoint.
 - WSL/Linux development builds use a Unix-domain socket fallback.
 - Command IPC is line-delimited JSON for low-volume request/response commands.
-- Attach now has a separate streaming pipe path on Windows.
+- Attach now uses a separate Windows named-pipe endpoint from command IPC.
+- The initial attach stream keeps JSON only for attach startup. Client input and
+  detach lifecycle are length-prefixed frames, which keeps shell input separate
+  from control messages.
 - Existing Phase 1 commands round-trip through the daemon and still return
   placeholder responses until Phase 3 session state exists.
 
@@ -201,6 +205,8 @@ Current implementation notes:
 Current implementation notes:
 
 - Session state is daemon-owned and in-memory.
+- Session identity is a stable numeric ID. Session names are mutable metadata and
+  command lookup keys, not runtime ownership keys.
 - `wmux new -s <name>`, `wmux ls`, `wmux rename-session -t <old> <new>`,
   and `wmux kill-session -t <name>` now mutate daemon state.
 - Duplicate names are rejected by the daemon, not only by client-side parsing.
@@ -220,14 +226,20 @@ Current implementation notes:
 Current implementation notes:
 
 - `PtyProcess` owns the ConPTY handle, input/output pipes, child process handle,
-  reader thread, and bounded recent output chunks.
+  Windows job object, reader thread, and bounded recent output chunks.
+- Shell processes are assigned to a kill-on-close job object so session teardown
+  and daemon process exit clean up the daemon-owned shell process tree where
+  Windows permits it.
 - `wmux new -s <name>` starts `powershell.exe -NoLogo -NoProfile` under the
-  daemon and stores it by session name.
-- `wmux attach -t <name>` uses a long-lived named-pipe connection. The daemon
-  replays recent buffered output and then streams live ConPTY output while
-  forwarding client input to the shell.
-- The attach stream is still raw byte passthrough. A real Windows terminal
-  emulator is expected to handle ConPTY terminal negotiation for this phase.
+  daemon and stores runtime ownership by stable session ID.
+- `wmux attach -t <name>` uses a long-lived attach named-pipe connection. The
+  daemon replays recent buffered output and then streams live ConPTY output
+  while forwarding framed client input to the shell.
+- Attach output is still raw byte passthrough. A real Windows terminal emulator
+  is expected to handle ConPTY terminal negotiation for this phase.
+- Raw PTY byte chunks are only a Phase 4 replay mechanism. Scrollback, copy
+  mode, pane rendering, and correct reattach must be built on daemon-owned VT
+  state and bounded scrollback rings, not on raw byte replay.
 - This phase proves daemon-owned shell lifetime and first attach output. It is
   not the final pane renderer or terminal parser.
 
@@ -244,9 +256,26 @@ Current overlap from Phase 4:
 
 - The client already switches the local console into a raw-ish VT input/output
   mode and restores it on exit.
-- `Ctrl+b d` currently detaches from the streaming attach connection.
-- Phase 5 should harden this path with better terminal-size propagation,
-  explicit detach status, redirected-stdin behavior, and crash cleanup tests.
+- `Ctrl+b d` sends an explicit detach frame before the client leaves the
+  streaming attach connection.
+- Phase 5 now sends the initial client terminal size during attach and asks the
+  daemon to resize the session ConPTY before replaying output.
+- Phase 5 should still harden this path with live resize events,
+  redirected-stdin behavior, and attach/crash cleanup tests.
+- The daemon tracks active attach clients by client ID and classifies connection
+  endings as explicit detach, disconnect, protocol error, shell close, or output
+  close while unregistering the client.
+- Attach connections still run on worker threads for the prototype. They are no
+  longer invisible to daemon state, but a later event-loop design should replace
+  this with fully joinable/owned client runtimes.
+
+Current lifecycle guard:
+
+- `wmux server stop` refuses to stop while live sessions exist.
+- `wmux server stop --force` explicitly terminates live session runtimes before
+  stopping the daemon.
+- Session kill and forced server stop ask active attach connections to
+  disconnect so blocked pipe IO can unwind.
 
 This proves ConPTY, IPC, daemon lifetime, input routing, detach, and reattach
 before pane rendering becomes complex.
@@ -259,6 +288,17 @@ before pane rendering becomes complex.
 - Reconnect client to existing session
 - Replay visible state on attach
 - Resume live streaming
+- Add repeated create/attach/detach/kill testing and verify shell cleanup.
+
+Current stability check:
+
+```powershell
+.\scripts\test-kill-session-cleanup.ps1 -Wmux .\build-vs\Debug\wmux.exe -Iterations 20
+```
+
+The script validates repeated session create/kill cleanup and checks that no new
+daemon-owned shell processes remain after each kill. It intentionally leaves
+pre-existing sessions alone.
 
 ### Phase 7: Virtual Terminal State
 

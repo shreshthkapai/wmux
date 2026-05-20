@@ -24,6 +24,8 @@ namespace {
 
 constexpr auto kStartupAttempts = 40;
 constexpr auto kStartupSleep = std::chrono::milliseconds{50};
+constexpr auto kPipeConnectAttempts = 20;
+constexpr auto kPipeConnectSleep = std::chrono::milliseconds{25};
 
 IpcResponse transport_error(std::string message) {
   IpcResponse response;
@@ -69,20 +71,9 @@ std::filesystem::path current_executable_path(const std::filesystem::path& fallb
   return std::filesystem::path{buffer};
 }
 
-IpcResponse send_windows_request(std::string_view request_json) {
-  const auto endpoint = widen(command_endpoint_name());
-  HANDLE pipe = CreateFileW(
-      endpoint.c_str(),
-      GENERIC_READ | GENERIC_WRITE,
-      0,
-      nullptr,
-      OPEN_EXISTING,
-      0,
-      nullptr);
-
-  if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY) {
-    WaitNamedPipeW(endpoint.c_str(), 1000);
-    pipe = CreateFileW(
+HANDLE connect_windows_pipe(const std::wstring& endpoint) {
+  for (int attempt = 0; attempt < kPipeConnectAttempts; ++attempt) {
+    HANDLE pipe = CreateFileW(
         endpoint.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0,
@@ -90,8 +81,30 @@ IpcResponse send_windows_request(std::string_view request_json) {
         OPEN_EXISTING,
         0,
         nullptr);
+
+    if (pipe != INVALID_HANDLE_VALUE) {
+      return pipe;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_PIPE_BUSY) {
+      WaitNamedPipeW(endpoint.c_str(), static_cast<DWORD>(kPipeConnectSleep.count()));
+      continue;
+    }
+
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+      break;
+    }
+
+    std::this_thread::sleep_for(kPipeConnectSleep);
   }
 
+  return INVALID_HANDLE_VALUE;
+}
+
+IpcResponse send_windows_request(std::string_view request_json) {
+  const auto endpoint = widen(command_endpoint_name());
+  HANDLE pipe = connect_windows_pipe(endpoint);
   if (pipe == INVALID_HANDLE_VALUE) {
     return transport_error("wmux: daemon is not running\n");
   }
@@ -307,6 +320,14 @@ std::string command_endpoint_name() {
   return R"(\\.\pipe\wmux)";
 #else
   return "/tmp/wmux-" + std::to_string(getuid()) + ".sock";
+#endif
+}
+
+std::string attach_endpoint_name() {
+#ifdef _WIN32
+  return R"(\\.\pipe\wmux-attach)";
+#else
+  return "/tmp/wmux-" + std::to_string(getuid()) + "-attach.sock";
 #endif
 }
 
