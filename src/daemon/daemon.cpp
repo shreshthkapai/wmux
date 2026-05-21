@@ -37,7 +37,7 @@ namespace wmux {
 namespace {
 
 #ifdef _WIN32
-constexpr std::string_view kDefaultShell = "powershell.exe -NoLogo -NoProfile";
+constexpr std::string_view kFallbackDefaultShell = "powershell.exe -NoLogo -NoProfile";
 constexpr short kInitialPtyColumns = 120;
 constexpr short kInitialPtyRows = 30;
 constexpr auto kRequestReadTimeout = std::chrono::seconds{5};
@@ -75,6 +75,21 @@ struct DaemonState {
 
 void disconnect_attach_clients_for_session(DaemonState& state, SessionId session_id);
 void disconnect_all_attach_clients(DaemonState& state);
+
+#ifdef _WIN32
+std::string default_shell_command() {
+  char configured_shell[32768]{};
+  const DWORD size = GetEnvironmentVariableA(
+      "WMUX_DEFAULT_SHELL",
+      configured_shell,
+      static_cast<DWORD>(sizeof(configured_shell)));
+  if (size > 0 && size < sizeof(configured_shell)) {
+    return configured_shell;
+  }
+
+  return std::string{kFallbackDefaultShell};
+}
+#endif
 
 std::string quoted(std::string_view value) {
   std::ostringstream out;
@@ -128,7 +143,7 @@ std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
 
   std::shared_ptr<PtyProcess> shell_process;
 #ifdef _WIN32
-  auto shell = PtyProcess::start(kDefaultShell, kInitialPtyColumns, kInitialPtyRows);
+  auto shell = PtyProcess::start(default_shell_command(), kInitialPtyColumns, kInitialPtyRows);
   if (!shell.process) {
     return make_response_json(false, shell.error);
   }
@@ -684,58 +699,16 @@ bool connect_named_pipe(HANDLE pipe) {
   return ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
 }
 
-bool connect_named_pipe_until_stop(HANDLE pipe, std::atomic_bool& should_stop) {
-  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (event == nullptr) {
-    return false;
-  }
-
-  OVERLAPPED overlapped{};
-  overlapped.hEvent = event;
-  const BOOL connected = ConnectNamedPipe(pipe, &overlapped);
-  if (connected) {
-    CloseHandle(event);
-    return true;
-  }
-
-  const DWORD error = GetLastError();
-  if (error == ERROR_PIPE_CONNECTED) {
-    CloseHandle(event);
-    return true;
-  }
-  if (error != ERROR_IO_PENDING) {
-    CloseHandle(event);
-    return false;
-  }
-
-  while (!should_stop.load()) {
-    const DWORD wait_result = WaitForSingleObject(event, 50);
-    if (wait_result == WAIT_OBJECT_0) {
-      DWORD transferred = 0;
-      const BOOL ok = GetOverlappedResult(pipe, &overlapped, &transferred, FALSE);
-      CloseHandle(event);
-      return ok != 0;
-    }
-    if (wait_result != WAIT_TIMEOUT) {
-      break;
-    }
-  }
-
-  CancelIoEx(pipe, &overlapped);
-  CloseHandle(event);
-  return false;
-}
-
 void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_stop) {
   const auto endpoint = widen(attach_endpoint_name());
 
   while (!should_stop.load()) {
-    HANDLE pipe = create_server_pipe(endpoint, FILE_FLAG_OVERLAPPED);
+    HANDLE pipe = create_server_pipe(endpoint, 0);
     if (pipe == INVALID_HANDLE_VALUE) {
       return;
     }
 
-    if (!connect_named_pipe_until_stop(pipe, should_stop)) {
+    if (!connect_named_pipe(pipe)) {
       CloseHandle(pipe);
       continue;
     }
@@ -770,6 +743,21 @@ void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_st
   }
 }
 
+void wake_attach_listener() {
+  const auto endpoint = widen(attach_endpoint_name());
+  HANDLE pipe = CreateFileW(
+      endpoint.c_str(),
+      GENERIC_READ | GENERIC_WRITE,
+      0,
+      nullptr,
+      OPEN_EXISTING,
+      0,
+      nullptr);
+  if (pipe != INVALID_HANDLE_VALUE) {
+    CloseHandle(pipe);
+  }
+}
+
 int run_windows_daemon() {
   std::atomic_bool should_stop{false};
   DaemonState state;
@@ -780,6 +768,7 @@ int run_windows_daemon() {
     HANDLE pipe = create_server_pipe(endpoint, 0);
     if (pipe == INVALID_HANDLE_VALUE) {
       should_stop = true;
+      wake_attach_listener();
       if (attach_listener.joinable()) {
         attach_listener.join();
       }
@@ -804,6 +793,7 @@ int run_windows_daemon() {
   }
 
   disconnect_all_attach_clients(state);
+  wake_attach_listener();
   if (attach_listener.joinable()) {
     attach_listener.join();
   }

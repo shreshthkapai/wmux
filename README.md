@@ -71,8 +71,8 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 5
-daemon-owned ConPTY shell and raw interactive attach path:
+The current skeleton builds a small `wmux` executable with the Phase 6
+daemon-owned ConPTY shell and raw detach/reattach path:
 
 ```bash
 cmake -S . -B build
@@ -112,6 +112,18 @@ For the current Windows shell-lifetime stability check, run:
 The script creates and kills uniquely named sessions, then verifies that no new
 daemon-owned `powershell.exe`, `pwsh.exe`, or `cmd.exe` processes remain. It
 does not stop the daemon or touch sessions it did not create.
+
+For the detach/reattach persistence check, run:
+
+```powershell
+.\scripts\test-detach-reattach.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, starts a long-running loop through the attach pipe,
+simulates terminal closure by dropping the pipe, reattaches, verifies newer
+output was captured while detached, then verifies an explicit detach still
+leaves the session attachable.
 
 Interactive attach is intentionally still raw output passthrough. It is good
 enough to prove ConPTY process ownership and first shell IO. Client input uses

@@ -170,6 +170,9 @@ Attach streaming must keep shell data and lifecycle/control data separate.
   session kill, and server shutdown.
 - Track active clients by stable client ID so cleanup paths can disconnect them
   deliberately.
+- Keep detach/reattach covered by an integration test that exercises the real
+  daemon and attach pipe, including abrupt pipe closure to simulate terminal
+  exit.
 - Do not parse JSON per keystroke.
 
 ## Stability Gates

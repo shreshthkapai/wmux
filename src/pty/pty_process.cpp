@@ -447,6 +447,7 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
             std::to_string(static_cast<unsigned long>(console_result)) + ")\n"};
   }
   UniquePseudoConsole console{raw_console};
+  output_write.reset();
 
   UniqueHandle job{CreateJobObjectW(nullptr, nullptr)};
   if (!job.valid()) {
@@ -532,8 +533,6 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
     return {
         nullptr, windows_error_message("wmux: failed to resume shell process", GetLastError())};
   }
-
-  output_write.reset();
 
   auto impl = std::make_unique<Impl>();
   impl->input_read = std::move(input_read);

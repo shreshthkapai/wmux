@@ -232,6 +232,8 @@ Current implementation notes:
   Windows permits it.
 - `wmux new -s <name>` starts `powershell.exe -NoLogo -NoProfile` under the
   daemon and stores runtime ownership by stable session ID.
+- Windows development builds also honor `WMUX_DEFAULT_SHELL` as a temporary
+  test hook. It is not a replacement for the later configuration system.
 - `wmux attach -t <name>` uses a long-lived attach named-pipe connection. The
   daemon replays recent buffered output and then streams live ConPTY output
   while forwarding framed client input to the shell.
@@ -290,15 +292,32 @@ before pane rendering becomes complex.
 - Resume live streaming
 - Add repeated create/attach/detach/kill testing and verify shell cleanup.
 
-Current stability check:
+Current implementation notes:
+
+- Session shells are daemon-owned and continue running after the attach client
+  sends detach or the attach pipe is closed by terminal exit.
+- The ConPTY reader thread stays alive while detached and appends output to a
+  bounded recent-output buffer.
+- Reattach opens a new attach pipe, gets the existing session runtime by stable
+  session ID, replays buffered output, then resumes live streaming.
+- This is still raw byte replay. The later virtual terminal state phase is
+  required before copy mode, scrollback, alternate screen replay, and panes can
+  be considered correct.
+
+Current stability checks:
 
 ```powershell
 .\scripts\test-kill-session-cleanup.ps1 -Wmux .\build-vs\Debug\wmux.exe -Iterations 20
+.\scripts\test-detach-reattach.ps1 -Wmux .\build-vs\Debug\wmux.exe
 ```
 
-The script validates repeated session create/kill cleanup and checks that no new
-daemon-owned shell processes remain after each kill. It intentionally leaves
-pre-existing sessions alone.
+The cleanup script validates repeated session create/kill cleanup and checks
+that no new daemon-owned shell processes remain after each kill. It leaves
+pre-existing sessions alone. The detach/reattach script requires an empty
+daemon because it restarts wmux with a deterministic `cmd.exe /D /Q` test shell;
+then it drives the attach pipe directly, simulates terminal closure, verifies
+output continues while detached, and verifies explicit detach leaves the session
+attachable.
 
 ### Phase 7: Virtual Terminal State
 
