@@ -35,6 +35,9 @@ int main(int argc, char** argv) {
     case wmux::CommandKind::AttachSession:
     case wmux::CommandKind::RenameSession:
     case wmux::CommandKind::KillSession:
+    case wmux::CommandKind::NewWindow:
+    case wmux::CommandKind::ListWindows:
+    case wmux::CommandKind::RenameWindow:
     case wmux::CommandKind::ServerStatus:
     case wmux::CommandKind::ServerStop: {
       std::string error;

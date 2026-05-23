@@ -128,6 +128,7 @@ Request/response messages for administrative commands:
 - list sessions
 - rename session
 - kill session
+- create/list/rename windows
 - server status
 - server stop
 
@@ -319,7 +320,38 @@ then it drives the attach pipe directly, simulates terminal closure, verifies
 output continues while detached, and verifies explicit detach leaves the session
 attachable.
 
-### Phase 7: Virtual Terminal State
+### Phase 7A: Window Model and Commands
+
+- Add stable window IDs
+- Make sessions own ordered windows
+- Track `active_window_id`
+- Create one ConPTY-backed shell per window
+- Add command IPC for creating, listing, and renaming windows
+
+Current implementation notes:
+
+- Every new session starts with one initial window named `0`.
+- Window runtime ownership is keyed by stable `SessionId` and `WindowId`; window
+  names are metadata and command lookup text, not process ownership keys.
+- `wmux new-window -n <name>`, `wmux list-windows`, and
+  `wmux rename-window <new>` operate on the only live session when exactly one
+  session exists.
+- The same commands accept `-t <session>` for explicit daemon targeting:
+  `wmux new-window -t finance -n logs`, `wmux list-windows -t finance`, and
+  `wmux rename-window -t finance agents`.
+- `wmux attach -t <session>` attaches to that session's active window.
+- Keybind-driven window switching is intentionally left for Phase 7B.
+- Rendering is still raw active-window output passthrough. Split panes, copy
+  mode, and correct redraw still require daemon-owned VT state.
+
+### Phase 7B: Interactive Window Switching
+
+- Add `Ctrl+b c` for new window
+- Add `Ctrl+b n` and `Ctrl+b p` for next/previous window
+- Add command-mode equivalents once command mode exists
+- Ensure attached clients switch to the newly active window cleanly
+
+### Phase 8: Virtual Terminal State
 
 - Parse VT output incrementally
 - Maintain pane screen grid
@@ -328,19 +360,12 @@ attachable.
 - Support alternate screen buffer
 - Mark dirty regions for render updates
 
-### Phase 8: Render Daemon-Owned Grid
+### Phase 9: Render Daemon-Owned Grid
 
 - Client renders daemon-provided pane state
 - Avoid direct raw passthrough for normal attached rendering
 - Add frame coalescing
 - Clip output to pane rectangle
-
-### Phase 9: Windows
-
-- Add window model
-- Track active window
-- Create, switch, and rename windows
-- Render active window only
 
 ### Phase 10: Pane Splitting and Layout Rendering
 

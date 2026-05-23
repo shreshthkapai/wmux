@@ -71,8 +71,9 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 6
-daemon-owned ConPTY shell and raw detach/reattach path:
+The current skeleton builds a small `wmux` executable with the Phase 7A
+daemon-owned ConPTY shell, raw detach/reattach path, and initial window command
+surface:
 
 ```bash
 cmake -S . -B build
@@ -83,6 +84,9 @@ cmake --build build
 ./build/wmux new -s finance
 ./build/wmux ls
 ./build/wmux attach -t finance
+./build/wmux new-window -n logs
+./build/wmux list-windows
+./build/wmux rename-window agents
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -94,10 +98,20 @@ On Windows, CMake will produce `wmux.exe`.
 
 The daemon uses separate Windows named-pipe endpoints for command
 request/response traffic and long-lived attach streaming. It keeps session
-state, ConPTY handles, shell processes, and a bounded recent output buffer in
-the daemon process. `wmux new -s <name>` starts a daemon-owned
-`powershell.exe -NoLogo -NoProfile` shell, and `wmux attach -t <name>` opens a
-streaming attach connection to it.
+state, window state, ConPTY handles, shell processes, and a bounded recent
+output buffer in the daemon process. `wmux new -s <name>` starts a daemon-owned
+`powershell.exe -NoLogo -NoProfile` shell for the session's initial window, and
+`wmux attach -t <name>` opens a streaming attach connection to the session's
+active window.
+
+Window commands currently operate on the only live session when exactly one
+session exists. They also accept `-t <session>` for explicit daemon commands:
+
+```bash
+./build/wmux new-window -t finance -n logs
+./build/wmux list-windows -t finance
+./build/wmux rename-window -t finance agents
+```
 
 `wmux server stop` refuses to stop while live sessions exist. Use
 `wmux server stop --force` only when you explicitly want the daemon to terminate

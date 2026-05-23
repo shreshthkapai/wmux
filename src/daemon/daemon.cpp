@@ -58,8 +58,11 @@ struct DaemonState {
   std::mutex mutex;
   std::condition_variable attach_clients_changed;
   SessionManager sessions;
-  struct SessionRuntime {
+  struct WindowRuntime {
     std::shared_ptr<PtyProcess> shell;
+  };
+  struct SessionRuntime {
+    std::unordered_map<WindowId, WindowRuntime> windows;
   };
   struct AttachClientRuntime {
     SessionId session_id{0};
@@ -118,6 +121,30 @@ std::string session_error_message(SessionError error, std::string_view name) {
   return out.str();
 }
 
+std::string window_error_message(WindowError error, std::string_view name) {
+  std::ostringstream out;
+
+  switch (error) {
+    case WindowError::EmptyName:
+      out << "wmux: window name cannot be empty\n";
+      break;
+    case WindowError::DuplicateName:
+      out << "wmux: window " << quoted(name) << " already exists\n";
+      break;
+    case WindowError::SessionNotFound:
+      out << "wmux: target session not found\n";
+      break;
+    case WindowError::WindowNotFound:
+      out << "wmux: active window not found\n";
+      break;
+    case WindowError::None:
+      out << "wmux: window operation failed\n";
+      break;
+  }
+
+  return out.str();
+}
+
 struct DaemonStats {
   std::size_t session_count{0};
   std::size_t attach_client_count{0};
@@ -126,6 +153,34 @@ struct DaemonStats {
 DaemonStats daemon_stats(DaemonState& state) {
   std::lock_guard lock(state.mutex);
   return {state.sessions.session_count(), state.attach_clients.size()};
+}
+
+std::optional<SessionId> resolve_target_session_for_window_command(
+    DaemonState& state,
+    const IpcRequest& request,
+    std::string& error) {
+  if (!request.session_name.empty()) {
+    const auto session_id = state.sessions.session_id_for_name(request.session_name);
+    if (!session_id) {
+      error = session_error_message(SessionError::NotFound, request.session_name);
+      return std::nullopt;
+    }
+
+    return session_id;
+  }
+
+  if (state.sessions.session_count() == 0) {
+    error = "wmux: no sessions\n";
+    return std::nullopt;
+  }
+
+  const auto only_session = state.sessions.only_session_id();
+  if (!only_session) {
+    error = "wmux: target session required; use -t <session>\n";
+    return std::nullopt;
+  }
+
+  return only_session;
 }
 
 std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
@@ -160,7 +215,7 @@ std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
     }
 
     if (shell_process) {
-      state.runtimes[result.id].shell = std::move(shell_process);
+      state.runtimes[result.id].windows[result.window_id].shell = std::move(shell_process);
     }
   }
 
@@ -199,7 +254,7 @@ std::string handle_rename_session(const IpcRequest& request, DaemonState& state)
 }
 
 std::string handle_kill_session(const IpcRequest& request, DaemonState& state) {
-  std::shared_ptr<PtyProcess> killed_shell;
+  std::vector<std::shared_ptr<PtyProcess>> killed_shells;
   SessionId killed_session_id{0};
   {
     std::lock_guard lock(state.mutex);
@@ -211,15 +266,23 @@ std::string handle_kill_session(const IpcRequest& request, DaemonState& state) {
     killed_session_id = result.id;
     const auto runtime = state.runtimes.find(result.id);
     if (runtime != state.runtimes.end()) {
-      killed_shell = std::move(runtime->second.shell);
+      killed_shells.reserve(runtime->second.windows.size());
+      for (auto& [window_id, window] : runtime->second.windows) {
+        (void)window_id;
+        if (window.shell) {
+          killed_shells.push_back(std::move(window.shell));
+        }
+      }
       state.runtimes.erase(runtime);
     }
   }
 
   disconnect_attach_clients_for_session(state, killed_session_id);
 
-  if (killed_shell) {
-    killed_shell->terminate();
+  for (auto& killed_shell : killed_shells) {
+    if (killed_shell) {
+      killed_shell->terminate();
+    }
   }
 
   std::ostringstream out;
@@ -234,14 +297,110 @@ std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state) {
     shells.reserve(state.runtimes.size());
     for (auto& [id, runtime] : state.runtimes) {
       (void)id;
-      if (runtime.shell) {
-        shells.push_back(std::move(runtime.shell));
+      for (auto& [window_id, window] : runtime.windows) {
+        (void)window_id;
+        if (window.shell) {
+          shells.push_back(std::move(window.shell));
+        }
       }
     }
     state.runtimes.clear();
   }
 
   return shells;
+}
+
+std::string handle_new_window(const IpcRequest& request, DaemonState& state) {
+  if (request.window_name.empty()) {
+    return make_response_json(false, window_error_message(WindowError::EmptyName, {}));
+  }
+
+  SessionId session_id{0};
+  {
+    std::lock_guard lock(state.mutex);
+    std::string error;
+    const auto resolved = resolve_target_session_for_window_command(state, request, error);
+    if (!resolved) {
+      return make_response_json(false, error);
+    }
+    session_id = *resolved;
+  }
+
+  std::shared_ptr<PtyProcess> shell_process;
+#ifdef _WIN32
+  auto shell = PtyProcess::start(default_shell_command(), kInitialPtyColumns, kInitialPtyRows);
+  if (!shell.process) {
+    return make_response_json(false, shell.error);
+  }
+  shell_process = std::move(shell.process);
+#endif
+
+  WindowOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    result = state.sessions.create_window(session_id, request.window_name);
+    if (!result.ok) {
+      if (shell_process) {
+        shell_process->terminate();
+      }
+      return make_response_json(false, window_error_message(result.error, request.window_name));
+    }
+
+    if (shell_process) {
+      state.runtimes[result.session_id].windows[result.window_id].shell = std::move(shell_process);
+    }
+  }
+
+  std::ostringstream out;
+  out << "wmux: created window " << quoted(request.window_name) << "\n";
+  return make_response_json(true, out.str());
+}
+
+std::string handle_list_windows(const IpcRequest& request, DaemonState& state) {
+  std::lock_guard lock(state.mutex);
+  std::string error;
+  const auto session_id = resolve_target_session_for_window_command(state, request, error);
+  if (!session_id) {
+    return make_response_json(false, error);
+  }
+
+  const auto active_window = state.sessions.active_window_id(*session_id);
+  const auto windows = state.sessions.list_windows(*session_id);
+  if (windows.empty()) {
+    return make_response_json(true, "wmux: no windows\n");
+  }
+
+  std::ostringstream out;
+  for (const auto& window : windows) {
+    out << window.id << ": " << window.name;
+    if (active_window && window.id == *active_window) {
+      out << " *";
+    }
+    out << "\n";
+  }
+  return make_response_json(true, out.str());
+}
+
+std::string handle_rename_window(const IpcRequest& request, DaemonState& state) {
+  if (request.window_name.empty()) {
+    return make_response_json(false, window_error_message(WindowError::EmptyName, {}));
+  }
+
+  std::lock_guard lock(state.mutex);
+  std::string error;
+  const auto session_id = resolve_target_session_for_window_command(state, request, error);
+  if (!session_id) {
+    return make_response_json(false, error);
+  }
+
+  const auto result = state.sessions.rename_active_window(*session_id, request.window_name);
+  if (!result.ok) {
+    return make_response_json(false, window_error_message(result.error, request.window_name));
+  }
+
+  std::ostringstream out;
+  out << "wmux: renamed active window to " << quoted(request.window_name) << "\n";
+  return make_response_json(true, out.str());
 }
 
 std::string handle_session_request(const IpcRequest& request, DaemonState& state) {
@@ -267,6 +426,18 @@ std::string handle_session_request(const IpcRequest& request, DaemonState& state
 
   if (request.type == "KillSession") {
     return handle_kill_session(request, state);
+  }
+
+  if (request.type == "NewWindow") {
+    return handle_new_window(request, state);
+  }
+
+  if (request.type == "ListWindows") {
+    return handle_list_windows(request, state);
+  }
+
+  if (request.type == "RenameWindow") {
+    return handle_rename_window(request, state);
   }
 
   return {};
@@ -387,6 +558,7 @@ bool write_all(HANDLE pipe, std::string_view bytes) {
 
 struct AttachTarget {
   SessionId session_id{0};
+  WindowId window_id{0};
   std::string session_name;
   std::shared_ptr<PtyProcess> shell;
 };
@@ -408,12 +580,24 @@ std::optional<AttachTarget> shell_for_attach(
   }
 
   const auto runtime = state.runtimes.find(*session_id);
-  if (runtime == state.runtimes.end() || !runtime->second.shell) {
-    error = "wmux: session has no shell process\n";
+  if (runtime == state.runtimes.end()) {
+    error = "wmux: session has no runtime\n";
     return {};
   }
 
-  return AttachTarget{*session_id, request.session_name, runtime->second.shell};
+  const auto active_window = state.sessions.active_window_id(*session_id);
+  if (!active_window) {
+    error = "wmux: session has no active window\n";
+    return {};
+  }
+
+  const auto window = runtime->second.windows.find(*active_window);
+  if (window == runtime->second.windows.end() || !window->second.shell) {
+    error = "wmux: active window has no shell process\n";
+    return {};
+  }
+
+  return AttachTarget{*session_id, *active_window, request.session_name, window->second.shell};
 }
 
 void close_pipe(HANDLE pipe) {

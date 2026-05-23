@@ -14,6 +14,7 @@ struct IpcRequest {
   std::string session_name;
   std::string target_name;
   std::string new_name;
+  std::string window_name;
   std::uint16_t terminal_columns{0};
   std::uint16_t terminal_rows{0};
   bool force{false};

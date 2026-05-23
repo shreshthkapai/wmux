@@ -79,6 +79,73 @@ CommandLine parse_rename_session(const std::vector<std::string_view>& args) {
   return command;
 }
 
+CommandLine parse_new_window(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::NewWindow;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "-t") {
+      if (i + 1 >= args.size() || is_empty(args[i + 1])) {
+        return invalid("new-window requires -t <session>");
+      }
+      command.session_name = std::string{args[++i]};
+      continue;
+    }
+
+    if (args[i] == "-n") {
+      if (i + 1 >= args.size() || is_empty(args[i + 1])) {
+        return invalid("new-window requires -n <name>");
+      }
+      command.window_name = std::string{args[++i]};
+      continue;
+    }
+
+    std::ostringstream message;
+    message << "new-window does not accept argument " << quoted(args[i]);
+    return invalid(message.str());
+  }
+
+  if (command.window_name.empty()) {
+    return invalid("new-window requires -n <name>");
+  }
+
+  return command;
+}
+
+CommandLine parse_list_windows(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::ListWindows;
+
+  if (args.size() == 1) {
+    return command;
+  }
+
+  if (args.size() == 3 && args[1] == "-t" && !is_empty(args[2])) {
+    command.session_name = std::string{args[2]};
+    return command;
+  }
+
+  return invalid("list-windows accepts optional -t <session>");
+}
+
+CommandLine parse_rename_window(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::RenameWindow;
+
+  if (args.size() == 2 && !is_empty(args[1])) {
+    command.window_name = std::string{args[1]};
+    return command;
+  }
+
+  if (args.size() == 4 && args[1] == "-t" && !is_empty(args[2]) && !is_empty(args[3])) {
+    command.session_name = std::string{args[2]};
+    command.window_name = std::string{args[3]};
+    return command;
+  }
+
+  return invalid("rename-window requires [-t <session>] <new>");
+}
+
 CommandLine parse_server_command(const std::vector<std::string_view>& args) {
   if (args.size() < 2) {
     return invalid("server requires one subcommand: status or stop");
@@ -155,6 +222,18 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_named_session_command(args, CommandKind::KillSession, "kill-session", "-t");
   }
 
+  if (args[0] == "new-window") {
+    return parse_new_window(args);
+  }
+
+  if (args[0] == "list-windows") {
+    return parse_list_windows(args);
+  }
+
+  if (args[0] == "rename-window") {
+    return parse_rename_window(args);
+  }
+
   if (args[0] == "server") {
     return parse_server_command(args);
   }
@@ -179,6 +258,11 @@ std::string render_help(std::string_view executable_name) {
   out << "  attach -t <name>               Attach to a session\n";
   out << "  rename-session -t <old> <new>  Rename a session\n";
   out << "  kill-session -t <name>         Kill a session\n";
+  out << "  new-window [-t <session>] -n <name>\n";
+  out << "                                 Create a window\n";
+  out << "  list-windows [-t <session>]    List windows\n";
+  out << "  rename-window [-t <session>] <new>\n";
+  out << "                                 Rename the active window\n";
   out << "  server status                  Show daemon status\n";
   out << "  server stop [--force]          Stop daemon\n";
   out << "  version                        Print wmux version information\n";
@@ -220,6 +304,27 @@ std::string render_placeholder_response(const CommandLine& command) {
       break;
     case CommandKind::KillSession:
       out << "wmux: would kill session '" << command.session_name << "'\n";
+      break;
+    case CommandKind::NewWindow:
+      out << "wmux: would create window '" << command.window_name << "'";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::ListWindows:
+      out << "wmux: would list windows";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::RenameWindow:
+      out << "wmux: would rename active window to '" << command.window_name << "'";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
       break;
     case CommandKind::ServerStatus:
       out << "wmux: daemon status is not implemented yet\n";

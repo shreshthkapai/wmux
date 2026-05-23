@@ -16,6 +16,9 @@ enum class CommandKind {
   AttachSession,
   RenameSession,
   KillSession,
+  NewWindow,
+  ListWindows,
+  RenameWindow,
   ServerStatus,
   ServerStop,
   Unknown,
@@ -27,6 +30,7 @@ struct CommandLine {
   std::string session_name;
   std::string target_name;
   std::string new_name;
+  std::string window_name;
   bool force{false};
 };
 

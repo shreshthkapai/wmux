@@ -74,6 +74,58 @@ void expects_kill_session_command() {
   assert(result.error.empty());
 }
 
+void expects_new_window_command() {
+  const std::vector<std::string_view> args{"new-window", "-n", "logs"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::NewWindow);
+  assert(result.window_name == "logs");
+  assert(result.session_name.empty());
+  assert(result.error.empty());
+}
+
+void expects_targeted_new_window_command() {
+  const std::vector<std::string_view> args{"new-window", "-t", "finance", "-n", "logs"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::NewWindow);
+  assert(result.session_name == "finance");
+  assert(result.window_name == "logs");
+  assert(result.error.empty());
+}
+
+void expects_list_windows_command() {
+  const std::vector<std::string_view> args{"list-windows"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::ListWindows);
+  assert(result.session_name.empty());
+  assert(result.error.empty());
+}
+
+void expects_targeted_list_windows_command() {
+  const std::vector<std::string_view> args{"list-windows", "-t", "finance"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::ListWindows);
+  assert(result.session_name == "finance");
+  assert(result.error.empty());
+}
+
+void expects_rename_window_command() {
+  const std::vector<std::string_view> args{"rename-window", "agents"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::RenameWindow);
+  assert(result.window_name == "agents");
+  assert(result.session_name.empty());
+  assert(result.error.empty());
+}
+
+void expects_targeted_rename_window_command() {
+  const std::vector<std::string_view> args{"rename-window", "-t", "finance", "agents"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::RenameWindow);
+  assert(result.session_name == "finance");
+  assert(result.window_name == "agents");
+  assert(result.error.empty());
+}
+
 void expects_server_status_command() {
   const std::vector<std::string_view> args{"server", "status"};
   const auto result = wmux::parse_command_line(args);
@@ -109,6 +161,20 @@ void expects_wrong_target_flag_error() {
   const auto result = wmux::parse_command_line(args);
   assert(result.kind == wmux::CommandKind::Unknown);
   assert(result.error == "attach requires -t <name>");
+}
+
+void expects_missing_window_name_error() {
+  const std::vector<std::string_view> args{"new-window", "-n"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "new-window requires -n <name>");
+}
+
+void expects_bad_list_windows_argument_error() {
+  const std::vector<std::string_view> args{"list-windows", "finance"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "list-windows accepts optional -t <session>");
 }
 
 void expects_server_subcommand_error() {
@@ -151,11 +217,19 @@ int main() {
   expects_attach_session_command();
   expects_rename_session_command();
   expects_kill_session_command();
+  expects_new_window_command();
+  expects_targeted_new_window_command();
+  expects_list_windows_command();
+  expects_targeted_list_windows_command();
+  expects_rename_window_command();
+  expects_targeted_rename_window_command();
   expects_server_status_command();
   expects_server_stop_command();
   expects_forced_server_stop_command();
   expects_missing_session_name_error();
   expects_wrong_target_flag_error();
+  expects_missing_window_name_error();
+  expects_bad_list_windows_argument_error();
   expects_server_subcommand_error();
   expects_server_stop_argument_error();
   expects_placeholder_response();

@@ -205,6 +205,7 @@ Use integration tests for Windows behavior:
 
 - ConPTY process spawn
 - session kill cleanup with no leaked daemon-owned shell processes
+- daemon window create/list/rename commands against live session state
 - input/output round trips
 - resizing pseudo consoles
 - attach/detach

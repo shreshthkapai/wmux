@@ -179,6 +179,12 @@ std::string request_type_for_command(CommandKind kind) {
       return "RenameSession";
     case CommandKind::KillSession:
       return "KillSession";
+    case CommandKind::NewWindow:
+      return "NewWindow";
+    case CommandKind::ListWindows:
+      return "ListWindows";
+    case CommandKind::RenameWindow:
+      return "RenameWindow";
     case CommandKind::ServerStatus:
       return "ServerStatus";
     case CommandKind::ServerStop:
@@ -229,6 +235,9 @@ std::string make_command_request_json(const CommandLine& command) {
   if (!command.new_name.empty()) {
     append_json_field(out, "new_name", command.new_name);
   }
+  if (!command.window_name.empty()) {
+    append_json_field(out, "window_name", command.window_name);
+  }
   if (command.force) {
     append_json_bool(out, "force", command.force);
   }
@@ -273,6 +282,9 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   }
   if (const auto new_name = find_json_string(json, "new_name")) {
     request.new_name = *new_name;
+  }
+  if (const auto window_name = find_json_string(json, "window_name")) {
+    request.window_name = *window_name;
   }
   if (const auto force = find_json_bool(json, "force")) {
     request.force = *force;
