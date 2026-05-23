@@ -71,9 +71,9 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 7A
-daemon-owned ConPTY shell, raw detach/reattach path, and initial window command
-surface:
+The current skeleton builds a small `wmux` executable with the Phase 7B
+daemon-owned ConPTY shell, raw detach/reattach path, window commands, and
+interactive window switching:
 
 ```bash
 cmake -S . -B build
@@ -142,10 +142,23 @@ leaves the session attachable.
 Interactive attach is intentionally still raw output passthrough. It is good
 enough to prove ConPTY process ownership and first shell IO. Client input uses
 small length-prefixed attach frames so `Ctrl+b d` is an explicit detach event
-instead of an accidental pipe close. The client also sends its initial terminal
-size on attach so the daemon can resize ConPTY before replaying output, but
-live resize events, the richer terminal model, and pane rendering come in later
-phases.
+instead of an accidental pipe close. `Ctrl+b c` creates a new window, while
+`Ctrl+b n` and `Ctrl+b p` switch the attached session between independent
+window shells. The client also sends its initial terminal size on attach so the
+daemon can resize ConPTY before replaying output, but live resize events, the
+richer terminal model, and pane rendering come in later phases.
+
+For the current interactive window switching check, run:
+
+```powershell
+.\scripts\test-window-switching.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, drives the attach pipe directly, creates a window
+with the same command frame used by `Ctrl+b c`, switches with the same command
+frames used by `Ctrl+b p` and `Ctrl+b n`, and verifies each window keeps
+independent shell state.
 
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY

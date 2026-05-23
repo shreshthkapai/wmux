@@ -28,6 +28,7 @@ struct IpcResponse {
 enum class AttachFrameType : std::uint8_t {
   Input = 1,
   Detach = 2,
+  Command = 3,
 };
 
 struct AttachFrameHeader {
@@ -49,6 +50,7 @@ std::string make_response_json(bool ok, std::string_view message);
 std::optional<IpcResponse> parse_response_json(std::string_view json);
 std::string make_attach_input_frame(std::string_view bytes);
 std::string make_attach_detach_frame();
+std::string make_attach_command_frame(std::string_view command);
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header);
 
 }  // namespace wmux

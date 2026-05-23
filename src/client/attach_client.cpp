@@ -204,6 +204,10 @@ bool send_attach_detach(HANDLE pipe) {
   return write_attach_frame(pipe, make_attach_detach_frame());
 }
 
+bool send_attach_command(HANDLE pipe, std::string_view command) {
+  return write_attach_frame(pipe, make_attach_command_frame(command));
+}
+
 bool read_response_line(HANDLE pipe, std::string& response) {
   response.clear();
   char ch = '\0';
@@ -235,6 +239,15 @@ bool send_processed_input(
         stop_requested = true;
         SetEvent(stop_event);
         return sent;
+      }
+      if (byte == 'c') {
+        return send_attach_command(pipe, "new-window");
+      }
+      if (byte == 'n') {
+        return send_attach_command(pipe, "next-window");
+      }
+      if (byte == 'p') {
+        return send_attach_command(pipe, "previous-window");
       }
 
       to_send.push_back('\x02');

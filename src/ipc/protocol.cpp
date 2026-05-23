@@ -328,6 +328,10 @@ std::string make_attach_detach_frame() {
   return make_attach_frame(AttachFrameType::Detach, {});
 }
 
+std::string make_attach_command_frame(std::string_view command) {
+  return make_attach_frame(AttachFrameType::Command, command);
+}
+
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
   if (header.size() != kAttachFrameHeaderSize || header[0] != 'W' || header[1] != 'M') {
     return std::nullopt;
@@ -340,6 +344,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       break;
     case static_cast<std::uint8_t>(AttachFrameType::Detach):
       parsed.type = AttachFrameType::Detach;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::Command):
+      parsed.type = AttachFrameType::Command;
       break;
     default:
       return std::nullopt;

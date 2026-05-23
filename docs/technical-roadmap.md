@@ -340,7 +340,6 @@ Current implementation notes:
   `wmux new-window -t finance -n logs`, `wmux list-windows -t finance`, and
   `wmux rename-window -t finance agents`.
 - `wmux attach -t <session>` attaches to that session's active window.
-- Keybind-driven window switching is intentionally left for Phase 7B.
 - Rendering is still raw active-window output passthrough. Split panes, copy
   mode, and correct redraw still require daemon-owned VT state.
 
@@ -350,6 +349,33 @@ Current implementation notes:
 - Add `Ctrl+b n` and `Ctrl+b p` for next/previous window
 - Add command-mode equivalents once command mode exists
 - Ensure attached clients switch to the newly active window cleanly
+
+Current implementation notes:
+
+- Attach input now has a third framed message type for wmux control commands.
+  Normal shell bytes, explicit detach, and window commands are kept separate.
+- `Ctrl+b c` creates a new daemon-owned window shell in the attached session and
+  makes it active.
+- `Ctrl+b n` and `Ctrl+b p` switch the session's active window and replay the
+  newly active shell's bounded output buffer to the attached client.
+- The attach thread performs initial and switch replay before returning to input
+  polling. This avoids blocking output behind an idle synchronous pipe read.
+- Server-side attach input reads poll for complete framed messages before
+  calling `ReadFile`, which keeps live output responsive while the client is
+  idle.
+- This is still raw byte replay. Correct redraw across full-screen TUIs,
+  alternate screen state, panes, scrollback, and copy mode still require the
+  daemon-owned VT model in Phase 8.
+
+Current stability checks:
+
+```powershell
+.\scripts\test-window-switching.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script verifies interactive create, previous-window, and next-window
+control frames against real ConPTY shells and confirms each window keeps
+independent shell state.
 
 ### Phase 8: Virtual Terminal State
 

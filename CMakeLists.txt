@@ -61,7 +61,11 @@ set(WMUX_COMMON_SOURCES
 
 set(WMUX_RUNTIME_SOURCES
   src/client/attach_client.cpp
+  src/daemon/daemon_attach.cpp
+  src/daemon/daemon_commands.cpp
   src/daemon/daemon.cpp
+  src/daemon/daemon_shell.cpp
+  src/daemon/daemon_state.cpp
   src/ipc/transport.cpp
   src/pty/pty_process.cpp
 )
