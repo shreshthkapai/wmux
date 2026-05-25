@@ -41,6 +41,16 @@ void expects_window_command_request_json() {
   assert(request->window_name == "logs");
 }
 
+void expects_split_command_request_json() {
+  const std::vector<std::string_view> args{"split-window", "-t", "finance", "-v"};
+  const auto command = wmux::parse_command_line(args);
+  const auto request = wmux::parse_request_json(wmux::make_command_request_json(command));
+  assert(request);
+  assert(request->type == "SplitWindow");
+  assert(request->session_name == "finance");
+  assert(request->split_direction == "vertical");
+}
+
 void expects_attach_request_json_with_terminal_size() {
   wmux::CommandLine command;
   command.kind = wmux::CommandKind::AttachSession;
@@ -117,6 +127,7 @@ void run_ipc_protocol_tests() {
   expects_command_request_json();
   expects_forced_command_request_json();
   expects_window_command_request_json();
+  expects_split_command_request_json();
   expects_attach_request_json_with_terminal_size();
   expects_json_escaping();
   expects_response_json();

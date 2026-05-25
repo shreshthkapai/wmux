@@ -126,6 +126,24 @@ void expects_targeted_rename_window_command() {
   assert(result.error.empty());
 }
 
+void expects_split_window_horizontal_command() {
+  const std::vector<std::string_view> args{"split-window", "-h"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SplitWindow);
+  assert(result.split_direction == "horizontal");
+  assert(result.session_name.empty());
+  assert(result.error.empty());
+}
+
+void expects_split_window_vertical_command() {
+  const std::vector<std::string_view> args{"split-window", "-t", "finance", "-v"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SplitWindow);
+  assert(result.session_name == "finance");
+  assert(result.split_direction == "vertical");
+  assert(result.error.empty());
+}
+
 void expects_server_status_command() {
   const std::vector<std::string_view> args{"server", "status"};
   const auto result = wmux::parse_command_line(args);
@@ -177,6 +195,20 @@ void expects_bad_list_windows_argument_error() {
   assert(result.error == "list-windows accepts optional -t <session>");
 }
 
+void expects_missing_split_direction_error() {
+  const std::vector<std::string_view> args{"split-window"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "split-window requires one of -h or -v");
+}
+
+void expects_duplicate_split_direction_error() {
+  const std::vector<std::string_view> args{"split-window", "-h", "-v"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "split-window accepts only one split direction");
+}
+
 void expects_server_subcommand_error() {
   const std::vector<std::string_view> args{"server", "restart"};
   const auto result = wmux::parse_command_line(args);
@@ -223,6 +255,8 @@ int main() {
   expects_targeted_list_windows_command();
   expects_rename_window_command();
   expects_targeted_rename_window_command();
+  expects_split_window_horizontal_command();
+  expects_split_window_vertical_command();
   expects_server_status_command();
   expects_server_stop_command();
   expects_forced_server_stop_command();
@@ -230,6 +264,8 @@ int main() {
   expects_wrong_target_flag_error();
   expects_missing_window_name_error();
   expects_bad_list_windows_argument_error();
+  expects_missing_split_direction_error();
+  expects_duplicate_split_direction_error();
   expects_server_subcommand_error();
   expects_server_stop_argument_error();
   expects_placeholder_response();

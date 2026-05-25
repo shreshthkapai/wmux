@@ -55,6 +55,27 @@ std::string window_error_message(WindowError error, std::string_view name) {
   return out.str();
 }
 
+std::string pane_error_message(PaneError error) {
+  std::ostringstream out;
+
+  switch (error) {
+    case PaneError::SessionNotFound:
+      out << "wmux: target session not found\n";
+      break;
+    case PaneError::WindowNotFound:
+      out << "wmux: active window not found\n";
+      break;
+    case PaneError::PaneNotFound:
+      out << "wmux: active pane not found\n";
+      break;
+    case PaneError::None:
+      out << "wmux: pane operation failed\n";
+      break;
+  }
+
+  return out.str();
+}
+
 DaemonStats daemon_stats(DaemonState& state) {
   std::lock_guard lock(state.mutex);
   return {state.sessions.session_count(), state.attach_clients.size()};
@@ -69,8 +90,11 @@ std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state) {
       (void)id;
       for (auto& [window_id, window] : runtime.windows) {
         (void)window_id;
-        if (window.shell) {
-          shells.push_back(std::move(window.shell));
+        for (auto& [pane_id, pane] : window.panes) {
+          (void)pane_id;
+          if (pane.shell) {
+            shells.push_back(std::move(pane.shell));
+          }
         }
       }
     }

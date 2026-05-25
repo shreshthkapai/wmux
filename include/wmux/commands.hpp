@@ -19,6 +19,7 @@ enum class CommandKind {
   NewWindow,
   ListWindows,
   RenameWindow,
+  SplitWindow,
   ServerStatus,
   ServerStop,
   Unknown,
@@ -31,6 +32,7 @@ struct CommandLine {
   std::string target_name;
   std::string new_name;
   std::string window_name;
+  std::string split_direction;
   bool force{false};
 };
 

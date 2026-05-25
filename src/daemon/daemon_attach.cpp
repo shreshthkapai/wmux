@@ -11,8 +11,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,7 +34,24 @@ struct AttachTarget {
 
 struct ActiveShell {
   WindowId window_id{0};
+  PaneId pane_id{0};
   std::shared_ptr<PtyProcess> shell;
+};
+
+struct RenderPane {
+  PaneLayoutRect rect;
+  bool active{false};
+  std::shared_ptr<PtyProcess> shell;
+};
+
+struct ActiveWindowFrame {
+  WindowId window_id{0};
+  PaneId active_pane_id{0};
+  std::string session_name;
+  std::string window_name;
+  int columns{120};
+  int rows{30};
+  std::vector<RenderPane> panes;
 };
 
 std::optional<AttachTarget> target_for_attach(
@@ -64,6 +83,11 @@ std::optional<ActiveShell> active_shell_for_session(
     error = "wmux: session has no active window\n";
     return {};
   }
+  const auto active_pane = state.sessions.active_pane_id(session_id);
+  if (!active_pane) {
+    error = "wmux: active window has no active pane\n";
+    return {};
+  }
 
   const auto runtime = state.runtimes.find(session_id);
   if (runtime == state.runtimes.end()) {
@@ -72,12 +96,76 @@ std::optional<ActiveShell> active_shell_for_session(
   }
 
   const auto window = runtime->second.windows.find(*active_window);
-  if (window == runtime->second.windows.end() || !window->second.shell) {
-    error = "wmux: active window has no shell process\n";
+  if (window == runtime->second.windows.end()) {
+    error = "wmux: active window has no runtime\n";
     return {};
   }
 
-  return ActiveShell{*active_window, window->second.shell};
+  const auto pane = window->second.panes.find(*active_pane);
+  if (pane == window->second.panes.end() || !pane->second.shell) {
+    error = "wmux: active pane has no shell process\n";
+    return {};
+  }
+
+  return ActiveShell{*active_window, *active_pane, pane->second.shell};
+}
+
+std::optional<ActiveWindowFrame> active_window_frame(
+    DaemonState& state,
+    SessionId session_id,
+    std::string_view session_name,
+    short columns,
+    short rows,
+    std::string& error) {
+  ActiveWindowFrame frame;
+  frame.columns = columns > 0 ? columns : 120;
+  frame.rows = rows > 0 ? rows : 30;
+
+  std::lock_guard lock(state.mutex);
+  const auto window = state.sessions.active_window_summary(session_id);
+  if (!window) {
+    error = "wmux: session has no active window\n";
+    return {};
+  }
+
+  const auto runtime = state.runtimes.find(session_id);
+  if (runtime == state.runtimes.end()) {
+    error = "wmux: session has no runtime\n";
+    return {};
+  }
+
+  const auto window_runtime = runtime->second.windows.find(window->id);
+  if (window_runtime == runtime->second.windows.end()) {
+    error = "wmux: active window has no runtime\n";
+    return {};
+  }
+
+  const int pane_rows = std::max(1, frame.rows - 1);
+  const auto rects = compute_pane_layout_rects(window->pane_tree, frame.columns, pane_rows);
+
+  frame.window_id = window->id;
+  frame.active_pane_id = window->active_pane_id;
+  frame.session_name = std::string{session_name};
+  frame.window_name = window->name;
+  frame.panes.reserve(rects.size());
+  for (const auto& rect : rects) {
+    const auto pane_runtime = window_runtime->second.panes.find(rect.pane_id);
+    if (pane_runtime == window_runtime->second.panes.end() || !pane_runtime->second.shell) {
+      continue;
+    }
+
+    frame.panes.push_back(RenderPane{
+        rect,
+        rect.pane_id == window->active_pane_id,
+        pane_runtime->second.shell});
+  }
+
+  if (frame.panes.empty()) {
+    error = "wmux: active window has no pane runtimes\n";
+    return {};
+  }
+
+  return frame;
 }
 
 short attach_dimension(std::uint16_t value) {
@@ -197,6 +285,216 @@ PipeReadResult read_exact(HANDLE pipe, char* buffer, std::size_t byte_count) {
   return PipeReadResult::Ok;
 }
 
+int body_left(const PaneLayoutRect& rect) {
+  return rect.width >= 3 ? rect.left + 1 : rect.left;
+}
+
+int body_top(const PaneLayoutRect& rect) {
+  return rect.height >= 3 ? rect.top + 1 : rect.top;
+}
+
+int body_width(const PaneLayoutRect& rect) {
+  return rect.width >= 3 ? rect.width - 2 : rect.width;
+}
+
+int body_height(const PaneLayoutRect& rect) {
+  return rect.height >= 3 ? rect.height - 2 : rect.height;
+}
+
+void append_cursor_move(std::string& out, int row, int column) {
+  out += "\x1b[";
+  out += std::to_string(row + 1);
+  out += ";";
+  out += std::to_string(column + 1);
+  out += "H";
+}
+
+std::string sanitize_terminal_output(std::string_view bytes) {
+  std::string sanitized;
+  sanitized.reserve(bytes.size());
+
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const unsigned char ch = static_cast<unsigned char>(bytes[index]);
+    if (ch == '\x1b') {
+      if (index + 1 < bytes.size() && bytes[index + 1] == '[') {
+        index += 2;
+        while (index < bytes.size()) {
+          const unsigned char final = static_cast<unsigned char>(bytes[index]);
+          if (final >= 0x40 && final <= 0x7e) {
+            break;
+          }
+          ++index;
+        }
+      } else if (index + 1 < bytes.size() && bytes[index + 1] == ']') {
+        index += 2;
+        while (index < bytes.size() && bytes[index] != '\a') {
+          if (bytes[index] == '\x1b' && index + 1 < bytes.size() && bytes[index + 1] == '\\') {
+            ++index;
+            break;
+          }
+          ++index;
+        }
+      }
+      continue;
+    }
+
+    if (ch == '\r') {
+      continue;
+    }
+
+    if (ch == '\n' || ch == '\t') {
+      sanitized.push_back(static_cast<char>(ch));
+      continue;
+    }
+
+    if (ch == '\b') {
+      if (!sanitized.empty() && sanitized.back() != '\n') {
+        sanitized.pop_back();
+      }
+      continue;
+    }
+
+    if (ch >= 0x20 && ch != 0x7f) {
+      sanitized.push_back(static_cast<char>(ch));
+    }
+  }
+
+  return sanitized;
+}
+
+std::vector<std::string> visible_lines(std::string_view bytes, int max_lines) {
+  std::vector<std::string> lines;
+  lines.emplace_back();
+
+  const auto sanitized = sanitize_terminal_output(bytes);
+  for (const char ch : sanitized) {
+    if (ch == '\n') {
+      lines.emplace_back();
+      continue;
+    }
+
+    if (ch == '\t') {
+      auto& line = lines.back();
+      const auto spaces = 4 - (line.size() % 4);
+      line.append(spaces, ' ');
+      continue;
+    }
+
+    lines.back().push_back(ch);
+  }
+
+  if (max_lines > 0 && static_cast<int>(lines.size()) > max_lines) {
+    lines.erase(lines.begin(), lines.end() - max_lines);
+  }
+
+  return lines;
+}
+
+void append_clipped_text(std::string& out, std::string_view line, int width) {
+  if (width <= 0) {
+    return;
+  }
+
+  const auto count = static_cast<std::size_t>(std::min<int>(width, static_cast<int>(line.size())));
+  out.append(line.substr(0, count));
+  if (static_cast<int>(count) < width) {
+    out.append(static_cast<std::size_t>(width) - count, ' ');
+  }
+}
+
+void append_pane_border(std::string& out, const PaneLayoutRect& rect, bool active) {
+  if (rect.width <= 0 || rect.height <= 0) {
+    return;
+  }
+
+  const char horizontal = active ? '=' : '-';
+  const char vertical = active ? '#' : '|';
+
+  if (rect.height == 1) {
+    append_cursor_move(out, rect.top, rect.left);
+    out.append(static_cast<std::size_t>(rect.width), horizontal);
+    return;
+  }
+
+  if (rect.width == 1) {
+    for (int row = 0; row < rect.height; ++row) {
+      append_cursor_move(out, rect.top + row, rect.left);
+      out.push_back(vertical);
+    }
+    return;
+  }
+
+  append_cursor_move(out, rect.top, rect.left);
+  out.push_back('+');
+  out.append(static_cast<std::size_t>(std::max(0, rect.width - 2)), horizontal);
+  out.push_back('+');
+
+  for (int row = 1; row < rect.height - 1; ++row) {
+    append_cursor_move(out, rect.top + row, rect.left);
+    out.push_back(vertical);
+    if (rect.width > 2) {
+      out.append(static_cast<std::size_t>(rect.width - 2), ' ');
+    }
+    out.push_back(vertical);
+  }
+
+  append_cursor_move(out, rect.top + rect.height - 1, rect.left);
+  out.push_back('+');
+  out.append(static_cast<std::size_t>(std::max(0, rect.width - 2)), horizontal);
+  out.push_back('+');
+}
+
+std::string render_frame(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots) {
+  std::string out{kClearTerminal};
+
+  for (const auto& pane : frame.panes) {
+    append_pane_border(out, pane.rect, pane.active);
+
+    const int left = body_left(pane.rect);
+    const int top = body_top(pane.rect);
+    const int width = body_width(pane.rect);
+    const int height = body_height(pane.rect);
+    const auto snapshot = snapshots.find(pane.rect.pane_id);
+    if (snapshot == snapshots.end() || width <= 0 || height <= 0) {
+      continue;
+    }
+
+    const auto lines = visible_lines(snapshot->second.bytes, height);
+    const int first_row = std::max(0, height - static_cast<int>(lines.size()));
+    for (int row = 0; row < height; ++row) {
+      append_cursor_move(out, top + row, left);
+      const int line_index = row - first_row;
+      if (line_index >= 0 && line_index < static_cast<int>(lines.size())) {
+        append_clipped_text(out, lines[static_cast<std::size_t>(line_index)], width);
+      } else {
+        out.append(static_cast<std::size_t>(width), ' ');
+      }
+    }
+  }
+
+  if (frame.rows > 1) {
+    std::ostringstream status;
+    status << " wmux [" << frame.session_name << "] window " << frame.window_name
+           << " pane " << frame.active_pane_id << " ";
+    std::string status_line = status.str();
+    if (static_cast<int>(status_line.size()) > frame.columns) {
+      status_line.resize(static_cast<std::size_t>(frame.columns));
+    }
+    if (static_cast<int>(status_line.size()) < frame.columns) {
+      status_line.append(static_cast<std::size_t>(frame.columns) - status_line.size(), ' ');
+    }
+
+    append_cursor_move(out, frame.rows - 1, 0);
+    out += "\x1b[7m";
+    out += status_line;
+    out += "\x1b[0m";
+  }
+
+  return out;
+}
+
 struct AttachFrame {
   AttachFrameType type{AttachFrameType::Input};
   std::string payload;
@@ -234,7 +532,8 @@ bool create_interactive_window(DaemonState& state, SessionId session_id, std::st
       return false;
     }
 
-    state.runtimes[result.session_id].windows[result.window_id].shell = std::move(shell_process);
+    state.runtimes[result.session_id].windows[result.window_id].panes[result.pane_id].shell =
+        std::move(shell_process);
   }
 
   return true;
@@ -265,6 +564,83 @@ bool select_interactive_window(
   return true;
 }
 
+std::optional<SplitDirection> attach_split_direction(std::string_view command) {
+  if (command == "split-horizontal") {
+    return SplitDirection::Horizontal;
+  }
+
+  if (command == "split-vertical") {
+    return SplitDirection::Vertical;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<PaneDirection> attach_pane_direction(std::string_view command) {
+  if (command == "select-pane-left") {
+    return PaneDirection::Left;
+  }
+
+  if (command == "select-pane-right") {
+    return PaneDirection::Right;
+  }
+
+  if (command == "select-pane-up") {
+    return PaneDirection::Up;
+  }
+
+  if (command == "select-pane-down") {
+    return PaneDirection::Down;
+  }
+
+  return std::nullopt;
+}
+
+bool split_interactive_pane(
+    DaemonState& state,
+    SessionId session_id,
+    SplitDirection direction,
+    std::string& error) {
+  auto shell = start_default_shell();
+  if (!shell.process) {
+    error = shell.error;
+    return false;
+  }
+
+  std::shared_ptr<PtyProcess> shell_process = std::move(shell.process);
+  {
+    std::lock_guard lock(state.mutex);
+    const auto result = state.sessions.split_active_pane(session_id, direction);
+    if (!result.ok) {
+      error = pane_error_message(result.error);
+      shell_process->terminate();
+      return false;
+    }
+
+    state.runtimes[result.session_id]
+        .windows[result.window_id]
+        .panes[result.pane_id]
+        .shell = std::move(shell_process);
+  }
+
+  return true;
+}
+
+bool select_interactive_pane(
+    DaemonState& state,
+    SessionId session_id,
+    PaneDirection direction,
+    std::string& error) {
+  std::lock_guard lock(state.mutex);
+  const auto result = state.sessions.select_pane(session_id, direction);
+  if (!result.ok) {
+    error = pane_error_message(result.error);
+    return false;
+  }
+
+  return true;
+}
+
 bool execute_attach_command(
     DaemonState& state,
     SessionId session_id,
@@ -276,6 +652,14 @@ bool execute_attach_command(
 
   if (command == "next-window" || command == "previous-window") {
     return select_interactive_window(state, session_id, command, error);
+  }
+
+  if (const auto direction = attach_split_direction(command)) {
+    return split_interactive_pane(state, session_id, *direction, error);
+  }
+
+  if (const auto direction = attach_pane_direction(command)) {
+    return select_interactive_pane(state, session_id, *direction, error);
   }
 
   error = "wmux: unknown attach command\n";
@@ -339,6 +723,7 @@ void run_attach_connection(
     DaemonState& state,
     ClientId client_id,
     SessionId session_id,
+    std::string session_name,
     short columns,
     short rows) {
   if (!write_all(pipe, make_response_json(true, ""))) {
@@ -350,23 +735,26 @@ void run_attach_connection(
   std::atomic_bool stop_requested{false};
   std::atomic_bool output_closed{false};
   std::mutex stream_mutex;
-  WindowId current_window_id = 0;
-  std::uint64_t next_sequence = 0;
-  std::shared_ptr<PtyProcess> current_shell;
+  std::unordered_map<PaneId, std::shared_ptr<PtyProcess>> current_shells;
+  std::unordered_map<PaneId, std::uint64_t> next_sequences;
 
   const auto replay_active_window = [&](std::string& error) {
-    auto active_shell = active_shell_for_session(state, session_id, error);
-    if (!active_shell) {
+    auto frame = active_window_frame(state, session_id, session_name, columns, rows, error);
+    if (!frame) {
       return false;
     }
 
-    if (columns > 0 && rows > 0) {
-      active_shell->shell->resize(columns, rows);
+    std::unordered_map<PaneId, PtyOutputSnapshot> snapshots;
+    snapshots.reserve(frame->panes.size());
+    for (const auto& pane : frame->panes) {
+      const int width = std::max(1, body_width(pane.rect));
+      const int height = std::max(1, body_height(pane.rect));
+      pane.shell->resize(static_cast<short>(std::min(width, 32767)),
+                         static_cast<short>(std::min(height, 32767)));
+      snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
     }
 
-    const auto snapshot = active_shell->shell->output_snapshot();
-    std::string replay{kClearTerminal};
-    replay.append(snapshot.bytes);
+    const auto replay = render_frame(*frame, snapshots);
 
     std::lock_guard stream_lock(stream_mutex);
     if (!write_all(pipe, replay)) {
@@ -374,9 +762,17 @@ void run_attach_connection(
       return false;
     }
 
-    current_window_id = active_shell->window_id;
-    current_shell = std::move(active_shell->shell);
-    next_sequence = snapshot.next_sequence;
+    current_shells.clear();
+    next_sequences.clear();
+    current_shells.reserve(frame->panes.size());
+    next_sequences.reserve(frame->panes.size());
+    for (const auto& pane : frame->panes) {
+      current_shells.emplace(pane.rect.pane_id, pane.shell);
+      const auto snapshot = snapshots.find(pane.rect.pane_id);
+      next_sequences.emplace(
+          pane.rect.pane_id,
+          snapshot == snapshots.end() ? 1 : snapshot->second.next_sequence);
+    }
     return true;
   };
 
@@ -394,39 +790,44 @@ void run_attach_connection(
 
   std::thread output_thread{[&] {
     while (!stop_requested) {
-      std::shared_ptr<PtyProcess> shell;
-      std::uint64_t sequence = 0;
-      WindowId window_id = 0;
+      std::vector<std::pair<PaneId, std::shared_ptr<PtyProcess>>> shells;
+      std::unordered_map<PaneId, std::uint64_t> sequences;
       {
         std::lock_guard stream_lock(stream_mutex);
-        shell = current_shell;
-        sequence = next_sequence;
-        window_id = current_window_id;
+        shells.reserve(current_shells.size());
+        for (const auto& [pane_id, shell] : current_shells) {
+          shells.emplace_back(pane_id, shell);
+        }
+        sequences = next_sequences;
       }
 
-      if (!shell) {
+      if (shells.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{25});
         continue;
       }
 
-      const auto output = shell->wait_for_output(sequence, std::chrono::milliseconds{100});
-      if (!output.bytes.empty()) {
-        std::lock_guard stream_lock(stream_mutex);
-        if (shell != current_shell || window_id != current_window_id || sequence != next_sequence) {
+      bool changed = false;
+      for (const auto& [pane_id, shell] : shells) {
+        const auto sequence = sequences.find(pane_id);
+        if (sequence == sequences.end()) {
           continue;
         }
 
-        if (!write_all(pipe, output.bytes)) {
-          output_closed = true;
+        const auto output = shell->wait_for_output(sequence->second, std::chrono::milliseconds{0});
+        if (!output.bytes.empty()) {
+          changed = true;
+          break;
+        }
+      }
+
+      if (changed) {
+        std::string error;
+        if (!replay_active_window(error)) {
           stop_requested = true;
           break;
         }
-        next_sequence = output.next_sequence;
-      }
-
-      if (!output.alive && output.bytes.empty()) {
-        stop_requested = true;
-        break;
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds{33});
       }
     }
   }};
@@ -602,9 +1003,10 @@ AttachDispatch dispatch_attach_connection(
                &state,
                client_id,
                session_id = target->session_id,
+               session_name = std::move(target->session_name),
                columns,
                rows] {
-    run_attach_connection(pipe, state, client_id, session_id, columns, rows);
+    run_attach_connection(pipe, state, client_id, session_id, session_name, columns, rows);
   }}
       .detach();
   return AttachDispatch::HandedOff;

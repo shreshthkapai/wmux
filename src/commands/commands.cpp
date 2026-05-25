@@ -146,6 +146,39 @@ CommandLine parse_rename_window(const std::vector<std::string_view>& args) {
   return invalid("rename-window requires [-t <session>] <new>");
 }
 
+CommandLine parse_split_window(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::SplitWindow;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "-t") {
+      if (i + 1 >= args.size() || is_empty(args[i + 1])) {
+        return invalid("split-window requires -t <session>");
+      }
+      command.session_name = std::string{args[++i]};
+      continue;
+    }
+
+    if (args[i] == "-h" || args[i] == "-v") {
+      if (!command.split_direction.empty()) {
+        return invalid("split-window accepts only one split direction");
+      }
+      command.split_direction = args[i] == "-h" ? "horizontal" : "vertical";
+      continue;
+    }
+
+    std::ostringstream message;
+    message << "split-window does not accept argument " << quoted(args[i]);
+    return invalid(message.str());
+  }
+
+  if (command.split_direction.empty()) {
+    return invalid("split-window requires one of -h or -v");
+  }
+
+  return command;
+}
+
 CommandLine parse_server_command(const std::vector<std::string_view>& args) {
   if (args.size() < 2) {
     return invalid("server requires one subcommand: status or stop");
@@ -234,6 +267,10 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_rename_window(args);
   }
 
+  if (args[0] == "split-window") {
+    return parse_split_window(args);
+  }
+
   if (args[0] == "server") {
     return parse_server_command(args);
   }
@@ -263,6 +300,8 @@ std::string render_help(std::string_view executable_name) {
   out << "  list-windows [-t <session>]    List windows\n";
   out << "  rename-window [-t <session>] <new>\n";
   out << "                                 Rename the active window\n";
+  out << "  split-window [-t <session>] -h|-v\n";
+  out << "                                 Split the active pane\n";
   out << "  server status                  Show daemon status\n";
   out << "  server stop [--force]          Stop daemon\n";
   out << "  version                        Print wmux version information\n";
@@ -321,6 +360,13 @@ std::string render_placeholder_response(const CommandLine& command) {
       break;
     case CommandKind::RenameWindow:
       out << "wmux: would rename active window to '" << command.window_name << "'";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::SplitWindow:
+      out << "wmux: would split active pane " << command.split_direction;
       if (!command.session_name.empty()) {
         out << " in session '" << command.session_name << "'";
       }

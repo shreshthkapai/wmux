@@ -340,8 +340,9 @@ Current implementation notes:
   `wmux new-window -t finance -n logs`, `wmux list-windows -t finance`, and
   `wmux rename-window -t finance agents`.
 - `wmux attach -t <session>` attaches to that session's active window.
-- Rendering is still raw active-window output passthrough. Split panes, copy
-  mode, and correct redraw still require daemon-owned VT state.
+- Phase 8C replaces raw active-window passthrough with basic daemon-rendered
+  pane frames. Copy mode and correct redraw for complex terminal apps still
+  require daemon-owned VT state.
 
 ### Phase 7B: Interactive Window Switching
 
@@ -363,9 +364,10 @@ Current implementation notes:
 - Server-side attach input reads poll for complete framed messages before
   calling `ReadFile`, which keeps live output responsive while the client is
   idle.
-- This is still raw byte replay. Correct redraw across full-screen TUIs,
-  alternate screen state, panes, scrollback, and copy mode still require the
-  daemon-owned VT model in Phase 8.
+- Phase 8C replaces raw byte replay in the attached view with basic
+  daemon-rendered pane frames. Correct redraw across full-screen TUIs,
+  alternate screen state, scrollback, and copy mode still require the
+  daemon-owned VT model in Phase 9.
 
 Current stability checks:
 
@@ -377,7 +379,101 @@ The script verifies interactive create, previous-window, and next-window
 control frames against real ConPTY shells and confirms each window keeps
 independent shell state.
 
-### Phase 8: Virtual Terminal State
+### Phase 8A: Pane Model and Split Commands
+
+- Add stable pane IDs
+- Add pane summaries to windows
+- Add a pane layout tree
+- Track `active_pane_id` per window
+- Add command IPC for `split-window -h` and `split-window -v`
+- Spawn one daemon-owned ConPTY shell for each new pane
+
+Current implementation notes:
+
+- Every new session starts with one window and one pane.
+- Every new window starts with one pane.
+- `split-window [-t <session>] -h` and `split-window [-t <session>] -v`
+  split the active pane in the active window and make the newly created pane
+  active.
+- Pane runtime ownership is keyed by stable `SessionId`, `WindowId`, and
+  `PaneId`; pane layout position is not process identity.
+- The pane tree records nested horizontal and vertical splits with a 50/50
+  initial ratio. Phase 8C uses this tree for basic rectangle computation and
+  bordered rendering.
+- Command-IPC splits update the daemon model. Existing attach clients are still
+  not notified unless the split is initiated through that attach connection.
+
+### Phase 8B: Interactive Pane Splitting and Focus
+
+- Add `Ctrl+b %` and `Ctrl+b "` for splitting
+- Add `Ctrl+b` arrow keys for pane focus
+- Route input only to the focused pane
+- Ensure each pane keeps independent shell state
+
+Current implementation notes:
+
+- Attach command frames now include pane commands for horizontal split, vertical
+  split, and directional focus.
+- `Ctrl+b %` creates a new daemon-owned pane shell by splitting the active pane
+  horizontally, then replays the new active pane to the attached client.
+- `Ctrl+b "` creates a new daemon-owned pane shell by splitting the active pane
+  vertically, then replays the new active pane to the attached client.
+- `Ctrl+b` arrow keys select the nearest pane in that direction based on the
+  pane tree's current virtual rectangles. This is the same neighbor model the
+  later renderer can use, but it does not draw borders yet.
+- Attach streaming tracks active window and active pane IDs so output from an
+  old pane is ignored after focus changes.
+- Input is resolved against the daemon's current active pane on every input
+  frame, so shell input follows focus.
+- Phase 8C replaces raw active-pane passthrough with basic multi-pane redraws.
+  Phase 8B itself proved process ownership and input routing, not final
+  split-pane rendering.
+
+Current stability checks:
+
+```powershell
+.\scripts\test-pane-focus.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script verifies interactive horizontal split, vertical split, left/right/up
+focus, and independent shell state for each pane against real ConPTY shells.
+
+### Phase 8C: Layout Rendering
+
+- Compute pane rectangles
+- Draw borders and active pane highlight
+- Clip pane output to pane rectangles
+- Resize ConPTY dimensions when pane rectangles change
+- Handle terminal resize events
+
+Current implementation notes:
+
+- `compute_pane_layout_rects` converts the daemon-owned pane tree into integer
+  rectangles for the current attached terminal size.
+- Attach output now redraws the active window as a full frame containing every
+  visible pane, ASCII borders, active-pane highlighting, clipped text regions,
+  and a status line.
+- Pane ConPTY dimensions are resized to the pane body before replay/redraw.
+- The renderer strips common VT control sequences and renders plain clipped
+  text from the bounded pane output buffer. This keeps the layout stable enough
+  for split-pane validation, but it is intentionally not the final terminal
+  renderer.
+- Live terminal resize events are still pending. The initial attach size is
+  used for the current frame.
+- Production-grade redraw, full-screen TUI behavior, color/style attributes,
+  alternate screen, scrollback, and copy mode still require Phase 9's
+  daemon-owned VT/grid model.
+
+Current stability checks:
+
+```powershell
+.\scripts\test-pane-focus.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script now validates pane split/focus behavior while receiving bordered
+multi-pane redraw frames from the daemon.
+
+### Phase 9: Virtual Terminal State
 
 - Parse VT output incrementally
 - Maintain pane screen grid
@@ -386,22 +482,12 @@ independent shell state.
 - Support alternate screen buffer
 - Mark dirty regions for render updates
 
-### Phase 9: Render Daemon-Owned Grid
+### Phase 10: Render Daemon-Owned Grid
 
 - Client renders daemon-provided pane state
 - Avoid direct raw passthrough for normal attached rendering
 - Add frame coalescing
 - Clip output to pane rectangle
-
-### Phase 10: Pane Splitting and Layout Rendering
-
-- Add pane layout tree
-- Split horizontally and vertically
-- Compute pane rectangles
-- Draw borders and active pane highlight
-- Route input only to focused pane
-- Resize ConPTY dimensions when pane rectangles change
-- Handle terminal resize events
 
 ### Phase 11: Command Mode
 

@@ -72,7 +72,8 @@ std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
     }
 
     if (shell_process) {
-      state.runtimes[result.id].windows[result.window_id].shell = std::move(shell_process);
+      state.runtimes[result.id].windows[result.window_id].panes[result.pane_id].shell =
+          std::move(shell_process);
     }
   }
 
@@ -126,8 +127,11 @@ std::string handle_kill_session(const IpcRequest& request, DaemonState& state) {
       killed_shells.reserve(runtime->second.windows.size());
       for (auto& [window_id, window] : runtime->second.windows) {
         (void)window_id;
-        if (window.shell) {
-          killed_shells.push_back(std::move(window.shell));
+        for (auto& [pane_id, pane] : window.panes) {
+          (void)pane_id;
+          if (pane.shell) {
+            killed_shells.push_back(std::move(pane.shell));
+          }
         }
       }
       state.runtimes.erase(runtime);
@@ -182,7 +186,8 @@ std::string handle_new_window(const IpcRequest& request, DaemonState& state) {
     }
 
     if (shell_process) {
-      state.runtimes[result.session_id].windows[result.window_id].shell = std::move(shell_process);
+      state.runtimes[result.session_id].windows[result.window_id].panes[result.pane_id].shell =
+          std::move(shell_process);
     }
   }
 
@@ -238,6 +243,67 @@ std::string handle_rename_window(const IpcRequest& request, DaemonState& state) 
   return make_response_json(true, out.str());
 }
 
+std::optional<SplitDirection> parse_split_direction(std::string_view direction) {
+  if (direction == "horizontal") {
+    return SplitDirection::Horizontal;
+  }
+
+  if (direction == "vertical") {
+    return SplitDirection::Vertical;
+  }
+
+  return std::nullopt;
+}
+
+std::string handle_split_window(const IpcRequest& request, DaemonState& state) {
+  const auto direction = parse_split_direction(request.split_direction);
+  if (!direction) {
+    return make_response_json(false, "wmux: split-window requires one of -h or -v\n");
+  }
+
+  SessionId session_id{0};
+  {
+    std::lock_guard lock(state.mutex);
+    std::string error;
+    const auto resolved = resolve_target_session_for_window_command(state, request, error);
+    if (!resolved) {
+      return make_response_json(false, error);
+    }
+    session_id = *resolved;
+  }
+
+  std::shared_ptr<PtyProcess> shell_process;
+  auto shell = start_default_shell();
+  if (!shell.process) {
+    return make_response_json(false, shell.error);
+  }
+  shell_process = std::move(shell.process);
+
+  PaneOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    result = state.sessions.split_active_pane(session_id, *direction);
+    if (!result.ok) {
+      if (shell_process) {
+        shell_process->terminate();
+      }
+      return make_response_json(false, pane_error_message(result.error));
+    }
+
+    if (shell_process) {
+      state.runtimes[result.session_id]
+          .windows[result.window_id]
+          .panes[result.pane_id]
+          .shell = std::move(shell_process);
+    }
+  }
+
+  std::ostringstream out;
+  out << "wmux: split active pane "
+      << (request.split_direction == "horizontal" ? "horizontally" : "vertically") << "\n";
+  return make_response_json(true, out.str());
+}
+
 std::string handle_session_request(const IpcRequest& request, DaemonState& state) {
   if (request.type == "DefaultSession") {
     return make_response_json(true, "wmux: interactive session startup is not implemented yet\n");
@@ -273,6 +339,10 @@ std::string handle_session_request(const IpcRequest& request, DaemonState& state
 
   if (request.type == "RenameWindow") {
     return handle_rename_window(request, state);
+  }
+
+  if (request.type == "SplitWindow") {
+    return handle_split_window(request, state);
   }
 
   return {};

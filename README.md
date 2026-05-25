@@ -71,9 +71,9 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 7B
+The current skeleton builds a small `wmux` executable with the Phase 8C
 daemon-owned ConPTY shell, raw detach/reattach path, window commands, and
-interactive window switching:
+basic pane rendering:
 
 ```bash
 cmake -S . -B build
@@ -87,6 +87,8 @@ cmake --build build
 ./build/wmux new-window -n logs
 ./build/wmux list-windows
 ./build/wmux rename-window agents
+./build/wmux split-window -h
+./build/wmux split-window -v
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -111,7 +113,16 @@ session exists. They also accept `-t <session>` for explicit daemon commands:
 ./build/wmux new-window -t finance -n logs
 ./build/wmux list-windows -t finance
 ./build/wmux rename-window -t finance agents
+./build/wmux split-window -t finance -h
+./build/wmux split-window -t finance -v
 ```
+
+`split-window` updates daemon-owned pane state for the active window, spawns a
+new ConPTY shell for the created pane, and marks the new pane active.
+Interactive attach also supports `Ctrl+b %`, `Ctrl+b "`, and `Ctrl+b` arrow
+keys. Input is routed only to the active pane. Attached windows now render all
+visible panes with ASCII borders, an active-pane highlight, clipped pane text,
+and a status line.
 
 `wmux server stop` refuses to stop while live sessions exist. Use
 `wmux server stop --force` only when you explicitly want the daemon to terminate
@@ -139,14 +150,14 @@ simulates terminal closure by dropping the pipe, reattaches, verifies newer
 output was captured while detached, then verifies an explicit detach still
 leaves the session attachable.
 
-Interactive attach is intentionally still raw output passthrough. It is good
-enough to prove ConPTY process ownership and first shell IO. Client input uses
-small length-prefixed attach frames so `Ctrl+b d` is an explicit detach event
-instead of an accidental pipe close. `Ctrl+b c` creates a new window, while
-`Ctrl+b n` and `Ctrl+b p` switch the attached session between independent
-window shells. The client also sends its initial terminal size on attach so the
-daemon can resize ConPTY before replaying output, but live resize events, the
-richer terminal model, and pane rendering come in later phases.
+Interactive attach now uses daemon-rendered basic pane frames rather than direct
+active-shell passthrough. Client input uses small length-prefixed attach frames
+so `Ctrl+b d` is an explicit detach event instead of an accidental pipe close.
+`Ctrl+b c` creates a new window, while `Ctrl+b n` and `Ctrl+b p` switch the
+attached session between independent window shells. The client also sends its
+initial terminal size on attach so the daemon can size panes before replaying
+output. Live resize events and the richer VT/grid terminal model still come in
+later phases.
 
 For the current interactive window switching check, run:
 
@@ -159,6 +170,19 @@ The script requires an empty daemon, restarts it with a deterministic
 with the same command frame used by `Ctrl+b c`, switches with the same command
 frames used by `Ctrl+b p` and `Ctrl+b n`, and verifies each window keeps
 independent shell state.
+
+For the current interactive pane focus check, run:
+
+```powershell
+.\scripts\test-pane-focus.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, drives the attach pipe directly, splits panes with
+the same command frames used by `Ctrl+b %` and `Ctrl+b "`, switches focus with
+the same command frames used by `Ctrl+b` arrow keys, and verifies each pane
+keeps independent shell state while the attach stream renders a bordered pane
+layout.
 
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY

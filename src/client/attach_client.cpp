@@ -208,6 +208,21 @@ bool send_attach_command(HANDLE pipe, std::string_view command) {
   return write_attach_frame(pipe, make_attach_command_frame(command));
 }
 
+std::string_view arrow_attach_command(char direction) {
+  switch (direction) {
+    case 'A':
+      return "select-pane-up";
+    case 'B':
+      return "select-pane-down";
+    case 'C':
+      return "select-pane-right";
+    case 'D':
+      return "select-pane-left";
+    default:
+      return {};
+  }
+}
+
 bool read_response_line(HANDLE pipe, std::string& response) {
   response.clear();
   char ch = '\0';
@@ -231,7 +246,8 @@ bool send_processed_input(
   std::string to_send;
   to_send.reserve(bytes.size() + 1);
 
-  for (const char byte : bytes) {
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const char byte = bytes[index];
     if (prefix_pending) {
       prefix_pending = false;
       if (byte == 'd') {
@@ -248,6 +264,18 @@ bool send_processed_input(
       }
       if (byte == 'p') {
         return send_attach_command(pipe, "previous-window");
+      }
+      if (byte == '%') {
+        return send_attach_command(pipe, "split-horizontal");
+      }
+      if (byte == '"') {
+        return send_attach_command(pipe, "split-vertical");
+      }
+      if (byte == '\x1b' && index + 2 < bytes.size() && bytes[index + 1] == '[') {
+        const auto command = arrow_attach_command(bytes[index + 2]);
+        if (!command.empty()) {
+          return send_attach_command(pipe, command);
+        }
       }
 
       to_send.push_back('\x02');

@@ -36,8 +36,12 @@ struct DaemonState {
   std::condition_variable attach_clients_changed;
   SessionManager sessions;
 
-  struct WindowRuntime {
+  struct PaneRuntime {
     std::shared_ptr<PtyProcess> shell;
+  };
+
+  struct WindowRuntime {
+    std::unordered_map<PaneId, PaneRuntime> panes;
   };
 
   struct SessionRuntime {
@@ -65,6 +69,7 @@ struct DaemonStats {
 std::string quoted(std::string_view value);
 std::string session_error_message(SessionError error, std::string_view name);
 std::string window_error_message(WindowError error, std::string_view name);
+std::string pane_error_message(PaneError error);
 DaemonStats daemon_stats(DaemonState& state);
 std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state);
 
