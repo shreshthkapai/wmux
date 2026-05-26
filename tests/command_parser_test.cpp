@@ -7,6 +7,7 @@
 
 void run_ipc_protocol_tests();
 void run_session_manager_tests();
+void run_terminal_grid_tests();
 
 namespace {
 
@@ -272,4 +273,5 @@ int main() {
   expects_unknown_command_error();
   run_ipc_protocol_tests();
   run_session_manager_tests();
+  run_terminal_grid_tests();
 }

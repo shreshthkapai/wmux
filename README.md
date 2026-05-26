@@ -71,9 +71,9 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 8C
+The current skeleton builds a small `wmux` executable with the Phase 9C
 daemon-owned ConPTY shell, raw detach/reattach path, window commands, and
-basic pane rendering:
+basic pane rendering plus live attach resize and rendering hardening:
 
 ```bash
 cmake -S . -B build
@@ -122,7 +122,11 @@ new ConPTY shell for the created pane, and marks the new pane active.
 Interactive attach also supports `Ctrl+b %`, `Ctrl+b "`, and `Ctrl+b` arrow
 keys. Input is routed only to the active pane. Attached windows now render all
 visible panes with ASCII borders, an active-pane highlight, clipped pane text,
-and a status line.
+and a status line. The current renderer avoids drawing pane text over
+tiny-pane borders, coalesces continuous output redraws, and has layout tests
+for nested geometry, clamped split ratios, and tiny terminal dimensions. Pane
+text now comes from a daemon-owned virtual terminal grid that is updated by the
+PTY reader thread, not from ad hoc raw-byte sanitization during every redraw.
 
 `wmux server stop` refuses to stop while live sessions exist. Use
 `wmux server stop --force` only when you explicitly want the daemon to terminate
@@ -155,9 +159,12 @@ active-shell passthrough. Client input uses small length-prefixed attach frames
 so `Ctrl+b d` is an explicit detach event instead of an accidental pipe close.
 `Ctrl+b c` creates a new window, while `Ctrl+b n` and `Ctrl+b p` switch the
 attached session between independent window shells. The client also sends its
-initial terminal size on attach so the daemon can size panes before replaying
-output. Live resize events and the richer VT/grid terminal model still come in
-later phases.
+initial terminal size on attach and sends resize frames while attached, so the
+daemon can recompute pane rectangles, resize each visible pane's ConPTY, and
+redraw the active window. The VT/grid foundation currently handles printable
+text, cursor movement, common clear commands, SGR attribute state, and alternate
+screen switching. It is still early and does not yet provide full TUI parity,
+dirty-region frame diffs, scrollback, or copy-mode selection.
 
 For the current interactive window switching check, run:
 

@@ -33,7 +33,7 @@ function Invoke-Wmux {
 
 function New-AttachFrame {
   param(
-    [ValidateSet("Input", "Detach", "Command")]
+    [ValidateSet("Input", "Detach", "Command", "Resize")]
     [string]$Type,
 
     [byte[]]$Payload = @()
@@ -43,6 +43,7 @@ function New-AttachFrame {
     "Input" { 1 }
     "Detach" { 2 }
     "Command" { 3 }
+    "Resize" { 4 }
   }
 
   $length = [uint32]$Payload.Length
@@ -101,6 +102,29 @@ function Write-AttachCommand {
   Write-PipeBytes -Pipe $Pipe -Bytes (
     New-AttachFrame -Type Command -Payload ([Text.Encoding]::UTF8.GetBytes($Command))
   )
+}
+
+function Write-AttachResize {
+  param(
+    [Parameter(Mandatory = $true)]
+    [System.IO.Stream]$Pipe,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, 32767)]
+    [int]$Columns,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, 32767)]
+    [int]$Rows
+  )
+
+  $payload = [byte[]]::new(4)
+  $payload[0] = [byte]($Columns -band 0xff)
+  $payload[1] = [byte](($Columns -shr 8) -band 0xff)
+  $payload[2] = [byte]($Rows -band 0xff)
+  $payload[3] = [byte](($Rows -shr 8) -band 0xff)
+
+  Write-PipeBytes -Pipe $Pipe -Bytes (New-AttachFrame -Type Resize -Payload $payload)
 }
 
 function Write-AttachDetach {
@@ -246,6 +270,11 @@ try {
 
   $attach = Open-Attach -SessionName $sessionName
   [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "initial cmd prompt")
+
+  Write-Host "resize attach viewport"
+  Write-AttachResize -Pipe $attach -Columns 90 -Rows 20
+  $resizeCursor = [regex]::Escape("$([char]27)[20;1H")
+  [void](Read-UntilMarker -Pipe $attach -Pattern $resizeCursor -Description "resize redraw status row")
 
   Write-Host "pane 1: write marker"
   Write-AttachInput -Pipe $attach -Text "echo $marker`_P1`r"

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,7 @@ namespace {
 
 constexpr auto kRequestReadTimeout = std::chrono::seconds{5};
 constexpr auto kRequestReadPoll = std::chrono::milliseconds{10};
+constexpr auto kOutputRedrawInterval = std::chrono::milliseconds{33};
 constexpr std::string_view kClearTerminal = "\x1b[2J\x1b[H";
 
 struct AttachTarget {
@@ -286,19 +288,19 @@ PipeReadResult read_exact(HANDLE pipe, char* buffer, std::size_t byte_count) {
 }
 
 int body_left(const PaneLayoutRect& rect) {
-  return rect.width >= 3 ? rect.left + 1 : rect.left;
+  return rect.width >= 3 && rect.height >= 3 ? rect.left + 1 : rect.left;
 }
 
 int body_top(const PaneLayoutRect& rect) {
-  return rect.height >= 3 ? rect.top + 1 : rect.top;
+  return rect.width >= 3 && rect.height >= 3 ? rect.top + 1 : rect.top;
 }
 
 int body_width(const PaneLayoutRect& rect) {
-  return rect.width >= 3 ? rect.width - 2 : rect.width;
+  return rect.width >= 3 && rect.height >= 3 ? rect.width - 2 : 0;
 }
 
 int body_height(const PaneLayoutRect& rect) {
-  return rect.height >= 3 ? rect.height - 2 : rect.height;
+  return rect.width >= 3 && rect.height >= 3 ? rect.height - 2 : 0;
 }
 
 void append_cursor_move(std::string& out, int row, int column) {
@@ -307,87 +309,6 @@ void append_cursor_move(std::string& out, int row, int column) {
   out += ";";
   out += std::to_string(column + 1);
   out += "H";
-}
-
-std::string sanitize_terminal_output(std::string_view bytes) {
-  std::string sanitized;
-  sanitized.reserve(bytes.size());
-
-  for (std::size_t index = 0; index < bytes.size(); ++index) {
-    const unsigned char ch = static_cast<unsigned char>(bytes[index]);
-    if (ch == '\x1b') {
-      if (index + 1 < bytes.size() && bytes[index + 1] == '[') {
-        index += 2;
-        while (index < bytes.size()) {
-          const unsigned char final = static_cast<unsigned char>(bytes[index]);
-          if (final >= 0x40 && final <= 0x7e) {
-            break;
-          }
-          ++index;
-        }
-      } else if (index + 1 < bytes.size() && bytes[index + 1] == ']') {
-        index += 2;
-        while (index < bytes.size() && bytes[index] != '\a') {
-          if (bytes[index] == '\x1b' && index + 1 < bytes.size() && bytes[index + 1] == '\\') {
-            ++index;
-            break;
-          }
-          ++index;
-        }
-      }
-      continue;
-    }
-
-    if (ch == '\r') {
-      continue;
-    }
-
-    if (ch == '\n' || ch == '\t') {
-      sanitized.push_back(static_cast<char>(ch));
-      continue;
-    }
-
-    if (ch == '\b') {
-      if (!sanitized.empty() && sanitized.back() != '\n') {
-        sanitized.pop_back();
-      }
-      continue;
-    }
-
-    if (ch >= 0x20 && ch != 0x7f) {
-      sanitized.push_back(static_cast<char>(ch));
-    }
-  }
-
-  return sanitized;
-}
-
-std::vector<std::string> visible_lines(std::string_view bytes, int max_lines) {
-  std::vector<std::string> lines;
-  lines.emplace_back();
-
-  const auto sanitized = sanitize_terminal_output(bytes);
-  for (const char ch : sanitized) {
-    if (ch == '\n') {
-      lines.emplace_back();
-      continue;
-    }
-
-    if (ch == '\t') {
-      auto& line = lines.back();
-      const auto spaces = 4 - (line.size() % 4);
-      line.append(spaces, ' ');
-      continue;
-    }
-
-    lines.back().push_back(ch);
-  }
-
-  if (max_lines > 0 && static_cast<int>(lines.size()) > max_lines) {
-    lines.erase(lines.begin(), lines.end() - max_lines);
-  }
-
-  return lines;
 }
 
 void append_clipped_text(std::string& out, std::string_view line, int width) {
@@ -461,11 +382,11 @@ std::string render_frame(
       continue;
     }
 
-    const auto lines = visible_lines(snapshot->second.bytes, height);
-    const int first_row = std::max(0, height - static_cast<int>(lines.size()));
+    const auto& lines = snapshot->second.screen.lines;
+    const int first_row = std::max(0, static_cast<int>(lines.size()) - height);
     for (int row = 0; row < height; ++row) {
       append_cursor_move(out, top + row, left);
-      const int line_index = row - first_row;
+      const int line_index = first_row + row;
       if (line_index >= 0 && line_index < static_cast<int>(lines.size())) {
         append_clipped_text(out, lines[static_cast<std::size_t>(line_index)], width);
       } else {
@@ -734,12 +655,21 @@ void run_attach_connection(
 
   std::atomic_bool stop_requested{false};
   std::atomic_bool output_closed{false};
+  std::atomic<short> current_columns{columns > 0 ? columns : static_cast<short>(120)};
+  std::atomic<short> current_rows{rows > 0 ? rows : static_cast<short>(30)};
   std::mutex stream_mutex;
   std::unordered_map<PaneId, std::shared_ptr<PtyProcess>> current_shells;
   std::unordered_map<PaneId, std::uint64_t> next_sequences;
 
   const auto replay_active_window = [&](std::string& error) {
-    auto frame = active_window_frame(state, session_id, session_name, columns, rows, error);
+    std::lock_guard stream_lock(stream_mutex);
+    auto frame = active_window_frame(
+        state,
+        session_id,
+        session_name,
+        current_columns.load(std::memory_order_relaxed),
+        current_rows.load(std::memory_order_relaxed),
+        error);
     if (!frame) {
       return false;
     }
@@ -756,7 +686,6 @@ void run_attach_connection(
 
     const auto replay = render_frame(*frame, snapshots);
 
-    std::lock_guard stream_lock(stream_mutex);
     if (!write_all(pipe, replay)) {
       output_closed = true;
       return false;
@@ -789,6 +718,7 @@ void run_attach_connection(
   }
 
   std::thread output_thread{[&] {
+    auto last_output_redraw = std::chrono::steady_clock::time_point{};
     while (!stop_requested) {
       std::vector<std::pair<PaneId, std::shared_ptr<PtyProcess>>> shells;
       std::unordered_map<PaneId, std::uint64_t> sequences;
@@ -821,11 +751,24 @@ void run_attach_connection(
       }
 
       if (changed) {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_output_redraw.time_since_epoch().count() != 0) {
+          const auto next_allowed = last_output_redraw + kOutputRedrawInterval;
+          if (now < next_allowed) {
+            std::this_thread::sleep_for(next_allowed - now);
+          }
+        }
+
+        if (stop_requested) {
+          break;
+        }
+
         std::string error;
         if (!replay_active_window(error)) {
           stop_requested = true;
           break;
         }
+        last_output_redraw = std::chrono::steady_clock::now();
       } else {
         std::this_thread::sleep_for(std::chrono::milliseconds{33});
       }
@@ -850,6 +793,23 @@ void run_attach_connection(
         end_reason = AttachEndReason::ProtocolError;
         break;
       }
+      if (!replay_active_window(error)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::Resize) {
+      const auto dimensions = parse_attach_resize_payload(frame.payload);
+      if (!dimensions) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      current_columns.store(static_cast<short>(dimensions->first), std::memory_order_relaxed);
+      current_rows.store(static_cast<short>(dimensions->second), std::memory_order_relaxed);
+      std::string error;
       if (!replay_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "wmux/terminal_grid.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -10,6 +12,7 @@ namespace wmux {
 
 struct PtyOutputSnapshot {
   std::string bytes;
+  TerminalScreenSnapshot screen;
   std::uint64_t next_sequence{1};
   bool alive{false};
 };

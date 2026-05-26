@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <string>
 #include <string_view>
 
@@ -30,6 +31,7 @@ enum class AttachFrameType : std::uint8_t {
   Input = 1,
   Detach = 2,
   Command = 3,
+  Resize = 4,
 };
 
 struct AttachFrameHeader {
@@ -52,6 +54,9 @@ std::optional<IpcResponse> parse_response_json(std::string_view json);
 std::string make_attach_input_frame(std::string_view bytes);
 std::string make_attach_detach_frame();
 std::string make_attach_command_frame(std::string_view command);
+std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows);
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header);
+std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_payload(
+    std::string_view payload);
 
 }  // namespace wmux

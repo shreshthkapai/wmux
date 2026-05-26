@@ -1,9 +1,39 @@
 #include "wmux/session_manager.hpp"
 
 #include <cassert>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace {
+
+void assert_layout_covers_without_overlap(
+    const std::vector<wmux::PaneLayoutRect>& rects,
+    int columns,
+    int rows) {
+  std::vector<bool> occupied(static_cast<std::size_t>(columns * rows), false);
+
+  for (const auto& rect : rects) {
+    assert(rect.left >= 0);
+    assert(rect.top >= 0);
+    assert(rect.width > 0);
+    assert(rect.height > 0);
+    assert(rect.left + rect.width <= columns);
+    assert(rect.top + rect.height <= rows);
+
+    for (int row = rect.top; row < rect.top + rect.height; ++row) {
+      for (int column = rect.left; column < rect.left + rect.width; ++column) {
+        const auto offset = static_cast<std::size_t>((row * columns) + column);
+        assert(!occupied[offset]);
+        occupied[offset] = true;
+      }
+    }
+  }
+
+  for (const bool cell : occupied) {
+    assert(cell);
+  }
+}
 
 void expects_create_and_list_sessions() {
   wmux::SessionManager sessions;
@@ -353,6 +383,60 @@ void computes_integer_pane_layout_rects() {
   assert(rects[2].height == 14);
 }
 
+void computes_nested_layout_without_gaps_or_overlaps() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Vertical).ok);
+  assert(sessions.select_pane(created_session.id, wmux::PaneDirection::Left).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Vertical).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  const auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 101, 37);
+
+  assert(rects.size() == 5);
+  assert_layout_covers_without_overlap(rects, 101, 37);
+}
+
+void clamps_extreme_split_ratios_for_layout() {
+  wmux::PaneNode root;
+  root.kind = wmux::PaneNode::Kind::Split;
+  root.direction = wmux::SplitDirection::Horizontal;
+  root.ratio = 42.0;
+  root.first = std::make_unique<wmux::PaneNode>(1);
+  root.second = std::make_unique<wmux::PaneNode>(2);
+
+  const auto rects = wmux::compute_pane_layout_rects(root, 10, 5);
+
+  assert(rects.size() == 2);
+  assert(rects[0].pane_id == 1);
+  assert(rects[0].width == 9);
+  assert(rects[1].pane_id == 2);
+  assert(rects[1].left == 9);
+  assert(rects[1].width == 1);
+  assert_layout_covers_without_overlap(rects, 10, 5);
+}
+
+void handles_tiny_layout_without_invalid_rectangles() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Vertical).ok);
+
+  const auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 2, 1);
+
+  assert(!rects.empty());
+  assert_layout_covers_without_overlap(rects, 2, 1);
+}
+
 void resolves_only_session_id() {
   wmux::SessionManager sessions;
 
@@ -405,6 +489,9 @@ void run_session_manager_tests() {
   rejects_pane_selection_without_neighbor();
   returns_active_window_summary();
   computes_integer_pane_layout_rects();
+  computes_nested_layout_without_gaps_or_overlaps();
+  clamps_extreme_split_ratios_for_layout();
+  handles_tiny_layout_without_invalid_rectangles();
   resolves_only_session_id();
   rejects_empty_names();
 }

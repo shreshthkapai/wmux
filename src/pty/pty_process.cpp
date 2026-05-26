@@ -220,6 +220,7 @@ struct PtyProcess::Impl {
   mutable std::mutex output_mutex;
   mutable std::condition_variable output_cv;
   std::deque<StoredOutputChunk> output_chunks;
+  TerminalGrid screen;
   std::uint64_t next_sequence{1};
   std::size_t buffered_bytes{0};
   bool reader_done{false};
@@ -239,6 +240,7 @@ struct PtyProcess::Impl {
     }
 
     std::lock_guard lock(output_mutex);
+    screen.feed(bytes);
     buffered_bytes += bytes.size();
     output_chunks.push_back(StoredOutputChunk{next_sequence++, std::move(bytes)});
 
@@ -262,6 +264,7 @@ struct PtyProcess::Impl {
     PtyOutputSnapshot snapshot;
     snapshot.next_sequence = next_sequence;
     snapshot.alive = !reader_done;
+    snapshot.screen = screen.snapshot();
     snapshot.bytes.reserve(buffered_bytes);
     for (const auto& chunk : output_chunks) {
       snapshot.bytes += chunk.bytes;
@@ -353,7 +356,15 @@ struct PtyProcess::Impl {
     }
 
     const COORD size{columns, rows};
-    return SUCCEEDED(ResizePseudoConsole(console.get(), size));
+    if (!SUCCEEDED(ResizePseudoConsole(console.get(), size))) {
+      return false;
+    }
+
+    {
+      std::lock_guard output_lock(output_mutex);
+      screen.resize(columns, rows);
+    }
+    return true;
   }
 
   void terminate() {
@@ -541,6 +552,7 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
   impl->job = std::move(job);
   impl->process = std::move(process);
   impl->console = std::move(console);
+  impl->screen.resize(columns, rows);
 
   auto pty = std::shared_ptr<PtyProcess>(new PtyProcess(std::move(impl)));
   pty->impl_->start_reader();

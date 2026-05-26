@@ -340,6 +340,16 @@ std::string make_attach_command_frame(std::string_view command) {
   return make_attach_frame(AttachFrameType::Command, command);
 }
 
+std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows) {
+  std::string payload;
+  payload.reserve(4);
+  payload.push_back(static_cast<char>(columns & 0xFF));
+  payload.push_back(static_cast<char>((columns >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(rows & 0xFF));
+  payload.push_back(static_cast<char>((rows >> 8) & 0xFF));
+  return make_attach_frame(AttachFrameType::Resize, payload);
+}
+
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
   if (header.size() != kAttachFrameHeaderSize || header[0] != 'W' || header[1] != 'M') {
     return std::nullopt;
@@ -356,6 +366,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
     case static_cast<std::uint8_t>(AttachFrameType::Command):
       parsed.type = AttachFrameType::Command;
       break;
+    case static_cast<std::uint8_t>(AttachFrameType::Resize):
+      parsed.type = AttachFrameType::Resize;
+      break;
     default:
       return std::nullopt;
   }
@@ -370,6 +383,25 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
   }
 
   return parsed;
+}
+
+std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_payload(
+    std::string_view payload) {
+  if (payload.size() != 4) {
+    return std::nullopt;
+  }
+
+  const auto columns =
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[0])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[1]) << 8);
+  const auto rows =
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[2])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[3]) << 8);
+  if (columns == 0 || rows == 0 || columns > 32767 || rows > 32767) {
+    return std::nullopt;
+  }
+
+  return std::pair{columns, rows};
 }
 
 }  // namespace wmux

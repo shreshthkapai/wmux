@@ -458,10 +458,8 @@ Current implementation notes:
   text from the bounded pane output buffer. This keeps the layout stable enough
   for split-pane validation, but it is intentionally not the final terminal
   renderer.
-- Live terminal resize events are still pending. The initial attach size is
-  used for the current frame.
 - Production-grade redraw, full-screen TUI behavior, color/style attributes,
-  alternate screen, scrollback, and copy mode still require Phase 9's
+  alternate screen, scrollback, and copy mode still require Phase 9C's
   daemon-owned VT/grid model.
 
 Current stability checks:
@@ -473,7 +471,56 @@ Current stability checks:
 The script now validates pane split/focus behavior while receiving bordered
 multi-pane redraw frames from the daemon.
 
-### Phase 9: Virtual Terminal State
+### Phase 9A: Live Resize Path
+
+- Detect attached terminal size changes in the client
+- Send resize events on the attach stream
+- Recompute pane rectangles in the daemon
+- Resize visible pane ConPTY dimensions
+- Redraw the active window after resize
+
+Current implementation notes:
+
+- The client polls the current console viewport while attached and sends a
+  dedicated resize attach frame when the size changes.
+- Attach resize frames are length-prefixed control frames, separate from shell
+  input and wmux command frames.
+- The daemon keeps the current dimensions per attach connection, recomputes the
+  active window's pane layout on resize, calls `ResizePseudoConsole` for each
+  visible pane body, and redraws the bordered frame.
+- This makes split-pane layout responsive to outer terminal resize, but it is
+  still backed by raw output sanitization rather than a real VT screen grid.
+
+### Phase 9B: Rendering Hardening
+
+- Improve nested split edge cases
+- Prevent border/output corruption in constrained pane rectangles
+- Reduce unnecessary full-frame redraw churn under continuous output
+- Add layout geometry tests for overlap, gap, and clamped-ratio behavior
+
+Current implementation notes:
+
+- Pane body rendering is disabled for rectangles that are too small to contain
+  both borders and text. Tiny panes now render as border-only instead of letting
+  shell output overwrite pane borders.
+- Visible pane text extraction now clips while scanning the bounded pane output
+  buffer instead of building a full sanitized intermediate string. This keeps
+  redraw cost tied to the visible pane dimensions rather than the whole recent
+  output buffer.
+- Attach frame writes and active-pane/window replay are serialized more tightly
+  so command-triggered redraws, resize redraws, and output-triggered redraws do
+  not interleave on the same attach pipe.
+- Continuous output redraws are coalesced to roughly one frame every 33 ms.
+  This keeps high-output panes from spinning the renderer as fast as the daemon
+  can loop while preserving responsive live updates.
+- Session manager tests now verify nested pane layouts cover the requested
+  terminal area without gaps or overlaps, clamp extreme split ratios, and avoid
+  invalid rectangles under tiny terminal dimensions.
+- This phase hardens the current basic renderer. It is still not the final
+  terminal rendering model for full-screen TUIs, alternate screen state,
+  scrollback, color/style attributes, or copy mode.
+
+### Phase 9C: Virtual Terminal State
 
 - Parse VT output incrementally
 - Maintain pane screen grid
@@ -482,10 +529,35 @@ multi-pane redraw frames from the daemon.
 - Support alternate screen buffer
 - Mark dirty regions for render updates
 
+Current implementation notes:
+
+- `TerminalGrid` is the first daemon-owned virtual terminal model. It keeps a
+  bounded screen grid per pane process with cursor position, basic text
+  attributes, normal screen state, and alternate screen state.
+- The ConPTY reader thread feeds output bytes into the pane grid as bytes
+  arrive, so attached redraws no longer rebuild visible pane text by sanitizing
+  the whole raw output buffer.
+- The current parser handles printable bytes, carriage return, line feed,
+  backspace, tab stops, common CSI cursor movement, clear screen/line commands,
+  basic SGR attribute state, OSC skipping, reset, and alternate-screen
+  switching.
+- Pane resize now resizes both ConPTY and the stored terminal grid before the
+  next redraw.
+- The raw bounded PTY byte buffer still exists for diagnostics and future
+  recovery work, but the basic renderer now reads `TerminalScreenSnapshot`
+  lines from daemon-owned pane state.
+- Unit tests cover newline handling, cursor movement, clear-line behavior,
+  bounded screen scrolling, SGR escape removal, alternate-screen switching, and
+  resize preservation.
+- This is a foundation, not full terminal compatibility yet. Full TUI parity
+  still needs UTF-8/wide-glyph handling, richer DEC modes, dirty-region
+  tracking, scrollback integration, color rendering, and more complete escape
+  coverage.
+
 ### Phase 10: Render Daemon-Owned Grid
 
 - Client renders daemon-provided pane state
-- Avoid direct raw passthrough for normal attached rendering
+- Expand rendering from the daemon-owned grid model
 - Add frame coalescing
 - Clip output to pane rectangle
 

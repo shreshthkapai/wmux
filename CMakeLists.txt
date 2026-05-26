@@ -55,6 +55,7 @@ endif()
 set(WMUX_COMMON_SOURCES
   src/commands/commands.cpp
   src/core/session_manager.cpp
+  src/core/terminal_grid.cpp
   src/core/version.cpp
   src/ipc/protocol.cpp
 )
@@ -99,6 +100,7 @@ if(WMUX_BUILD_TESTS)
     tests/command_parser_test.cpp
     tests/ipc_protocol_test.cpp
     tests/session_manager_test.cpp
+    tests/terminal_grid_test.cpp
     ${WMUX_COMMON_SOURCES}
   )
   target_include_directories(wmux_tests PRIVATE include)

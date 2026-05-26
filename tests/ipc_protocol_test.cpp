@@ -115,6 +115,28 @@ void expects_attach_command_frame() {
   assert(frame.substr(wmux::kAttachFrameHeaderSize) == "next-window");
 }
 
+void expects_attach_resize_frame() {
+  const auto frame = wmux::make_attach_resize_frame(132, 43);
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 4);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::Resize);
+  assert(header->payload_size == 4);
+
+  const auto dimensions =
+      wmux::parse_attach_resize_payload(frame.substr(wmux::kAttachFrameHeaderSize));
+  assert(dimensions);
+  assert(dimensions->first == 132);
+  assert(dimensions->second == 43);
+}
+
+void rejects_bad_attach_resize_payload() {
+  assert(!wmux::parse_attach_resize_payload(""));
+  assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
+}
+
 void expects_bad_json_rejected() {
   const auto request = wmux::parse_request_json("{\"nope\":\"ListSessions\"}\n");
   assert(!request);
@@ -134,5 +156,7 @@ void run_ipc_protocol_tests() {
   expects_attach_input_frame();
   expects_attach_detach_frame();
   expects_attach_command_frame();
+  expects_attach_resize_frame();
+  rejects_bad_attach_resize_payload();
   expects_bad_json_rejected();
 }

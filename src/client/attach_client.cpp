@@ -208,6 +208,18 @@ bool send_attach_command(HANDLE pipe, std::string_view command) {
   return write_attach_frame(pipe, make_attach_command_frame(command));
 }
 
+bool send_attach_resize(HANDLE pipe, TerminalSize size) {
+  if (size.columns == 0 || size.rows == 0) {
+    return true;
+  }
+
+  return write_attach_frame(pipe, make_attach_resize_frame(size.columns, size.rows));
+}
+
+bool same_terminal_size(TerminalSize lhs, TerminalSize rhs) {
+  return lhs.columns == rhs.columns && lhs.rows == rhs.rows;
+}
+
 std::string_view arrow_attach_command(char direction) {
   switch (direction) {
     case 'A':
@@ -396,11 +408,25 @@ int run_attach_client(const CommandLine& command) {
   std::thread output_thread{
       [&] { stream_output(pipe.get(), output, stop_requested, stop_event.get()); }};
 
+  TerminalSize last_size = size;
   bool prefix_pending = false;
   char buffer[512];
   while (!stop_requested) {
     HANDLE handles[] = {input, stop_event.get()};
-    const DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    const DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, 100);
+    const auto latest_size = current_terminal_size(output);
+    if (!same_terminal_size(latest_size, last_size) && latest_size.columns > 0 &&
+        latest_size.rows > 0) {
+      if (!send_attach_resize(pipe.get(), latest_size)) {
+        stop_requested = true;
+        break;
+      }
+      last_size = latest_size;
+    }
+
+    if (wait_result == WAIT_TIMEOUT) {
+      continue;
+    }
     if (wait_result == WAIT_OBJECT_0 + 1 || stop_requested) {
       break;
     }
