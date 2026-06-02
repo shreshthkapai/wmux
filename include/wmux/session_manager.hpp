@@ -28,6 +28,11 @@ enum class PaneDirection {
   Down,
 };
 
+enum class PaneTreePathStep {
+  First,
+  Second,
+};
+
 struct PaneSummary {
   PaneId id{0};
   std::chrono::system_clock::time_point created_at;
@@ -35,6 +40,15 @@ struct PaneSummary {
 
 struct PaneLayoutRect {
   PaneId pane_id{0};
+  int left{0};
+  int top{0};
+  int width{0};
+  int height{0};
+};
+
+struct PaneSplitResizeTarget {
+  std::vector<PaneTreePathStep> path;
+  SplitDirection direction{SplitDirection::Horizontal};
   int left{0};
   int top{0};
   int width{0};
@@ -101,6 +115,7 @@ enum class WindowError {
   DuplicateName,
   SessionNotFound,
   WindowNotFound,
+  LastWindow,
 };
 
 struct WindowOperationResult {
@@ -109,6 +124,7 @@ struct WindowOperationResult {
   SessionId session_id{0};
   WindowId window_id{0};
   PaneId pane_id{0};
+  WindowId removed_window_id{0};
 };
 
 enum class PaneError {
@@ -116,6 +132,7 @@ enum class PaneError {
   SessionNotFound,
   WindowNotFound,
   PaneNotFound,
+  LastPane,
 };
 
 struct PaneOperationResult {
@@ -124,6 +141,7 @@ struct PaneOperationResult {
   SessionId session_id{0};
   WindowId window_id{0};
   PaneId pane_id{0};
+  PaneId removed_pane_id{0};
 };
 
 class SessionManager {
@@ -135,8 +153,16 @@ class SessionManager {
   WindowOperationResult rename_active_window(SessionId session_id, std::string name);
   WindowOperationResult select_next_window(SessionId session_id);
   WindowOperationResult select_previous_window(SessionId session_id);
+  WindowOperationResult kill_active_window(SessionId session_id);
   PaneOperationResult split_active_pane(SessionId session_id, SplitDirection direction);
   PaneOperationResult select_pane(SessionId session_id, PaneDirection direction);
+  PaneOperationResult select_pane(SessionId session_id, PaneId pane_id);
+  PaneOperationResult resize_active_window_split(
+      SessionId session_id,
+      const PaneSplitResizeTarget& target,
+      int column,
+      int row);
+  PaneOperationResult kill_active_pane(SessionId session_id);
 
   bool has_session(std::string_view name) const;
   std::optional<SessionId> session_id_for_name(std::string_view name) const;
@@ -159,6 +185,12 @@ class SessionManager {
 
 std::vector<PaneLayoutRect> compute_pane_layout_rects(
     const PaneNode& root,
+    int columns,
+    int rows);
+std::optional<PaneSplitResizeTarget> find_pane_split_resize_target(
+    const PaneNode& root,
+    int column,
+    int row,
     int columns,
     int rows);
 

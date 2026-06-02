@@ -219,6 +219,41 @@ void selects_next_and_previous_window() {
   assert(sessions.active_window_id(created_session.id) == 3);
 }
 
+void kills_active_window_without_killing_session() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.create_window(created_session.id, "logs").ok);
+  assert(sessions.create_window(created_session.id, "agents").ok);
+
+  const auto killed = sessions.kill_active_window(created_session.id);
+
+  assert(killed.ok);
+  assert(killed.removed_window_id == 3);
+  assert(killed.window_id == 2);
+  assert(sessions.session_count() == 1);
+  assert(sessions.active_window_id(created_session.id) == 2);
+
+  const auto windows = sessions.list_windows(created_session.id);
+  assert(windows.size() == 2);
+  assert(windows[0].name == "0");
+  assert(windows[1].name == "logs");
+}
+
+void rejects_killing_last_window() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  const auto killed = sessions.kill_active_window(created_session.id);
+
+  assert(!killed.ok);
+  assert(killed.error == wmux::WindowError::LastWindow);
+  assert(sessions.session_count() == 1);
+  assert(sessions.active_window_id(created_session.id) == created_session.window_id);
+}
+
 void splits_active_pane() {
   wmux::SessionManager sessions;
 
@@ -324,6 +359,33 @@ void selects_nested_adjacent_panes() {
   assert(left.pane_id == 1);
 }
 
+void selects_pane_by_id() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+  assert(sessions.active_pane_id(created_session.id) == 2);
+
+  const auto selected = sessions.select_pane(created_session.id, created_session.pane_id);
+
+  assert(selected.ok);
+  assert(selected.pane_id == created_session.pane_id);
+  assert(sessions.active_pane_id(created_session.id) == created_session.pane_id);
+}
+
+void rejects_missing_pane_selection_by_id() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  const auto selected = sessions.select_pane(created_session.id, 42);
+
+  assert(!selected.ok);
+  assert(selected.error == wmux::PaneError::PaneNotFound);
+  assert(sessions.active_pane_id(created_session.id) == created_session.pane_id);
+}
+
 void rejects_pane_selection_without_neighbor() {
   wmux::SessionManager sessions;
 
@@ -333,6 +395,43 @@ void rejects_pane_selection_without_neighbor() {
 
   assert(!selected.ok);
   assert(selected.error == wmux::PaneError::PaneNotFound);
+  assert(sessions.active_pane_id(created_session.id) == created_session.pane_id);
+}
+
+void kills_active_pane_and_collapses_layout() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Vertical).ok);
+  assert(sessions.active_pane_id(created_session.id) == 3);
+
+  const auto killed = sessions.kill_active_pane(created_session.id);
+
+  assert(killed.ok);
+  assert(killed.removed_pane_id == 3);
+  assert(killed.pane_id == 2);
+  assert(sessions.active_pane_id(created_session.id) == 2);
+
+  const auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  assert(active->panes.size() == 2);
+  assert(active->active_pane_id == 2);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects.size() == 2);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+}
+
+void rejects_killing_last_pane() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  const auto killed = sessions.kill_active_pane(created_session.id);
+
+  assert(!killed.ok);
+  assert(killed.error == wmux::PaneError::LastPane);
   assert(sessions.active_pane_id(created_session.id) == created_session.pane_id);
 }
 
@@ -437,6 +536,125 @@ void handles_tiny_layout_without_invalid_rectangles() {
   assert_layout_covers_without_overlap(rects, 2, 1);
 }
 
+void finds_horizontal_split_resize_target() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  const auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto target = wmux::find_pane_split_resize_target(active->pane_tree, 60, 5, 120, 29);
+
+  assert(target);
+  assert(target->path.empty());
+  assert(target->direction == wmux::SplitDirection::Horizontal);
+  assert(target->left == 0);
+  assert(target->top == 0);
+  assert(target->width == 120);
+  assert(target->height == 29);
+}
+
+void resizes_horizontal_split_ratio() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto target = wmux::find_pane_split_resize_target(active->pane_tree, 60, 5, 120, 29);
+  assert(target);
+
+  const auto resized = sessions.resize_active_window_split(created_session.id, *target, 80, 5);
+  assert(resized.ok);
+
+  active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects.size() == 2);
+  assert(rects[0].pane_id == 1);
+  assert(rects[0].width == 80);
+  assert(rects[1].pane_id == 2);
+  assert(rects[1].left == 80);
+  assert(rects[1].width == 40);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+}
+
+void resizes_nested_vertical_split_ratio() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Vertical).ok);
+
+  auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto target = wmux::find_pane_split_resize_target(active->pane_tree, 70, 15, 120, 29);
+  assert(target);
+  assert(target->path.size() == 1);
+  assert(target->path[0] == wmux::PaneTreePathStep::Second);
+  assert(target->direction == wmux::SplitDirection::Vertical);
+  assert(target->left == 60);
+  assert(target->top == 0);
+  assert(target->width == 60);
+  assert(target->height == 29);
+
+  const auto resized = sessions.resize_active_window_split(created_session.id, *target, 70, 22);
+  assert(resized.ok);
+
+  active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects.size() == 3);
+  assert(rects[1].pane_id == 2);
+  assert(rects[1].height == 22);
+  assert(rects[2].pane_id == 3);
+  assert(rects[2].top == 22);
+  assert(rects[2].height == 7);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+}
+
+void rejects_resize_target_away_from_split_border() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  const auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  assert(!wmux::find_pane_split_resize_target(active->pane_tree, 10, 5, 120, 29));
+}
+
+void clamps_split_resize_ratio() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto target = wmux::find_pane_split_resize_target(active->pane_tree, 60, 5, 120, 29);
+  assert(target);
+
+  const auto resized = sessions.resize_active_window_split(created_session.id, *target, 0, 5);
+  assert(resized.ok);
+
+  active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  const auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects.size() == 2);
+  assert(rects[0].width == 6);
+  assert(rects[1].left == 6);
+  assert(rects[1].width == 114);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+}
+
 void resolves_only_session_id() {
   wmux::SessionManager sessions;
 
@@ -481,17 +699,28 @@ void run_session_manager_tests() {
   renames_active_window();
   rejects_duplicate_window_names();
   selects_next_and_previous_window();
+  kills_active_window_without_killing_session();
+  rejects_killing_last_window();
   splits_active_pane();
   nests_pane_splits_under_active_leaf();
   rejects_split_for_missing_session();
   selects_adjacent_panes();
   selects_nested_adjacent_panes();
+  selects_pane_by_id();
+  rejects_missing_pane_selection_by_id();
   rejects_pane_selection_without_neighbor();
+  kills_active_pane_and_collapses_layout();
+  rejects_killing_last_pane();
   returns_active_window_summary();
   computes_integer_pane_layout_rects();
   computes_nested_layout_without_gaps_or_overlaps();
   clamps_extreme_split_ratios_for_layout();
   handles_tiny_layout_without_invalid_rectangles();
+  finds_horizontal_split_resize_target();
+  resizes_horizontal_split_ratio();
+  resizes_nested_vertical_split_ratio();
+  rejects_resize_target_away_from_split_border();
+  clamps_split_resize_ratio();
   resolves_only_session_id();
   rejects_empty_names();
 }

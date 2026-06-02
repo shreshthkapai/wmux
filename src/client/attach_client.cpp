@@ -1,7 +1,9 @@
 #include "wmux/client.hpp"
 
+#include "wmux/command_mode.hpp"
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/mouse_input.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +26,8 @@ namespace {
 
 constexpr auto kAttachConnectAttempts = 40;
 constexpr auto kAttachConnectSleep = std::chrono::milliseconds{50};
+
+bool write_all(HANDLE handle, std::string_view bytes);
 
 struct TerminalSize {
   std::uint16_t columns{0};
@@ -105,6 +109,39 @@ class ConsoleModeGuard {
  private:
   HANDLE handle_{nullptr};
   DWORD original_mode_{0};
+  bool active_{false};
+};
+
+class MouseReportingGuard {
+ public:
+  MouseReportingGuard(HANDLE output, bool enabled) : output_(output), enabled_(enabled) {
+    if (!enabled_) {
+      return;
+    }
+
+    active_ = write_all(output_, enable_mouse_reporting_sequence());
+  }
+
+  MouseReportingGuard(const MouseReportingGuard&) = delete;
+  MouseReportingGuard& operator=(const MouseReportingGuard&) = delete;
+
+  ~MouseReportingGuard() {
+    if (enabled_ && active_) {
+      write_all(output_, disable_mouse_reporting_sequence());
+    }
+  }
+
+  bool active() const {
+    return active_;
+  }
+
+  bool enabled() const {
+    return enabled_;
+  }
+
+ private:
+  HANDLE output_{nullptr};
+  bool enabled_{false};
   bool active_{false};
 };
 
@@ -208,12 +245,70 @@ bool send_attach_command(HANDLE pipe, std::string_view command) {
   return write_attach_frame(pipe, make_attach_command_frame(command));
 }
 
+bool send_attach_command_mode(HANDLE pipe, std::string_view command) {
+  return write_attach_frame(pipe, make_attach_command_mode_frame(command));
+}
+
 bool send_attach_resize(HANDLE pipe, TerminalSize size) {
   if (size.columns == 0 || size.rows == 0) {
     return true;
   }
 
   return write_attach_frame(pipe, make_attach_resize_frame(size.columns, size.rows));
+}
+
+bool send_attach_status(HANDLE pipe, std::string_view status) {
+  return write_attach_frame(pipe, make_attach_status_frame(status));
+}
+
+AttachMouseButton attach_mouse_button(MouseButton button) {
+  switch (button) {
+    case MouseButton::Left:
+      return AttachMouseButton::Left;
+    case MouseButton::Middle:
+      return AttachMouseButton::Middle;
+    case MouseButton::Right:
+      return AttachMouseButton::Right;
+    case MouseButton::Release:
+      return AttachMouseButton::Release;
+    case MouseButton::WheelUp:
+      return AttachMouseButton::WheelUp;
+    case MouseButton::WheelDown:
+      return AttachMouseButton::WheelDown;
+    case MouseButton::Other:
+      return AttachMouseButton::Other;
+  }
+
+  return AttachMouseButton::Other;
+}
+
+AttachMouseAction attach_mouse_action(MouseAction action) {
+  switch (action) {
+    case MouseAction::Press:
+      return AttachMouseAction::Press;
+    case MouseAction::Release:
+      return AttachMouseAction::Release;
+    case MouseAction::Drag:
+      return AttachMouseAction::Drag;
+    case MouseAction::Wheel:
+      return AttachMouseAction::Wheel;
+  }
+
+  return AttachMouseAction::Press;
+}
+
+bool send_attach_mouse_event(HANDLE pipe, const MouseEvent& event) {
+  if (event.column == 0 || event.row == 0) {
+    return true;
+  }
+
+  const AttachMouseEventPayload payload{
+      event.column,
+      event.row,
+      static_cast<std::uint16_t>(std::clamp(event.button_code, 0, 65535)),
+      attach_mouse_button(event.button),
+      attach_mouse_action(event.action)};
+  return write_attach_frame(pipe, make_attach_mouse_event_frame(payload));
 }
 
 bool same_terminal_size(TerminalSize lhs, TerminalSize rhs) {
@@ -252,14 +347,92 @@ bool read_response_line(HANDLE pipe, std::string& response) {
 bool send_processed_input(
     HANDLE pipe,
     std::string_view bytes,
+    CommandPromptState& command_prompt,
+    std::string& pending_mouse_sequence,
+    bool mouse_enabled,
     bool& prefix_pending,
     std::atomic_bool& stop_requested,
     HANDLE stop_event) {
   std::string to_send;
   to_send.reserve(bytes.size() + 1);
 
+  const auto flush_input = [&] {
+    if (to_send.empty()) {
+      return true;
+    }
+
+    const bool sent = send_attach_input(pipe, to_send);
+    to_send.clear();
+    return sent;
+  };
+
+  const auto send_mouse_event = [&](const MouseParseResult& mouse) {
+    if (!mouse.event) {
+      return true;
+    }
+
+    return flush_input() && send_attach_mouse_event(pipe, *mouse.event);
+  };
+
   for (std::size_t index = 0; index < bytes.size(); ++index) {
     const char byte = bytes[index];
+    if (mouse_enabled && !pending_mouse_sequence.empty()) {
+      pending_mouse_sequence.push_back(byte);
+      const auto mouse = parse_sgr_mouse_sequence(pending_mouse_sequence);
+      if (mouse.status == MouseParseStatus::Parsed) {
+        pending_mouse_sequence.clear();
+        if (!send_mouse_event(mouse)) {
+          return false;
+        }
+        continue;
+      }
+      if (mouse.status == MouseParseStatus::Incomplete) {
+        continue;
+      }
+
+      to_send.append(pending_mouse_sequence);
+      pending_mouse_sequence.clear();
+      continue;
+    }
+
+    if (mouse_enabled && byte == '\x1b') {
+      const auto remaining = bytes.substr(index);
+      const auto mouse = parse_sgr_mouse_sequence(remaining);
+      if (mouse.status == MouseParseStatus::Parsed) {
+        index += mouse.bytes_consumed - 1;
+        if (!send_mouse_event(mouse)) {
+          return false;
+        }
+        continue;
+      }
+      if (mouse.status == MouseParseStatus::Incomplete &&
+          remaining.size() >= 3 &&
+          is_sgr_mouse_sequence_prefix(remaining)) {
+        pending_mouse_sequence.assign(remaining);
+        break;
+      }
+    }
+
+    if (command_prompt.active) {
+      const auto event = handle_command_prompt_byte(command_prompt, byte);
+      if (event == CommandPromptEvent::None) {
+        continue;
+      }
+
+      if (event == CommandPromptEvent::Submitted) {
+        return send_attach_command_mode(pipe, command_prompt.submitted_command);
+      }
+
+      if (!send_attach_status(pipe, command_prompt_status_text(command_prompt))) {
+        return false;
+      }
+      if (event == CommandPromptEvent::Cancelled) {
+        return true;
+      }
+
+      continue;
+    }
+
     if (prefix_pending) {
       prefix_pending = false;
       if (byte == 'd') {
@@ -282,6 +455,10 @@ bool send_processed_input(
       }
       if (byte == '"') {
         return send_attach_command(pipe, "split-vertical");
+      }
+      if (byte == ':') {
+        start_command_prompt(command_prompt);
+        return send_attach_status(pipe, command_prompt_status_text(command_prompt));
       }
       if (byte == '\x1b' && index + 2 < bytes.size() && bytes[index + 1] == '[') {
         const auto command = arrow_attach_command(bytes[index + 2]);
@@ -398,6 +575,12 @@ int run_attach_client(const CommandLine& command) {
     }
   }
 
+  MouseReportingGuard mouse_reporting{output, response->mouse_enabled};
+  if (mouse_reporting.enabled() && !mouse_reporting.active()) {
+    std::cerr << "wmux: failed to enable mouse reporting\n";
+    return 1;
+  }
+
   UniqueHandle stop_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
   if (!stop_event.valid()) {
     std::cerr << "wmux: failed to create attach stop event\n";
@@ -409,6 +592,8 @@ int run_attach_client(const CommandLine& command) {
       [&] { stream_output(pipe.get(), output, stop_requested, stop_event.get()); }};
 
   TerminalSize last_size = size;
+  CommandPromptState command_prompt;
+  std::string pending_mouse_sequence;
   bool prefix_pending = false;
   char buffer[512];
   while (!stop_requested) {
@@ -445,6 +630,9 @@ int run_attach_client(const CommandLine& command) {
     if (!send_processed_input(
             pipe.get(),
             std::string_view{buffer, bytes_read},
+            command_prompt,
+            pending_mouse_sequence,
+            response->mouse_enabled,
             prefix_pending,
             stop_requested,
             stop_event.get())) {

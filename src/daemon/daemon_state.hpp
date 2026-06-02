@@ -35,6 +35,7 @@ struct DaemonState {
   std::mutex mutex;
   std::condition_variable attach_clients_changed;
   SessionManager sessions;
+  bool mouse_enabled{false};
 
   struct PaneRuntime {
     std::shared_ptr<PtyProcess> shell;
@@ -64,6 +65,7 @@ struct DaemonState {
 struct DaemonStats {
   std::size_t session_count{0};
   std::size_t attach_client_count{0};
+  bool mouse_enabled{false};
 };
 
 std::string quoted(std::string_view value);
@@ -71,6 +73,8 @@ std::string session_error_message(SessionError error, std::string_view name);
 std::string window_error_message(WindowError error, std::string_view name);
 std::string pane_error_message(PaneError error);
 DaemonStats daemon_stats(DaemonState& state);
+bool daemon_mouse_enabled(DaemonState& state);
+void set_daemon_mouse_enabled(DaemonState& state, bool enabled);
 std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state);
 
 void disconnect_attach_clients_for_session(DaemonState& state, SessionId session_id);

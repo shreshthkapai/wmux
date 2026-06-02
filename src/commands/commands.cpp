@@ -179,6 +179,28 @@ CommandLine parse_split_window(const std::vector<std::string_view>& args) {
   return command;
 }
 
+CommandLine parse_set_option(const std::vector<std::string_view>& args) {
+  if (args.size() != 4 || args[1] != "-g" || is_empty(args[2]) || is_empty(args[3])) {
+    return invalid("set requires -g <option> <value>");
+  }
+
+  if (args[2] != "mouse") {
+    std::ostringstream message;
+    message << "unsupported global option " << quoted(args[2]);
+    return invalid(message.str());
+  }
+
+  if (args[3] != "on" && args[3] != "off") {
+    return invalid("set -g mouse requires on or off");
+  }
+
+  CommandLine command;
+  command.kind = CommandKind::SetOption;
+  command.option_name = std::string{args[2]};
+  command.option_value = std::string{args[3]};
+  return command;
+}
+
 CommandLine parse_server_command(const std::vector<std::string_view>& args) {
   if (args.size() < 2) {
     return invalid("server requires one subcommand: status or stop");
@@ -271,6 +293,10 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_split_window(args);
   }
 
+  if (args[0] == "set") {
+    return parse_set_option(args);
+  }
+
   if (args[0] == "server") {
     return parse_server_command(args);
   }
@@ -302,6 +328,7 @@ std::string render_help(std::string_view executable_name) {
   out << "                                 Rename the active window\n";
   out << "  split-window [-t <session>] -h|-v\n";
   out << "                                 Split the active pane\n";
+  out << "  set -g mouse on|off           Enable or disable mouse mode\n";
   out << "  server status                  Show daemon status\n";
   out << "  server stop [--force]          Stop daemon\n";
   out << "  version                        Print wmux version information\n";
@@ -371,6 +398,9 @@ std::string render_placeholder_response(const CommandLine& command) {
         out << " in session '" << command.session_name << "'";
       }
       out << "\n";
+      break;
+    case CommandKind::SetOption:
+      out << "wmux: would set " << command.option_name << " to " << command.option_value << "\n";
       break;
     case CommandKind::ServerStatus:
       out << "wmux: daemon status is not implemented yet\n";

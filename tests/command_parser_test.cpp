@@ -6,6 +6,8 @@
 #include <vector>
 
 void run_ipc_protocol_tests();
+void run_command_mode_tests();
+void run_mouse_input_tests();
 void run_session_manager_tests();
 void run_terminal_grid_tests();
 
@@ -145,6 +147,24 @@ void expects_split_window_vertical_command() {
   assert(result.error.empty());
 }
 
+void expects_set_mouse_on_command() {
+  const std::vector<std::string_view> args{"set", "-g", "mouse", "on"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SetOption);
+  assert(result.option_name == "mouse");
+  assert(result.option_value == "on");
+  assert(result.error.empty());
+}
+
+void expects_set_mouse_off_command() {
+  const std::vector<std::string_view> args{"set", "-g", "mouse", "off"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SetOption);
+  assert(result.option_name == "mouse");
+  assert(result.option_value == "off");
+  assert(result.error.empty());
+}
+
 void expects_server_status_command() {
   const std::vector<std::string_view> args{"server", "status"};
   const auto result = wmux::parse_command_line(args);
@@ -210,6 +230,27 @@ void expects_duplicate_split_direction_error() {
   assert(result.error == "split-window accepts only one split direction");
 }
 
+void expects_bad_set_argument_error() {
+  const std::vector<std::string_view> args{"set", "mouse", "on"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "set requires -g <option> <value>");
+}
+
+void expects_bad_set_mouse_value_error() {
+  const std::vector<std::string_view> args{"set", "-g", "mouse", "yes"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "set -g mouse requires on or off");
+}
+
+void expects_unsupported_set_option_error() {
+  const std::vector<std::string_view> args{"set", "-g", "status", "on"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "unsupported global option 'status'");
+}
+
 void expects_server_subcommand_error() {
   const std::vector<std::string_view> args{"server", "restart"};
   const auto result = wmux::parse_command_line(args);
@@ -258,6 +299,8 @@ int main() {
   expects_targeted_rename_window_command();
   expects_split_window_horizontal_command();
   expects_split_window_vertical_command();
+  expects_set_mouse_on_command();
+  expects_set_mouse_off_command();
   expects_server_status_command();
   expects_server_stop_command();
   expects_forced_server_stop_command();
@@ -267,11 +310,16 @@ int main() {
   expects_bad_list_windows_argument_error();
   expects_missing_split_direction_error();
   expects_duplicate_split_direction_error();
+  expects_bad_set_argument_error();
+  expects_bad_set_mouse_value_error();
+  expects_unsupported_set_option_error();
   expects_server_subcommand_error();
   expects_server_stop_argument_error();
   expects_placeholder_response();
   expects_unknown_command_error();
   run_ipc_protocol_tests();
+  run_command_mode_tests();
+  run_mouse_input_tests();
   run_session_manager_tests();
   run_terminal_grid_tests();
 }

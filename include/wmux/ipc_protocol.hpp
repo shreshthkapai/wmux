@@ -17,6 +17,8 @@ struct IpcRequest {
   std::string new_name;
   std::string window_name;
   std::string split_direction;
+  std::string option_name;
+  std::string option_value;
   std::uint16_t terminal_columns{0};
   std::uint16_t terminal_rows{0};
   bool force{false};
@@ -25,6 +27,7 @@ struct IpcRequest {
 struct IpcResponse {
   bool ok{false};
   std::string message;
+  bool mouse_enabled{false};
 };
 
 enum class AttachFrameType : std::uint8_t {
@@ -32,11 +35,45 @@ enum class AttachFrameType : std::uint8_t {
   Detach = 2,
   Command = 3,
   Resize = 4,
+  Status = 5,
+  CommandMode = 6,
+  MouseFocus = 7,
+  MouseEvent = 8,
 };
 
 struct AttachFrameHeader {
   AttachFrameType type{AttachFrameType::Input};
   std::uint32_t payload_size{0};
+};
+
+enum class AttachMouseButton : std::uint8_t {
+  Left = 0,
+  Middle = 1,
+  Right = 2,
+  Release = 3,
+  WheelUp = 4,
+  WheelDown = 5,
+  Other = 6,
+};
+
+enum class AttachMouseAction : std::uint8_t {
+  Press = 0,
+  Release = 1,
+  Drag = 2,
+  Wheel = 3,
+};
+
+struct AttachMouseFocusPayload {
+  std::uint16_t column{0};
+  std::uint16_t row{0};
+};
+
+struct AttachMouseEventPayload {
+  std::uint16_t column{0};
+  std::uint16_t row{0};
+  std::uint16_t button_code{0};
+  AttachMouseButton button{AttachMouseButton::Other};
+  AttachMouseAction action{AttachMouseAction::Press};
 };
 
 constexpr std::size_t kAttachFrameHeaderSize = 7;
@@ -50,13 +87,22 @@ std::string make_attach_request_json(
     std::uint16_t terminal_rows);
 std::optional<IpcRequest> parse_request_json(std::string_view json);
 std::string make_response_json(bool ok, std::string_view message);
+std::string make_response_json(bool ok, std::string_view message, bool mouse_enabled);
 std::optional<IpcResponse> parse_response_json(std::string_view json);
 std::string make_attach_input_frame(std::string_view bytes);
 std::string make_attach_detach_frame();
 std::string make_attach_command_frame(std::string_view command);
+std::string make_attach_command_mode_frame(std::string_view command);
 std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows);
+std::string make_attach_status_frame(std::string_view status);
+std::string make_attach_mouse_focus_frame(std::uint16_t column, std::uint16_t row);
+std::string make_attach_mouse_event_frame(const AttachMouseEventPayload& event);
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header);
 std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_payload(
+    std::string_view payload);
+std::optional<AttachMouseFocusPayload> parse_attach_mouse_focus_payload(
+    std::string_view payload);
+std::optional<AttachMouseEventPayload> parse_attach_mouse_event_payload(
     std::string_view payload);
 
 }  // namespace wmux

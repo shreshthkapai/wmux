@@ -187,6 +187,8 @@ std::string request_type_for_command(CommandKind kind) {
       return "RenameWindow";
     case CommandKind::SplitWindow:
       return "SplitWindow";
+    case CommandKind::SetOption:
+      return "SetOption";
     case CommandKind::ServerStatus:
       return "ServerStatus";
     case CommandKind::ServerStop:
@@ -243,6 +245,12 @@ std::string make_command_request_json(const CommandLine& command) {
   if (!command.split_direction.empty()) {
     append_json_field(out, "split_direction", command.split_direction);
   }
+  if (!command.option_name.empty()) {
+    append_json_field(out, "option_name", command.option_name);
+  }
+  if (!command.option_value.empty()) {
+    append_json_field(out, "option_value", command.option_value);
+  }
   if (command.force) {
     append_json_bool(out, "force", command.force);
   }
@@ -294,6 +302,12 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   if (const auto split_direction = find_json_string(json, "split_direction")) {
     request.split_direction = *split_direction;
   }
+  if (const auto option_name = find_json_string(json, "option_name")) {
+    request.option_name = *option_name;
+  }
+  if (const auto option_value = find_json_string(json, "option_value")) {
+    request.option_value = *option_value;
+  }
   if (const auto force = find_json_bool(json, "force")) {
     request.force = *force;
   }
@@ -315,6 +329,15 @@ std::string make_response_json(bool ok, std::string_view message) {
   return out.str();
 }
 
+std::string make_response_json(bool ok, std::string_view message, bool mouse_enabled) {
+  std::ostringstream out;
+  out << "{\"ok\":" << (ok ? "true" : "false");
+  append_json_field(out, "message", message);
+  append_json_bool(out, "mouse_enabled", mouse_enabled);
+  out << "}\n";
+  return out.str();
+}
+
 std::optional<IpcResponse> parse_response_json(std::string_view json) {
   const auto ok = find_json_bool(json, "ok");
   const auto message = find_json_string(json, "message");
@@ -325,6 +348,9 @@ std::optional<IpcResponse> parse_response_json(std::string_view json) {
   IpcResponse response;
   response.ok = *ok;
   response.message = *message;
+  if (const auto mouse_enabled = find_json_bool(json, "mouse_enabled")) {
+    response.mouse_enabled = *mouse_enabled;
+  }
   return response;
 }
 
@@ -340,6 +366,10 @@ std::string make_attach_command_frame(std::string_view command) {
   return make_attach_frame(AttachFrameType::Command, command);
 }
 
+std::string make_attach_command_mode_frame(std::string_view command) {
+  return make_attach_frame(AttachFrameType::CommandMode, command);
+}
+
 std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows) {
   std::string payload;
   payload.reserve(4);
@@ -348,6 +378,34 @@ std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows) 
   payload.push_back(static_cast<char>(rows & 0xFF));
   payload.push_back(static_cast<char>((rows >> 8) & 0xFF));
   return make_attach_frame(AttachFrameType::Resize, payload);
+}
+
+std::string make_attach_status_frame(std::string_view status) {
+  return make_attach_frame(AttachFrameType::Status, status);
+}
+
+std::string make_attach_mouse_focus_frame(std::uint16_t column, std::uint16_t row) {
+  std::string payload;
+  payload.reserve(4);
+  payload.push_back(static_cast<char>(column & 0xFF));
+  payload.push_back(static_cast<char>((column >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(row & 0xFF));
+  payload.push_back(static_cast<char>((row >> 8) & 0xFF));
+  return make_attach_frame(AttachFrameType::MouseFocus, payload);
+}
+
+std::string make_attach_mouse_event_frame(const AttachMouseEventPayload& event) {
+  std::string payload;
+  payload.reserve(8);
+  payload.push_back(static_cast<char>(event.column & 0xFF));
+  payload.push_back(static_cast<char>((event.column >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(event.row & 0xFF));
+  payload.push_back(static_cast<char>((event.row >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(event.button_code & 0xFF));
+  payload.push_back(static_cast<char>((event.button_code >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(event.button));
+  payload.push_back(static_cast<char>(event.action));
+  return make_attach_frame(AttachFrameType::MouseEvent, payload);
 }
 
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
@@ -368,6 +426,18 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       break;
     case static_cast<std::uint8_t>(AttachFrameType::Resize):
       parsed.type = AttachFrameType::Resize;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::Status):
+      parsed.type = AttachFrameType::Status;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::CommandMode):
+      parsed.type = AttachFrameType::CommandMode;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::MouseFocus):
+      parsed.type = AttachFrameType::MouseFocus;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::MouseEvent):
+      parsed.type = AttachFrameType::MouseEvent;
       break;
     default:
       return std::nullopt;
@@ -402,6 +472,59 @@ std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_paylo
   }
 
   return std::pair{columns, rows};
+}
+
+std::optional<AttachMouseFocusPayload> parse_attach_mouse_focus_payload(
+    std::string_view payload) {
+  if (payload.size() != 4) {
+    return std::nullopt;
+  }
+
+  const auto column =
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[0])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[1]) << 8);
+  const auto row =
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[2])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[3]) << 8);
+  if (column == 0 || row == 0 || column > 32767 || row > 32767) {
+    return std::nullopt;
+  }
+
+  return AttachMouseFocusPayload{
+      static_cast<std::uint16_t>(column),
+      static_cast<std::uint16_t>(row)};
+}
+
+std::optional<AttachMouseEventPayload> parse_attach_mouse_event_payload(
+    std::string_view payload) {
+  if (payload.size() != 8) {
+    return std::nullopt;
+  }
+
+  const auto column = static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[0])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[1]) << 8));
+  const auto row = static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[2])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[3]) << 8));
+  const auto button_code = static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[4])) |
+      static_cast<std::uint16_t>(static_cast<unsigned char>(payload[5]) << 8));
+  const auto button = static_cast<unsigned char>(payload[6]);
+  const auto action = static_cast<unsigned char>(payload[7]);
+
+  if (column == 0 || row == 0 || column > 32767 || row > 32767 ||
+      button > static_cast<unsigned char>(AttachMouseButton::Other) ||
+      action > static_cast<unsigned char>(AttachMouseAction::Wheel)) {
+    return std::nullopt;
+  }
+
+  return AttachMouseEventPayload{
+      column,
+      row,
+      button_code,
+      static_cast<AttachMouseButton>(button),
+      static_cast<AttachMouseAction>(action)};
 }
 
 }  // namespace wmux

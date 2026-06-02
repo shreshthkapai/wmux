@@ -1,6 +1,8 @@
 #include "daemon_attach.hpp"
 
 #include "daemon_shell.hpp"
+#include "wmux/command_mode.hpp"
+#include "wmux/commands.hpp"
 #include "wmux/ipc_transport.hpp"
 #include "wmux/pty_process.hpp"
 
@@ -323,6 +325,16 @@ void append_clipped_text(std::string& out, std::string_view line, int width) {
   }
 }
 
+std::string sanitize_status_text(std::string_view value) {
+  constexpr std::size_t kMaxStatusBytes = 4096;
+  std::string sanitized;
+  sanitized.reserve(std::min(value.size(), kMaxStatusBytes));
+  for (const char byte : value.substr(0, kMaxStatusBytes)) {
+    sanitized.push_back(byte >= ' ' && byte <= '~' ? byte : ' ');
+  }
+  return sanitized;
+}
+
 void append_pane_border(std::string& out, const PaneLayoutRect& rect, bool active) {
   if (rect.width <= 0 || rect.height <= 0) {
     return;
@@ -367,7 +379,8 @@ void append_pane_border(std::string& out, const PaneLayoutRect& rect, bool activ
 
 std::string render_frame(
     const ActiveWindowFrame& frame,
-    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots) {
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    std::string_view status_override) {
   std::string out{kClearTerminal};
 
   for (const auto& pane : frame.panes) {
@@ -397,8 +410,12 @@ std::string render_frame(
 
   if (frame.rows > 1) {
     std::ostringstream status;
-    status << " wmux [" << frame.session_name << "] window " << frame.window_name
-           << " pane " << frame.active_pane_id << " ";
+    if (status_override.empty()) {
+      status << " wmux [" << frame.session_name << "] window " << frame.window_name
+             << " pane " << frame.active_pane_id << " ";
+    } else {
+      status << status_override;
+    }
     std::string status_line = status.str();
     if (static_cast<int>(status_line.size()) > frame.columns) {
       status_line.resize(static_cast<std::size_t>(frame.columns));
@@ -421,6 +438,11 @@ struct AttachFrame {
   std::string payload;
 };
 
+struct MouseDragState {
+  bool active{false};
+  PaneSplitResizeTarget target;
+};
+
 std::string next_window_name(const std::vector<WindowSummary>& windows) {
   for (std::uint64_t candidate = 0; candidate < 100000; ++candidate) {
     const auto name = std::to_string(candidate);
@@ -435,7 +457,11 @@ std::string next_window_name(const std::vector<WindowSummary>& windows) {
   return "window-" + std::to_string(windows.size());
 }
 
-bool create_interactive_window(DaemonState& state, SessionId session_id, std::string& error) {
+bool create_interactive_window_named(
+    DaemonState& state,
+    SessionId session_id,
+    std::string_view name,
+    std::string& error) {
   auto shell = start_default_shell();
   if (!shell.process) {
     error = shell.error;
@@ -445,8 +471,7 @@ bool create_interactive_window(DaemonState& state, SessionId session_id, std::st
   std::shared_ptr<PtyProcess> shell_process = std::move(shell.process);
   {
     std::lock_guard lock(state.mutex);
-    const auto name = next_window_name(state.sessions.list_windows(session_id));
-    const auto result = state.sessions.create_window(session_id, name);
+    const auto result = state.sessions.create_window(session_id, std::string{name});
     if (!result.ok) {
       error = window_error_message(result.error, name);
       shell_process->terminate();
@@ -458,6 +483,16 @@ bool create_interactive_window(DaemonState& state, SessionId session_id, std::st
   }
 
   return true;
+}
+
+bool create_interactive_window(DaemonState& state, SessionId session_id, std::string& error) {
+  std::string name;
+  {
+    std::lock_guard lock(state.mutex);
+    name = next_window_name(state.sessions.list_windows(session_id));
+  }
+
+  return create_interactive_window_named(state, session_id, name, error);
 }
 
 bool select_interactive_window(
@@ -562,6 +597,374 @@ bool select_interactive_pane(
   return true;
 }
 
+std::optional<bool> select_interactive_pane_at(
+    DaemonState& state,
+    SessionId session_id,
+    std::uint16_t column,
+    std::uint16_t row,
+    short columns,
+    short rows,
+    std::string& error) {
+  if (column == 0 || row == 0) {
+    return false;
+  }
+
+  const int zero_based_column = static_cast<int>(column) - 1;
+  const int zero_based_row = static_cast<int>(row) - 1;
+  const int frame_columns = columns > 0 ? columns : 120;
+  const int frame_rows = rows > 0 ? rows : 30;
+  const int pane_rows = std::max(1, frame_rows - 1);
+  if (zero_based_column < 0 || zero_based_column >= frame_columns ||
+      zero_based_row < 0 || zero_based_row >= pane_rows) {
+    return false;
+  }
+
+  std::lock_guard lock(state.mutex);
+  const auto window = state.sessions.active_window_summary(session_id);
+  if (!window) {
+    error = "wmux: session has no active window\n";
+    return std::nullopt;
+  }
+
+  const auto rects = compute_pane_layout_rects(window->pane_tree, frame_columns, pane_rows);
+  const auto hit = std::find_if(rects.begin(), rects.end(), [&](const auto& rect) {
+    return zero_based_column >= rect.left &&
+           zero_based_column < rect.left + rect.width &&
+           zero_based_row >= rect.top &&
+           zero_based_row < rect.top + rect.height;
+  });
+  if (hit == rects.end()) {
+    return false;
+  }
+
+  if (hit->pane_id == window->active_pane_id) {
+    return false;
+  }
+
+  const auto result = state.sessions.select_pane(session_id, hit->pane_id);
+  if (!result.ok) {
+    error = pane_error_message(result.error);
+    return std::nullopt;
+  }
+
+  return true;
+}
+
+std::optional<PaneSplitResizeTarget> resize_target_at(
+    DaemonState& state,
+    SessionId session_id,
+    int column,
+    int row,
+    int columns,
+    int rows,
+    std::string& error) {
+  std::lock_guard lock(state.mutex);
+  const auto window = state.sessions.active_window_summary(session_id);
+  if (!window) {
+    error = "wmux: session has no active window\n";
+    return std::nullopt;
+  }
+
+  return find_pane_split_resize_target(window->pane_tree, column, row, columns, rows);
+}
+
+std::optional<bool> resize_interactive_split(
+    DaemonState& state,
+    SessionId session_id,
+    const PaneSplitResizeTarget& target,
+    int column,
+    int row,
+    std::string& error) {
+  std::lock_guard lock(state.mutex);
+  const auto result = state.sessions.resize_active_window_split(session_id, target, column, row);
+  if (!result.ok) {
+    error = pane_error_message(result.error);
+    return std::nullopt;
+  }
+
+  return true;
+}
+
+std::optional<bool> handle_interactive_mouse_event(
+    DaemonState& state,
+    SessionId session_id,
+    const AttachMouseEventPayload& mouse,
+    short columns,
+    short rows,
+    MouseDragState& drag,
+    std::string& error) {
+  const int frame_columns = columns > 0 ? columns : 120;
+  const int frame_rows = rows > 0 ? rows : 30;
+  const int pane_rows = std::max(1, frame_rows - 1);
+  const int column = static_cast<int>(mouse.column) - 1;
+  const int row = static_cast<int>(mouse.row) - 1;
+
+  if (mouse.action == AttachMouseAction::Release) {
+    drag.active = false;
+    return false;
+  }
+
+  if (column < 0 || column >= frame_columns || row < 0 || row >= pane_rows) {
+    return false;
+  }
+
+  if (mouse.action == AttachMouseAction::Drag) {
+    if (!drag.active) {
+      return false;
+    }
+
+    return resize_interactive_split(state, session_id, drag.target, column, row, error);
+  }
+
+  if (mouse.action != AttachMouseAction::Press || mouse.button != AttachMouseButton::Left) {
+    return false;
+  }
+
+  const auto target =
+      resize_target_at(state, session_id, column, row, frame_columns, pane_rows, error);
+  if (!error.empty()) {
+    return std::nullopt;
+  }
+
+  if (target) {
+    drag.active = true;
+    drag.target = *target;
+    return resize_interactive_split(state, session_id, drag.target, column, row, error);
+  }
+
+  drag.active = false;
+  return select_interactive_pane_at(
+      state,
+      session_id,
+      mouse.column,
+      mouse.row,
+      columns,
+      rows,
+      error);
+}
+
+std::string status_from_error(std::string_view error) {
+  std::string status{error};
+  while (!status.empty() && (status.back() == '\n' || status.back() == '\r')) {
+    status.pop_back();
+  }
+  return status;
+}
+
+bool kill_interactive_pane(DaemonState& state, SessionId session_id, std::string& status) {
+  std::shared_ptr<PtyProcess> removed_shell;
+  PaneOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    result = state.sessions.kill_active_pane(session_id);
+    if (!result.ok) {
+      status = status_from_error(pane_error_message(result.error));
+      return false;
+    }
+
+    const auto runtime = state.runtimes.find(result.session_id);
+    if (runtime != state.runtimes.end()) {
+      const auto window = runtime->second.windows.find(result.window_id);
+      if (window != runtime->second.windows.end()) {
+        const auto pane = window->second.panes.find(result.removed_pane_id);
+        if (pane != window->second.panes.end()) {
+          removed_shell = std::move(pane->second.shell);
+          window->second.panes.erase(pane);
+        }
+      }
+    }
+  }
+
+  if (removed_shell) {
+    removed_shell->terminate();
+  }
+
+  status = "wmux: killed pane " + std::to_string(result.removed_pane_id);
+  return true;
+}
+
+bool kill_interactive_window(DaemonState& state, SessionId session_id, std::string& status) {
+  std::vector<std::shared_ptr<PtyProcess>> removed_shells;
+  WindowOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    result = state.sessions.kill_active_window(session_id);
+    if (!result.ok) {
+      status = status_from_error(window_error_message(result.error, {}));
+      return false;
+    }
+
+    const auto runtime = state.runtimes.find(result.session_id);
+    if (runtime != state.runtimes.end()) {
+      const auto window = runtime->second.windows.find(result.removed_window_id);
+      if (window != runtime->second.windows.end()) {
+        removed_shells.reserve(window->second.panes.size());
+        for (auto& [pane_id, pane] : window->second.panes) {
+          (void)pane_id;
+          if (pane.shell) {
+            removed_shells.push_back(std::move(pane.shell));
+          }
+        }
+        runtime->second.windows.erase(window);
+      }
+    }
+  }
+
+  for (auto& shell : removed_shells) {
+    if (shell) {
+      shell->terminate();
+    }
+  }
+
+  status = "wmux: killed window " + std::to_string(result.removed_window_id);
+  return true;
+}
+
+std::vector<std::string_view> command_args_as_views(const std::vector<std::string>& args) {
+  std::vector<std::string_view> views;
+  views.reserve(args.size());
+  for (const auto& arg : args) {
+    views.push_back(arg);
+  }
+  return views;
+}
+
+bool rename_attached_session(
+    DaemonState& state,
+    SessionId session_id,
+    std::string_view current_session_name,
+    std::string_view new_name,
+    std::string& session_name,
+    std::string& status) {
+  std::lock_guard lock(state.mutex);
+  const auto current_id = state.sessions.session_id_for_name(current_session_name);
+  if (!current_id || *current_id != session_id) {
+    status = "wmux: attached session was renamed externally";
+    return false;
+  }
+
+  const auto result = state.sessions.rename_session(current_session_name, std::string{new_name});
+  if (!result.ok) {
+    const auto name = result.error == SessionError::DuplicateName ? new_name : current_session_name;
+    status = status_from_error(session_error_message(result.error, name));
+    return false;
+  }
+
+  session_name = std::string{new_name};
+  status = "wmux: renamed session to '" + session_name + "'";
+  return true;
+}
+
+bool rename_attached_window(
+    DaemonState& state,
+    SessionId session_id,
+    std::string_view name,
+    std::string& status) {
+  std::lock_guard lock(state.mutex);
+  const auto result = state.sessions.rename_active_window(session_id, std::string{name});
+  if (!result.ok) {
+    status = status_from_error(window_error_message(result.error, name));
+    return false;
+  }
+
+  status = "wmux: renamed active window to '" + std::string{name} + "'";
+  return true;
+}
+
+bool execute_command_mode_command(
+    DaemonState& state,
+    SessionId session_id,
+    std::string& session_name,
+    std::string_view command_text,
+    std::string& status) {
+  constexpr std::size_t kMaxCommandModeBytes = 4096;
+  if (command_text.size() > kMaxCommandModeBytes) {
+    status = "wmux: command is too long";
+    return false;
+  }
+
+  const auto parsed_text = parse_command_prompt_text(command_text);
+  if (!parsed_text.ok) {
+    status = parsed_text.error;
+    return false;
+  }
+
+  if (parsed_text.args.empty()) {
+    status = "wmux: empty command";
+    return false;
+  }
+
+  const auto command_name = std::string_view{parsed_text.args[0]};
+  if (command_name == "rename-session") {
+    if (parsed_text.args.size() != 2 || parsed_text.args[1].empty()) {
+      status = "wmux: rename-session requires <new>";
+      return false;
+    }
+
+    return rename_attached_session(
+        state, session_id, session_name, parsed_text.args[1], session_name, status);
+  }
+
+  if (command_name == "kill-pane") {
+    if (parsed_text.args.size() != 1) {
+      status = "wmux: kill-pane does not accept arguments yet";
+      return false;
+    }
+
+    return kill_interactive_pane(state, session_id, status);
+  }
+
+  if (command_name == "kill-window") {
+    if (parsed_text.args.size() != 1) {
+      status = "wmux: kill-window does not accept arguments yet";
+      return false;
+    }
+
+    return kill_interactive_window(state, session_id, status);
+  }
+
+  const auto args = command_args_as_views(parsed_text.args);
+  const auto command = parse_command_line(args);
+  if (command.kind == CommandKind::Unknown) {
+    status = "wmux: " + command.error;
+    return false;
+  }
+
+  if (!command.session_name.empty()) {
+    status = "wmux: command mode operates on the attached session; omit -t <session>";
+    return false;
+  }
+
+  switch (command.kind) {
+    case CommandKind::NewWindow: {
+      std::string error;
+      if (!create_interactive_window_named(state, session_id, command.window_name, error)) {
+        status = status_from_error(error);
+        return false;
+      }
+      status = "wmux: created window '" + command.window_name + "'";
+      return true;
+    }
+    case CommandKind::RenameWindow:
+      return rename_attached_window(state, session_id, command.window_name, status);
+    case CommandKind::SplitWindow: {
+      const auto direction =
+          command.split_direction == "horizontal" ? SplitDirection::Horizontal
+                                                  : SplitDirection::Vertical;
+      std::string error;
+      if (!split_interactive_pane(state, session_id, direction, error)) {
+        status = status_from_error(error);
+        return false;
+      }
+      status = "wmux: split active pane " + command.split_direction;
+      return true;
+    }
+    default:
+      status = "wmux: command is not supported in command mode yet";
+      return false;
+  }
+}
+
 bool execute_attach_command(
     DaemonState& state,
     SessionId session_id,
@@ -646,8 +1049,9 @@ void run_attach_connection(
     SessionId session_id,
     std::string session_name,
     short columns,
-    short rows) {
-  if (!write_all(pipe, make_response_json(true, ""))) {
+    short rows,
+    bool mouse_enabled) {
+  if (!write_all(pipe, make_response_json(true, "", mouse_enabled))) {
     close_attach_pipe(pipe);
     unregister_attach_client(state, client_id, AttachEndReason::OutputClosed);
     return;
@@ -660,6 +1064,8 @@ void run_attach_connection(
   std::mutex stream_mutex;
   std::unordered_map<PaneId, std::shared_ptr<PtyProcess>> current_shells;
   std::unordered_map<PaneId, std::uint64_t> next_sequences;
+  std::string status_override;
+  MouseDragState mouse_drag;
 
   const auto replay_active_window = [&](std::string& error) {
     std::lock_guard stream_lock(stream_mutex);
@@ -684,7 +1090,7 @@ void run_attach_connection(
       snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
     }
 
-    const auto replay = render_frame(*frame, snapshots);
+    const auto replay = render_frame(*frame, snapshots, status_override);
 
     if (!write_all(pipe, replay)) {
       output_closed = true;
@@ -809,6 +1215,98 @@ void run_attach_connection(
 
       current_columns.store(static_cast<short>(dimensions->first), std::memory_order_relaxed);
       current_rows.store(static_cast<short>(dimensions->second), std::memory_order_relaxed);
+      std::string error;
+      if (!replay_active_window(error)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::MouseFocus) {
+      const auto focus = parse_attach_mouse_focus_payload(frame.payload);
+      if (!focus) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      std::string error;
+      const auto changed = select_interactive_pane_at(
+          state,
+          session_id,
+          focus->column,
+          focus->row,
+          current_columns.load(std::memory_order_relaxed),
+          current_rows.load(std::memory_order_relaxed),
+          error);
+      if (!changed) {
+        if (!error.empty()) {
+          end_reason = AttachEndReason::ProtocolError;
+          break;
+        }
+        continue;
+      }
+
+      if (*changed && !replay_active_window(error)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::MouseEvent) {
+      const auto mouse = parse_attach_mouse_event_payload(frame.payload);
+      if (!mouse) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      std::string error;
+      const auto changed = handle_interactive_mouse_event(
+          state,
+          session_id,
+          *mouse,
+          current_columns.load(std::memory_order_relaxed),
+          current_rows.load(std::memory_order_relaxed),
+          mouse_drag,
+          error);
+      if (!changed) {
+        if (!error.empty()) {
+          end_reason = AttachEndReason::ProtocolError;
+          break;
+        }
+        continue;
+      }
+
+      if (*changed && !replay_active_window(error)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::Status) {
+      {
+        std::lock_guard stream_lock(stream_mutex);
+        status_override = sanitize_status_text(frame.payload);
+      }
+
+      std::string error;
+      if (!replay_active_window(error)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::CommandMode) {
+      std::string status;
+      (void)execute_command_mode_command(state, session_id, session_name, frame.payload, status);
+      {
+        std::lock_guard stream_lock(stream_mutex);
+        status_override = sanitize_status_text(status);
+      }
+
       std::string error;
       if (!replay_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
@@ -957,6 +1455,7 @@ AttachDispatch dispatch_attach_connection(
 
   const short columns = attach_dimension(request.terminal_columns);
   const short rows = attach_dimension(request.terminal_rows);
+  const bool mouse_enabled = daemon_mouse_enabled(state);
   const ClientId client_id =
       register_attach_client(state, target->session_id, target->session_name, pipe);
   std::thread{[pipe,
@@ -965,8 +1464,10 @@ AttachDispatch dispatch_attach_connection(
                session_id = target->session_id,
                session_name = std::move(target->session_name),
                columns,
-               rows] {
-    run_attach_connection(pipe, state, client_id, session_id, session_name, columns, rows);
+               rows,
+               mouse_enabled] {
+    run_attach_connection(
+        pipe, state, client_id, session_id, session_name, columns, rows, mouse_enabled);
   }}
       .detach();
   return AttachDispatch::HandedOff;

@@ -304,6 +304,23 @@ std::string handle_split_window(const IpcRequest& request, DaemonState& state) {
   return make_response_json(true, out.str());
 }
 
+std::string handle_set_option(const IpcRequest& request, DaemonState& state) {
+  if (request.option_name != "mouse") {
+    return make_response_json(false, "wmux: unsupported global option\n");
+  }
+
+  if (request.option_value != "on" && request.option_value != "off") {
+    return make_response_json(false, "wmux: set -g mouse requires on or off\n");
+  }
+
+  const bool enabled = request.option_value == "on";
+  set_daemon_mouse_enabled(state, enabled);
+
+  std::ostringstream out;
+  out << "wmux: set mouse " << (enabled ? "on" : "off") << "\n";
+  return make_response_json(true, out.str());
+}
+
 std::string handle_session_request(const IpcRequest& request, DaemonState& state) {
   if (request.type == "DefaultSession") {
     return make_response_json(true, "wmux: interactive session startup is not implemented yet\n");
@@ -345,6 +362,10 @@ std::string handle_session_request(const IpcRequest& request, DaemonState& state
     return handle_split_window(request, state);
   }
 
+  if (request.type == "SetOption") {
+    return handle_set_option(request, state);
+  }
+
   return {};
 }
 
@@ -364,6 +385,7 @@ std::string handle_request(
     out << "wmux: daemon is running\n";
     out << "sessions: " << stats.session_count << "\n";
     out << "attach clients: " << stats.attach_client_count << "\n";
+    out << "mouse: " << (stats.mouse_enabled ? "on" : "off") << "\n";
     return make_response_json(true, out.str());
   }
 

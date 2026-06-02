@@ -51,6 +51,16 @@ void expects_split_command_request_json() {
   assert(request->split_direction == "vertical");
 }
 
+void expects_set_option_request_json() {
+  const std::vector<std::string_view> args{"set", "-g", "mouse", "on"};
+  const auto command = wmux::parse_command_line(args);
+  const auto request = wmux::parse_request_json(wmux::make_command_request_json(command));
+  assert(request);
+  assert(request->type == "SetOption");
+  assert(request->option_name == "mouse");
+  assert(request->option_value == "on");
+}
+
 void expects_attach_request_json_with_terminal_size() {
   wmux::CommandLine command;
   command.kind = wmux::CommandKind::AttachSession;
@@ -79,6 +89,21 @@ void expects_response_json() {
   assert(response);
   assert(response->ok);
   assert(response->message == "wmux: ok\n");
+  assert(!response->mouse_enabled);
+}
+
+void expects_attach_response_json_with_mouse_setting() {
+  const auto enabled = wmux::parse_response_json(wmux::make_response_json(true, "", true));
+  assert(enabled);
+  assert(enabled->ok);
+  assert(enabled->message.empty());
+  assert(enabled->mouse_enabled);
+
+  const auto disabled = wmux::parse_response_json(wmux::make_response_json(true, "", false));
+  assert(disabled);
+  assert(disabled->ok);
+  assert(disabled->message.empty());
+  assert(!disabled->mouse_enabled);
 }
 
 void expects_attach_input_frame() {
@@ -132,9 +157,88 @@ void expects_attach_resize_frame() {
   assert(dimensions->second == 43);
 }
 
+void expects_attach_status_frame() {
+  const auto frame = wmux::make_attach_status_frame(":rename-session trading");
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 23);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::Status);
+  assert(header->payload_size == 23);
+  assert(frame.substr(wmux::kAttachFrameHeaderSize) == ":rename-session trading");
+}
+
+void expects_attach_command_mode_frame() {
+  const auto frame = wmux::make_attach_command_mode_frame("new-window -n logs");
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 18);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::CommandMode);
+  assert(header->payload_size == 18);
+  assert(frame.substr(wmux::kAttachFrameHeaderSize) == "new-window -n logs");
+}
+
+void expects_attach_mouse_focus_frame() {
+  const auto frame = wmux::make_attach_mouse_focus_frame(61, 8);
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 4);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::MouseFocus);
+  assert(header->payload_size == 4);
+
+  const auto focus =
+      wmux::parse_attach_mouse_focus_payload(frame.substr(wmux::kAttachFrameHeaderSize));
+  assert(focus);
+  assert(focus->column == 61);
+  assert(focus->row == 8);
+}
+
+void expects_attach_mouse_event_frame() {
+  const wmux::AttachMouseEventPayload payload{
+      61,
+      8,
+      32,
+      wmux::AttachMouseButton::Left,
+      wmux::AttachMouseAction::Drag};
+  const auto frame = wmux::make_attach_mouse_event_frame(payload);
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 8);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::MouseEvent);
+  assert(header->payload_size == 8);
+
+  const auto mouse =
+      wmux::parse_attach_mouse_event_payload(frame.substr(wmux::kAttachFrameHeaderSize));
+  assert(mouse);
+  assert(mouse->column == 61);
+  assert(mouse->row == 8);
+  assert(mouse->button_code == 32);
+  assert(mouse->button == wmux::AttachMouseButton::Left);
+  assert(mouse->action == wmux::AttachMouseAction::Drag);
+}
+
 void rejects_bad_attach_resize_payload() {
   assert(!wmux::parse_attach_resize_payload(""));
   assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
+}
+
+void rejects_bad_attach_mouse_focus_payload() {
+  assert(!wmux::parse_attach_mouse_focus_payload(""));
+  assert(!wmux::parse_attach_mouse_focus_payload(std::string_view{"\0\0\x08\0", 4}));
+  assert(!wmux::parse_attach_mouse_focus_payload(std::string_view{"\x3d\0\0\0", 4}));
+}
+
+void rejects_bad_attach_mouse_event_payload() {
+  assert(!wmux::parse_attach_mouse_event_payload(""));
+  assert(!wmux::parse_attach_mouse_event_payload(std::string_view{"\x01\0\x01\0\0\0\x07\0", 8}));
+  assert(!wmux::parse_attach_mouse_event_payload(std::string_view{"\x01\0\x01\0\0\0\0\x04", 8}));
 }
 
 void expects_bad_json_rejected() {
@@ -150,13 +254,21 @@ void run_ipc_protocol_tests() {
   expects_forced_command_request_json();
   expects_window_command_request_json();
   expects_split_command_request_json();
+  expects_set_option_request_json();
   expects_attach_request_json_with_terminal_size();
   expects_json_escaping();
   expects_response_json();
+  expects_attach_response_json_with_mouse_setting();
   expects_attach_input_frame();
   expects_attach_detach_frame();
   expects_attach_command_frame();
   expects_attach_resize_frame();
+  expects_attach_status_frame();
+  expects_attach_command_mode_frame();
+  expects_attach_mouse_focus_frame();
+  expects_attach_mouse_event_frame();
   rejects_bad_attach_resize_payload();
+  rejects_bad_attach_mouse_focus_payload();
+  rejects_bad_attach_mouse_event_payload();
   expects_bad_json_rejected();
 }

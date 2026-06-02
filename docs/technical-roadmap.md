@@ -554,28 +554,78 @@ Current implementation notes:
   tracking, scrollback integration, color rendering, and more complete escape
   coverage.
 
-### Phase 10: Render Daemon-Owned Grid
-
-- Client renders daemon-provided pane state
-- Expand rendering from the daemon-owned grid model
-- Add frame coalescing
-- Clip output to pane rectangle
-
-### Phase 11: Command Mode
+### Phase 10: Command Mode
 
 - Add `Ctrl+b :`
 - Parse command text
 - Dispatch commands
 - Show command errors in status line
 
-### Phase 12: Scrollback
+Current Phase 10A implementation notes:
+
+- `Ctrl+b :` enters command prompt mode in the attached client.
+- The prompt text is sent as a dedicated attach status frame, so the daemon
+  remains the single owner of status-line rendering.
+- Command prompt input supports printable ASCII, quoted arguments, backspace,
+  `Esc` cancel, and `Enter` submission.
+- Status payloads are sanitized on the daemon side before rendering to avoid
+  terminal-control injection from malformed attach clients.
+
+Current Phase 10B implementation notes:
+
+- Submitted command text is sent as a distinct attach frame type, separate from
+  raw shell input, status redraws, and keybind command frames.
+- Command mode dispatch is scoped to the currently attached session. It rejects
+  `-t <session>` forms so prompt commands cannot accidentally target another
+  live session.
+- Supported commands are:
+  - `rename-session <new>`
+  - `new-window -n <name>`
+  - `rename-window <new>`
+  - `split-window -h`
+  - `split-window -v`
+- Invalid command text shows a status-line error and does not disconnect the
+  attach client.
+- Successful commands show a status-line result, update daemon state, and redraw
+  the active window.
+
+Current Phase 10C implementation notes:
+
+- Command mode now supports destructive current-session operations:
+  - `kill-pane`
+  - `kill-window`
+- `kill-pane` removes the active pane, collapses the pane tree around the
+  surviving sibling subtree, terminates the removed pane's daemon-owned shell,
+  and makes a neighboring pane active.
+- `kill-pane` refuses to remove the last pane in a window. It does not
+  implicitly kill the active window or session.
+- `kill-window` removes the active window, terminates every daemon-owned shell
+  in that window, and activates a neighboring window.
+- `kill-window` refuses to remove the last window in a session. It does not
+  implicitly kill the session.
+- Removed shell processes are moved out of daemon state under the state lock and
+  terminated after the lock is released, keeping state mutation serialized while
+  avoiding process teardown under the global daemon mutex.
+
+Current stability checks:
+
+```powershell
+.\scripts\test-command-mode.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script drives command-mode attach frames directly and verifies
+invalid-command errors, window creation, window rename, pane split input
+routing, pane/window destructive command cleanup, last-pane and last-window
+refusal, and attached-session rename against daemon-visible state.
+
+### Phase 11: Scrollback
 
 - Add pane-local scrollback ring
 - Track viewport
 - Support scrolling
 - Keep memory bounded
 
-### Phase 13: Copy Mode and Clipboard
+### Phase 12: Copy Mode and Clipboard
 
 - Add copy mode state
 - Freeze viewport
@@ -584,14 +634,14 @@ Current implementation notes:
 - Copy to internal buffer
 - Copy to Windows clipboard
 
-### Phase 14: Paste Buffer
+### Phase 13: Paste Buffer
 
 - Add internal paste buffer
 - Paste into active pane
 - Normalize line endings
 - Optionally integrate with system clipboard
 
-### Phase 15: Mouse Mode
+### Phase 14: Mouse Mode
 
 - Enable terminal mouse reporting
 - Parse mouse events
@@ -599,7 +649,42 @@ Current implementation notes:
 - Click to focus pane
 - Drag borders to resize panes
 
-### Phase 16: Configuration
+Current mouse foundation implementation notes:
+
+- Attached clients enable XTerm button-event mouse reporting with SGR
+  coordinates while attached and disable those modes again through an RAII
+  guard during normal detach, disconnect, or process exit cleanup.
+- Mouse parser coverage exists for SGR press, release, drag, wheel, incomplete,
+  and invalid sequences.
+- The attach client recognizes and consumes SGR mouse sequences so they do not
+  leak into the active shell as raw control bytes.
+- Parsed mouse events are sent to the daemon as compact attach frames with
+  1-based terminal coordinates, button identity, and press/release/drag action.
+  The older mouse-focus frame remains supported as a compatibility path for
+  existing direct attach tests.
+- The daemon maps left-click coordinates to the active window's current pane
+  rectangles and selects the hit pane without routing the click bytes into the
+  shell.
+- Presses on split borders start a per-attach-client drag target. Drag events
+  update the target split ratio in the daemon-owned pane tree, clamp the ratio
+  to the same safe bounds used by layout, recompute pane rectangles, resize
+  visible pane ConPTYs, and redraw the active window.
+- Clicks and drags outside pane rectangles, including the status line, are
+  no-ops rather than protocol failures.
+- `wmux set -g mouse on` and `wmux set -g mouse off` now update daemon-owned
+  runtime state. The setting persists while the daemon process runs and is
+  reported in `wmux server status` as `mouse: on` or `mouse: off`.
+- Attach startup responses include the current mouse setting. Attached clients
+  enable terminal mouse reporting only when `mouse` is on, and leave mouse
+  reporting disabled when `mouse` is off.
+- Current regression coverage includes parser unit tests and
+  `scripts/test-mouse-focus.ps1`, which verifies clicked-pane focus changes
+  shell input routing. `scripts/test-mouse-resize.ps1` verifies drag-resize by
+  moving a split border and confirming subsequent click-to-focus uses the
+  updated pane geometry. `scripts/test-mouse-setting.ps1` verifies command IPC,
+  status output, and attach response propagation for the mouse setting.
+
+### Phase 15: Configuration
 
 Initial config path:
 
@@ -616,7 +701,7 @@ set -g default-shell powershell.exe
 set -g status on
 ```
 
-### Phase 17: Hardening for Daily Use
+### Phase 16: Hardening for Daily Use
 
 - Add handle leak tests
 - Add attach/detach loop tests

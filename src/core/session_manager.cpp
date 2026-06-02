@@ -62,6 +62,79 @@ bool replace_leaf_with_split(
   return node.second && replace_leaf_with_split(*node.second, target, created, direction);
 }
 
+std::optional<PaneId> first_leaf_pane_id(const PaneNode& node) {
+  if (node.kind == PaneNode::Kind::Leaf) {
+    return node.pane_id;
+  }
+
+  if (node.first) {
+    const auto first = first_leaf_pane_id(*node.first);
+    if (first) {
+      return first;
+    }
+  }
+
+  if (node.second) {
+    return first_leaf_pane_id(*node.second);
+  }
+
+  return std::nullopt;
+}
+
+bool remove_leaf_and_collapse(PaneNode& node, PaneId target, PaneId& replacement) {
+  if (node.kind == PaneNode::Kind::Leaf) {
+    return false;
+  }
+
+  if (!node.first || !node.second) {
+    return false;
+  }
+
+  if (node.first->kind == PaneNode::Kind::Leaf && node.first->pane_id == target) {
+    const auto next_active = first_leaf_pane_id(*node.second);
+    if (!next_active) {
+      return false;
+    }
+
+    replacement = *next_active;
+    PaneNode promoted = std::move(*node.second);
+    node.first.reset();
+    node.second.reset();
+    node = std::move(promoted);
+    return true;
+  }
+
+  if (node.second->kind == PaneNode::Kind::Leaf && node.second->pane_id == target) {
+    const auto next_active = first_leaf_pane_id(*node.first);
+    if (!next_active) {
+      return false;
+    }
+
+    replacement = *next_active;
+    PaneNode promoted = std::move(*node.first);
+    node.first.reset();
+    node.second.reset();
+    node = std::move(promoted);
+    return true;
+  }
+
+  return remove_leaf_and_collapse(*node.first, target, replacement) ||
+         remove_leaf_and_collapse(*node.second, target, replacement);
+}
+
+PaneNode* node_at_path(PaneNode& root, const std::vector<PaneTreePathStep>& path) {
+  PaneNode* node = &root;
+  for (const auto step : path) {
+    if (node == nullptr || node->kind != PaneNode::Kind::Split) {
+      return nullptr;
+    }
+
+    node = step == PaneTreePathStep::First ? node->first.get() : node->second.get();
+  }
+
+  return node;
+}
+
 std::optional<std::reference_wrapper<WindowSummary>> active_window(SessionSummary& session) {
   auto found = std::find_if(
       session.windows.begin(),
@@ -235,6 +308,130 @@ void collect_integer_layout_rects(
   collect_integer_layout_rects(*node.first, left, top, width, first_height, rects);
   collect_integer_layout_rects(
       *node.second, left, top + first_height, width, height - first_height, rects);
+}
+
+bool in_rect(int column, int row, int left, int top, int width, int height) {
+  return column >= left &&
+         column < left + width &&
+         row >= top &&
+         row < top + height;
+}
+
+std::optional<PaneSplitResizeTarget> find_split_resize_target(
+    const PaneNode& node,
+    int left,
+    int top,
+    int width,
+    int height,
+    int column,
+    int row,
+    std::vector<PaneTreePathStep>& path) {
+  if (width <= 1 || height <= 1 || node.kind != PaneNode::Kind::Split ||
+      !node.first || !node.second) {
+    return std::nullopt;
+  }
+
+  if (node.direction == SplitDirection::Horizontal) {
+    const int first_width = split_extent(width, node.ratio);
+
+    path.push_back(PaneTreePathStep::First);
+    if (const auto target = find_split_resize_target(
+            *node.first,
+            left,
+            top,
+            first_width,
+            height,
+            column,
+            row,
+            path)) {
+      return target;
+    }
+    path.pop_back();
+
+    path.push_back(PaneTreePathStep::Second);
+    if (const auto target = find_split_resize_target(
+            *node.second,
+            left + first_width,
+            top,
+            width - first_width,
+            height,
+            column,
+            row,
+            path)) {
+      return target;
+    }
+    path.pop_back();
+
+    const int split_column = left + first_width;
+    if ((column == split_column || column == split_column - 1) &&
+        row >= top &&
+        row < top + height) {
+      return PaneSplitResizeTarget{path, SplitDirection::Horizontal, left, top, width, height};
+    }
+    return std::nullopt;
+  }
+
+  const int first_height = split_extent(height, node.ratio);
+
+  path.push_back(PaneTreePathStep::First);
+  if (const auto target = find_split_resize_target(
+          *node.first,
+          left,
+          top,
+          width,
+          first_height,
+          column,
+          row,
+          path)) {
+    return target;
+  }
+  path.pop_back();
+
+  path.push_back(PaneTreePathStep::Second);
+  if (const auto target = find_split_resize_target(
+          *node.second,
+          left,
+          top + first_height,
+          width,
+          height - first_height,
+          column,
+          row,
+          path)) {
+    return target;
+  }
+  path.pop_back();
+
+  const int split_row = top + first_height;
+  if ((row == split_row || row == split_row - 1) &&
+      column >= left &&
+      column < left + width) {
+    return PaneSplitResizeTarget{path, SplitDirection::Vertical, left, top, width, height};
+  }
+
+  return std::nullopt;
+}
+
+double resized_ratio(const PaneSplitResizeTarget& target, int column, int row) {
+  constexpr double kMinSplitRatio = 0.05;
+  constexpr double kMaxSplitRatio = 0.95;
+
+  if (target.direction == SplitDirection::Horizontal) {
+    if (target.width <= 1) {
+      return 0.5;
+    }
+    return std::clamp(
+        static_cast<double>(column - target.left) / static_cast<double>(target.width),
+        kMinSplitRatio,
+        kMaxSplitRatio);
+  }
+
+  if (target.height <= 1) {
+    return 0.5;
+  }
+  return std::clamp(
+      static_cast<double>(row - target.top) / static_cast<double>(target.height),
+      kMinSplitRatio,
+      kMaxSplitRatio);
 }
 
 }  // namespace
@@ -463,6 +660,44 @@ WindowOperationResult SessionManager::select_previous_window(SessionId session_i
   return {true, WindowError::None, session_id, active->id, active->active_pane_id};
 }
 
+WindowOperationResult SessionManager::kill_active_window(SessionId session_id) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_session(session_id);
+  }
+
+  if (session->second.windows.empty()) {
+    return {false, WindowError::WindowNotFound, session_id};
+  }
+
+  if (session->second.windows.size() == 1) {
+    return {false, WindowError::LastWindow, session_id, session->second.active_window_id};
+  }
+
+  auto active = std::find_if(
+      session->second.windows.begin(),
+      session->second.windows.end(),
+      [&](const auto& window) { return window.id == session->second.active_window_id; });
+  if (active == session->second.windows.end()) {
+    return {false, WindowError::WindowNotFound, session_id};
+  }
+
+  const auto removed_window_id = active->id;
+  const auto removed_index =
+      static_cast<std::size_t>(std::distance(session->second.windows.begin(), active));
+  session->second.windows.erase(active);
+  const auto next_index = std::min(removed_index, session->second.windows.size() - 1);
+  const auto& next_active = session->second.windows[next_index];
+  session->second.active_window_id = next_active.id;
+  return {
+      true,
+      WindowError::None,
+      session_id,
+      next_active.id,
+      next_active.active_pane_id,
+      removed_window_id};
+}
+
 PaneOperationResult SessionManager::split_active_pane(
     SessionId session_id,
     SplitDirection direction) {
@@ -523,6 +758,99 @@ PaneOperationResult SessionManager::select_pane(SessionId session_id, PaneDirect
 
   window.active_pane_id = *neighbor;
   return {true, PaneError::None, session_id, window.id, *neighbor};
+}
+
+PaneOperationResult SessionManager::select_pane(SessionId session_id, PaneId pane_id) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_pane_session(session_id);
+  }
+
+  auto active = active_window(session->second);
+  if (!active) {
+    return {false, PaneError::WindowNotFound, session_id};
+  }
+
+  auto& window = active->get();
+  const auto pane = std::find_if(
+      window.panes.begin(),
+      window.panes.end(),
+      [&](const auto& candidate) { return candidate.id == pane_id; });
+  if (pane == window.panes.end()) {
+    return {false, PaneError::PaneNotFound, session_id, window.id, pane_id};
+  }
+
+  window.active_pane_id = pane_id;
+  return {true, PaneError::None, session_id, window.id, pane_id};
+}
+
+PaneOperationResult SessionManager::resize_active_window_split(
+    SessionId session_id,
+    const PaneSplitResizeTarget& target,
+    int column,
+    int row) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_pane_session(session_id);
+  }
+
+  auto active = active_window(session->second);
+  if (!active) {
+    return {false, PaneError::WindowNotFound, session_id};
+  }
+
+  auto& window = active->get();
+  auto* node = node_at_path(window.pane_tree, target.path);
+  if (node == nullptr || node->kind != PaneNode::Kind::Split || !node->first || !node->second ||
+      node->direction != target.direction) {
+    return {false, PaneError::PaneNotFound, session_id, window.id, window.active_pane_id};
+  }
+
+  node->ratio = resized_ratio(target, column, row);
+  return {true, PaneError::None, session_id, window.id, window.active_pane_id};
+}
+
+PaneOperationResult SessionManager::kill_active_pane(SessionId session_id) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_pane_session(session_id);
+  }
+
+  auto active = active_window(session->second);
+  if (!active) {
+    return {false, PaneError::WindowNotFound, session_id};
+  }
+
+  auto& window = active->get();
+  if (window.active_pane_id == 0) {
+    return {false, PaneError::PaneNotFound, session_id, window.id};
+  }
+
+  if (window.panes.size() == 1) {
+    return {false, PaneError::LastPane, session_id, window.id, window.active_pane_id};
+  }
+
+  const PaneId removed_pane_id = window.active_pane_id;
+  PaneId replacement_pane_id = 0;
+  if (!remove_leaf_and_collapse(window.pane_tree, removed_pane_id, replacement_pane_id)) {
+    return {false, PaneError::PaneNotFound, session_id, window.id, removed_pane_id};
+  }
+
+  window.panes.erase(
+      std::remove_if(
+          window.panes.begin(),
+          window.panes.end(),
+          [&](const auto& pane) { return pane.id == removed_pane_id; }),
+      window.panes.end());
+  window.active_pane_id = replacement_pane_id;
+
+  return {
+      true,
+      PaneError::None,
+      session_id,
+      window.id,
+      replacement_pane_id,
+      removed_pane_id};
 }
 
 bool SessionManager::has_session(std::string_view name) const {
@@ -627,6 +955,20 @@ std::vector<PaneLayoutRect> compute_pane_layout_rects(
   std::vector<PaneLayoutRect> rects;
   collect_integer_layout_rects(root, 0, 0, columns, rows, rects);
   return rects;
+}
+
+std::optional<PaneSplitResizeTarget> find_pane_split_resize_target(
+    const PaneNode& root,
+    int column,
+    int row,
+    int columns,
+    int rows) {
+  if (!in_rect(column, row, 0, 0, columns, rows)) {
+    return std::nullopt;
+  }
+
+  std::vector<PaneTreePathStep> path;
+  return find_split_resize_target(root, 0, 0, columns, rows, column, row, path);
 }
 
 }  // namespace wmux

@@ -71,9 +71,11 @@ See:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 9C
+The current skeleton builds a small `wmux` executable with the Phase 11D
 daemon-owned ConPTY shell, raw detach/reattach path, window commands, and
-basic pane rendering plus live attach resize and rendering hardening:
+basic pane rendering plus live attach resize, rendering hardening, and an
+initial command prompt dispatch plus mouse input, click-to-focus, and border
+drag resize with an explicit daemon-owned mouse setting:
 
 ```bash
 cmake -S . -B build
@@ -89,6 +91,8 @@ cmake --build build
 ./build/wmux rename-window agents
 ./build/wmux split-window -h
 ./build/wmux split-window -v
+./build/wmux set -g mouse on
+./build/wmux set -g mouse off
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -132,6 +136,23 @@ PTY reader thread, not from ad hoc raw-byte sanitization during every redraw.
 `wmux server stop --force` only when you explicitly want the daemon to terminate
 active session runtimes.
 
+Mouse mode is opt-in through daemon runtime state:
+
+```bash
+./build/wmux set -g mouse on
+./build/wmux set -g mouse off
+```
+
+When mouse mode is on, attached clients enable SGR mouse reporting while the
+attach session is active and disable it again on exit. The client parses SGR
+mouse sequences, consumes mouse traffic, and sends compact mouse event frames
+to the daemon. When mouse mode is off, attached clients do not enable terminal
+mouse reporting and do not treat mouse sequences as wmux control traffic. The
+daemon maps left-click coordinates to the active window's pane rectangles for
+focus, detects press/drag/release sequences on split borders, updates split
+ratios in the pane tree, recomputes the layout, resizes visible pane ConPTYs,
+and redraws the active window. Clicks and drags outside panes/status are no-ops.
+
 For the current Windows shell-lifetime stability check, run:
 
 ```powershell
@@ -166,6 +187,38 @@ text, cursor movement, common clear commands, SGR attribute state, and alternate
 screen switching. It is still early and does not yet provide full TUI parity,
 dirty-region frame diffs, scrollback, or copy-mode selection.
 
+`Ctrl+b :` now enters command prompt mode in the attached client. The prompt is
+rendered through the daemon-owned status line and supports basic ASCII text
+entry, quoted arguments, backspace, `Esc` cancel, and `Enter` submission.
+Command mode currently dispatches safe current-session commands:
+
+```text
+rename-session <new>
+new-window -n <name>
+rename-window <new>
+split-window -h
+split-window -v
+kill-pane
+kill-window
+```
+
+Errors and successful command results are shown in the status line. Destructive
+command-mode operations are scoped to the attached session: `kill-pane` refuses
+to remove the last pane in a window, and `kill-window` refuses to remove the
+last window in a session. These commands do not implicitly kill the session.
+
+For the current command-mode dispatch check, run:
+
+```powershell
+.\scripts\test-command-mode.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, drives the attach pipe directly with command-mode
+frames, verifies invalid-command errors, creates and renames a window, splits a
+pane, kills a pane, kills a window, verifies last-pane and last-window refusal,
+renames the session, and checks daemon-visible state after each command.
+
 For the current interactive window switching check, run:
 
 ```powershell
@@ -190,6 +243,37 @@ the same command frames used by `Ctrl+b %` and `Ctrl+b "`, switches focus with
 the same command frames used by `Ctrl+b` arrow keys, and verifies each pane
 keeps independent shell state while the attach stream renders a bordered pane
 layout.
+
+For the current mouse click-to-focus check, run:
+
+```powershell
+.\scripts\test-mouse-focus.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, drives the attach pipe directly with mouse-focus
+frames, and verifies shell input routes to the pane selected by the click.
+
+For the current daemon mouse setting check, run:
+
+```powershell
+.\scripts\test-mouse-setting.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, verifies the default `mouse: off` status,
+sets mouse on and off through command IPC, and confirms attach startup responses
+include the expected `mouse_enabled` value.
+
+For the current mouse border drag-resize check, run:
+
+```powershell
+.\scripts\test-mouse-resize.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+The script requires an empty daemon, restarts it with a deterministic
+`cmd.exe /D /Q` test shell, drives the attach pipe directly with mouse event
+frames, drags the horizontal split border, and verifies later click-to-focus
+uses the updated pane geometry.
 
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY
