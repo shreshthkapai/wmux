@@ -39,6 +39,7 @@ enum class AttachFrameType : std::uint8_t {
   CommandMode = 6,
   MouseFocus = 7,
   MouseEvent = 8,
+  Scroll = 9,
 };
 
 struct AttachFrameHeader {
@@ -61,6 +62,14 @@ enum class AttachMouseAction : std::uint8_t {
   Release = 1,
   Drag = 2,
   Wheel = 3,
+};
+
+enum class AttachScrollAction : std::uint8_t {
+  LineUp = 0,
+  LineDown = 1,
+  PageUp = 2,
+  PageDown = 3,
+  Bottom = 4,
 };
 
 struct AttachMouseFocusPayload {
@@ -97,6 +106,7 @@ std::string make_attach_resize_frame(std::uint16_t columns, std::uint16_t rows);
 std::string make_attach_status_frame(std::string_view status);
 std::string make_attach_mouse_focus_frame(std::uint16_t column, std::uint16_t row);
 std::string make_attach_mouse_event_frame(const AttachMouseEventPayload& event);
+std::string make_attach_scroll_frame(AttachScrollAction action);
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header);
 std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_payload(
     std::string_view payload);
@@ -104,5 +114,6 @@ std::optional<AttachMouseFocusPayload> parse_attach_mouse_focus_payload(
     std::string_view payload);
 std::optional<AttachMouseEventPayload> parse_attach_mouse_event_payload(
     std::string_view payload);
+std::optional<AttachScrollAction> parse_attach_scroll_payload(std::string_view payload);
 
 }  // namespace wmux

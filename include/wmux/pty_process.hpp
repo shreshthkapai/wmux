@@ -13,6 +13,7 @@ namespace wmux {
 struct PtyOutputSnapshot {
   std::string bytes;
   TerminalScreenSnapshot screen;
+  TerminalScrollbackSnapshot scrollback;
   std::uint64_t next_sequence{1};
   bool alive{false};
 };

@@ -36,6 +36,18 @@ std::vector<TerminalCell> resized_buffer(
   return next;
 }
 
+std::vector<bool> resized_wrapped_lines(
+    const std::vector<bool>& old_wrapped_lines,
+    int old_rows,
+    int new_rows) {
+  std::vector<bool> next(static_cast<std::size_t>(new_rows), false);
+  const int copied_rows = std::min(old_rows, new_rows);
+  for (int row = 0; row < copied_rows; ++row) {
+    next[static_cast<std::size_t>(row)] = old_wrapped_lines[static_cast<std::size_t>(row)];
+  }
+  return next;
+}
+
 std::vector<int> csi_params(std::string_view input) {
   std::vector<int> params;
   int value = 0;
@@ -80,11 +92,15 @@ int param_or_default(const std::vector<int>& params, std::size_t index, int defa
 
 TerminalGrid::TerminalGrid()
     : normal_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)) {}
+      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
+      normal_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false),
+      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {}
 
 TerminalGrid::TerminalGrid(int columns, int rows)
     : normal_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)) {
+      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
+      normal_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false),
+      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {
   resize(columns, rows);
 }
 
@@ -97,6 +113,9 @@ void TerminalGrid::resize(int columns, int rows) {
       resized_buffer(normal_buffer_, columns_, rows_, next_columns, next_rows, blank);
   alternate_buffer_ =
       resized_buffer(alternate_buffer_, columns_, rows_, next_columns, next_rows, blank);
+  normal_wrapped_lines_ = resized_wrapped_lines(normal_wrapped_lines_, rows_, next_rows);
+  alternate_wrapped_lines_ =
+      resized_wrapped_lines(alternate_wrapped_lines_, rows_, next_rows);
 
   columns_ = next_columns;
   rows_ = next_rows;
@@ -165,6 +184,13 @@ void TerminalGrid::feed(std::string_view bytes) {
   }
 }
 
+void TerminalGrid::set_scrollback_capacity(std::size_t capacity) {
+  scrollback_capacity_ = capacity;
+  while (scrollback_.size() > scrollback_capacity_) {
+    scrollback_.pop_front();
+  }
+}
+
 TerminalScreenSnapshot TerminalGrid::snapshot() const {
   TerminalScreenSnapshot screen;
   screen.columns = columns_;
@@ -172,19 +198,31 @@ TerminalScreenSnapshot TerminalGrid::snapshot() const {
   screen.cursor_column = cursor_column_;
   screen.cursor_row = cursor_row_;
   screen.alternate_screen = alternate_screen_;
+  screen.scrollback_line_count = scrollback_.size();
   screen.lines.reserve(static_cast<std::size_t>(rows_));
+  screen.line_snapshots.reserve(static_cast<std::size_t>(rows_));
 
   const auto& buffer = active_buffer();
+  const auto& wrapped_lines = active_wrapped_lines();
   for (int row = 0; row < rows_; ++row) {
-    std::string line;
-    line.reserve(static_cast<std::size_t>(columns_));
-    for (int column = 0; column < columns_; ++column) {
-      line.push_back(buffer[offset(row, column)].glyph);
-    }
-    screen.lines.push_back(std::move(line));
+    auto line = row_snapshot(buffer, wrapped_lines, row);
+    screen.lines.push_back(line.text);
+    screen.line_snapshots.push_back(std::move(line));
   }
 
   return screen;
+}
+
+TerminalScrollbackSnapshot TerminalGrid::scrollback_snapshot() const {
+  TerminalScrollbackSnapshot snapshot;
+  snapshot.capacity = scrollback_capacity_;
+  snapshot.lines.reserve(scrollback_.size());
+  snapshot.line_snapshots.reserve(scrollback_.size());
+  for (const auto& line : scrollback_) {
+    snapshot.lines.push_back(line.text);
+    snapshot.line_snapshots.push_back(line);
+  }
+  return snapshot;
 }
 
 std::vector<TerminalCell>& TerminalGrid::active_buffer() {
@@ -195,6 +233,14 @@ const std::vector<TerminalCell>& TerminalGrid::active_buffer() const {
   return alternate_screen_ ? alternate_buffer_ : normal_buffer_;
 }
 
+std::vector<bool>& TerminalGrid::active_wrapped_lines() {
+  return alternate_screen_ ? alternate_wrapped_lines_ : normal_wrapped_lines_;
+}
+
+const std::vector<bool>& TerminalGrid::active_wrapped_lines() const {
+  return alternate_screen_ ? alternate_wrapped_lines_ : normal_wrapped_lines_;
+}
+
 TerminalCell TerminalGrid::blank_cell() const {
   return TerminalCell{' ', current_attributes_};
 }
@@ -203,8 +249,47 @@ std::size_t TerminalGrid::offset(int row, int column) const {
   return static_cast<std::size_t>((row * columns_) + column);
 }
 
+std::vector<TerminalCell> TerminalGrid::row_cells(
+    const std::vector<TerminalCell>& buffer,
+    int row) const {
+  std::vector<TerminalCell> line;
+  line.reserve(static_cast<std::size_t>(columns_));
+  for (int column = 0; column < columns_; ++column) {
+    line.push_back(buffer[offset(row, column)]);
+  }
+  return line;
+}
+
+TerminalLineSnapshot TerminalGrid::row_snapshot(
+    const std::vector<TerminalCell>& buffer,
+    const std::vector<bool>& wrapped_lines,
+    int row) const {
+  return TerminalLineSnapshot{
+      row_text(buffer, row),
+      wrapped_lines[static_cast<std::size_t>(row)]};
+}
+
+std::string TerminalGrid::row_text(const std::vector<TerminalCell>& buffer, int row) const {
+  std::string line;
+  line.reserve(static_cast<std::size_t>(columns_));
+  for (int column = 0; column < columns_; ++column) {
+    line.push_back(buffer[offset(row, column)].glyph);
+  }
+  return line;
+}
+
+std::string TerminalGrid::row_text(const std::vector<TerminalCell>& cells) const {
+  std::string line;
+  line.reserve(cells.size());
+  for (const auto& cell : cells) {
+    line.push_back(cell.glyph);
+  }
+  return line;
+}
+
 void TerminalGrid::put_printable(char glyph) {
   if (pending_wrap_) {
+    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = true;
     cursor_column_ = 0;
     line_feed();
     pending_wrap_ = false;
@@ -248,18 +333,43 @@ void TerminalGrid::tab() {
 
 void TerminalGrid::scroll_up() {
   auto& buffer = active_buffer();
+  auto& wrapped_lines = active_wrapped_lines();
+  if (!alternate_screen_) {
+    append_scrollback_line(row_cells(buffer, 0));
+  }
+
   if (rows_ <= 1) {
     std::fill(buffer.begin(), buffer.end(), blank_cell());
+    std::fill(wrapped_lines.begin(), wrapped_lines.end(), false);
     return;
   }
 
   const auto columns = static_cast<std::size_t>(columns_);
   std::move(buffer.begin() + columns, buffer.end(), buffer.begin());
   std::fill(buffer.end() - columns, buffer.end(), blank_cell());
+  std::move(wrapped_lines.begin() + 1, wrapped_lines.end(), wrapped_lines.begin());
+  wrapped_lines.back() = false;
+}
+
+void TerminalGrid::append_scrollback_line(std::vector<TerminalCell> line) {
+  if (scrollback_capacity_ == 0) {
+    return;
+  }
+
+  const auto wrapped = normal_wrapped_lines_.empty() ? false : normal_wrapped_lines_.front();
+  scrollback_.push_back(TerminalLineSnapshot{row_text(line), wrapped});
+  while (scrollback_.size() > scrollback_capacity_) {
+    scrollback_.pop_front();
+  }
+}
+
+void TerminalGrid::clear_scrollback() {
+  scrollback_.clear();
 }
 
 void TerminalGrid::clear_all() {
   std::fill(active_buffer().begin(), active_buffer().end(), blank_cell());
+  std::fill(active_wrapped_lines().begin(), active_wrapped_lines().end(), false);
 }
 
 void TerminalGrid::clear_line(int mode) {
@@ -275,11 +385,18 @@ void TerminalGrid::clear_line(int mode) {
   for (int column = first; column <= last; ++column) {
     buffer[offset(cursor_row_, column)] = blank_cell();
   }
+  if (mode == 2 || last == columns_ - 1) {
+    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+  }
 }
 
 void TerminalGrid::clear_screen(int mode) {
   auto& buffer = active_buffer();
+  auto& wrapped_lines = active_wrapped_lines();
   if (mode == 2 || mode == 3) {
+    if (mode == 3 && !alternate_screen_) {
+      clear_scrollback();
+    }
     clear_all();
     return;
   }
@@ -289,9 +406,13 @@ void TerminalGrid::clear_screen(int mode) {
       for (int column = 0; column < columns_; ++column) {
         buffer[offset(row, column)] = blank_cell();
       }
+      wrapped_lines[static_cast<std::size_t>(row)] = false;
     }
     for (int column = 0; column <= cursor_column_; ++column) {
       buffer[offset(cursor_row_, column)] = blank_cell();
+    }
+    if (cursor_column_ == columns_ - 1) {
+      wrapped_lines[static_cast<std::size_t>(cursor_row_)] = false;
     }
     return;
   }
@@ -299,10 +420,12 @@ void TerminalGrid::clear_screen(int mode) {
   for (int column = cursor_column_; column < columns_; ++column) {
     buffer[offset(cursor_row_, column)] = blank_cell();
   }
+  wrapped_lines[static_cast<std::size_t>(cursor_row_)] = false;
   for (int row = cursor_row_ + 1; row < rows_; ++row) {
     for (int column = 0; column < columns_; ++column) {
       buffer[offset(row, column)] = blank_cell();
     }
+    wrapped_lines[static_cast<std::size_t>(row)] = false;
   }
 }
 

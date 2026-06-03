@@ -408,6 +408,12 @@ std::string make_attach_mouse_event_frame(const AttachMouseEventPayload& event) 
   return make_attach_frame(AttachFrameType::MouseEvent, payload);
 }
 
+std::string make_attach_scroll_frame(AttachScrollAction action) {
+  std::string payload;
+  payload.push_back(static_cast<char>(action));
+  return make_attach_frame(AttachFrameType::Scroll, payload);
+}
+
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
   if (header.size() != kAttachFrameHeaderSize || header[0] != 'W' || header[1] != 'M') {
     return std::nullopt;
@@ -438,6 +444,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       break;
     case static_cast<std::uint8_t>(AttachFrameType::MouseEvent):
       parsed.type = AttachFrameType::MouseEvent;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::Scroll):
+      parsed.type = AttachFrameType::Scroll;
       break;
     default:
       return std::nullopt;
@@ -525,6 +534,19 @@ std::optional<AttachMouseEventPayload> parse_attach_mouse_event_payload(
       button_code,
       static_cast<AttachMouseButton>(button),
       static_cast<AttachMouseAction>(action)};
+}
+
+std::optional<AttachScrollAction> parse_attach_scroll_payload(std::string_view payload) {
+  if (payload.size() != 1) {
+    return std::nullopt;
+  }
+
+  const auto action = static_cast<unsigned char>(payload[0]);
+  if (action > static_cast<unsigned char>(AttachScrollAction::Bottom)) {
+    return std::nullopt;
+  }
+
+  return static_cast<AttachScrollAction>(action);
 }
 
 }  // namespace wmux

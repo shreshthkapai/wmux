@@ -224,6 +224,22 @@ void expects_attach_mouse_event_frame() {
   assert(mouse->action == wmux::AttachMouseAction::Drag);
 }
 
+void expects_attach_scroll_frame() {
+  const auto frame = wmux::make_attach_scroll_frame(wmux::AttachScrollAction::PageUp);
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 1);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::Scroll);
+  assert(header->payload_size == 1);
+
+  const auto scroll =
+      wmux::parse_attach_scroll_payload(frame.substr(wmux::kAttachFrameHeaderSize));
+  assert(scroll);
+  assert(*scroll == wmux::AttachScrollAction::PageUp);
+}
+
 void rejects_bad_attach_resize_payload() {
   assert(!wmux::parse_attach_resize_payload(""));
   assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
@@ -239,6 +255,11 @@ void rejects_bad_attach_mouse_event_payload() {
   assert(!wmux::parse_attach_mouse_event_payload(""));
   assert(!wmux::parse_attach_mouse_event_payload(std::string_view{"\x01\0\x01\0\0\0\x07\0", 8}));
   assert(!wmux::parse_attach_mouse_event_payload(std::string_view{"\x01\0\x01\0\0\0\0\x04", 8}));
+}
+
+void rejects_bad_attach_scroll_payload() {
+  assert(!wmux::parse_attach_scroll_payload(""));
+  assert(!wmux::parse_attach_scroll_payload(std::string_view{"\x05", 1}));
 }
 
 void expects_bad_json_rejected() {
@@ -267,8 +288,10 @@ void run_ipc_protocol_tests() {
   expects_attach_command_mode_frame();
   expects_attach_mouse_focus_frame();
   expects_attach_mouse_event_frame();
+  expects_attach_scroll_frame();
   rejects_bad_attach_resize_payload();
   rejects_bad_attach_mouse_focus_payload();
   rejects_bad_attach_mouse_event_payload();
+  rejects_bad_attach_scroll_payload();
   expects_bad_json_rejected();
 }

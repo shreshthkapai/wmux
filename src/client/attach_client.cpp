@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -311,6 +312,10 @@ bool send_attach_mouse_event(HANDLE pipe, const MouseEvent& event) {
   return write_attach_frame(pipe, make_attach_mouse_event_frame(payload));
 }
 
+bool send_attach_scroll(HANDLE pipe, AttachScrollAction action) {
+  return write_attach_frame(pipe, make_attach_scroll_frame(action));
+}
+
 bool same_terminal_size(TerminalSize lhs, TerminalSize rhs) {
   return lhs.columns == rhs.columns && lhs.rows == rhs.rows;
 }
@@ -328,6 +333,32 @@ std::string_view arrow_attach_command(char direction) {
     default:
       return {};
   }
+}
+
+std::optional<AttachScrollAction> prefixed_scroll_sequence(std::string_view bytes) {
+  if (bytes.rfind("\x1b[5~", 0) == 0) {
+    return AttachScrollAction::PageUp;
+  }
+
+  if (bytes.rfind("\x1b[6~", 0) == 0) {
+    return AttachScrollAction::PageDown;
+  }
+
+  return std::nullopt;
+}
+
+std::size_t prefixed_scroll_sequence_size(AttachScrollAction action) {
+  switch (action) {
+    case AttachScrollAction::PageUp:
+    case AttachScrollAction::PageDown:
+      return 4;
+    case AttachScrollAction::LineUp:
+    case AttachScrollAction::LineDown:
+    case AttachScrollAction::Bottom:
+      return 0;
+  }
+
+  return 0;
 }
 
 bool read_response_line(HANDLE pipe, std::string& response) {
@@ -456,9 +487,19 @@ bool send_processed_input(
       if (byte == '"') {
         return send_attach_command(pipe, "split-vertical");
       }
+      if (byte == 'g') {
+        return send_attach_scroll(pipe, AttachScrollAction::Bottom);
+      }
       if (byte == ':') {
         start_command_prompt(command_prompt);
         return send_attach_status(pipe, command_prompt_status_text(command_prompt));
+      }
+      if (byte == '\x1b') {
+        const auto scroll = prefixed_scroll_sequence(bytes.substr(index));
+        if (scroll) {
+          index += prefixed_scroll_sequence_size(*scroll) - 1;
+          return send_attach_scroll(pipe, *scroll);
+        }
       }
       if (byte == '\x1b' && index + 2 < bytes.size() && bytes[index + 1] == '[') {
         const auto command = arrow_attach_command(bytes[index + 2]);

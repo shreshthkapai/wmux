@@ -265,6 +265,7 @@ struct PtyProcess::Impl {
     snapshot.next_sequence = next_sequence;
     snapshot.alive = !reader_done;
     snapshot.screen = screen.snapshot();
+    snapshot.scrollback = screen.scrollback_snapshot();
     snapshot.bytes.reserve(buffered_bytes);
     for (const auto& chunk : output_chunks) {
       snapshot.bytes += chunk.bytes;

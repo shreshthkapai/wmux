@@ -377,11 +377,47 @@ void append_pane_border(std::string& out, const PaneLayoutRect& rect, bool activ
   out.push_back('+');
 }
 
+struct PaneViewportState {
+  std::size_t offset{0};
+  std::size_t observed_line_count{0};
+};
+
+using PaneViewportStates = std::unordered_map<PaneId, PaneViewportState>;
+
+std::size_t snapshot_line_count(const PtyOutputSnapshot& snapshot) {
+  return snapshot.scrollback.lines.size() + snapshot.screen.lines.size();
+}
+
+std::size_t max_viewport_offset(const PtyOutputSnapshot& snapshot, int height) {
+  if (height <= 0) {
+    return 0;
+  }
+
+  const auto total = snapshot_line_count(snapshot);
+  const auto visible = static_cast<std::size_t>(height);
+  return total > visible ? total - visible : 0;
+}
+
+std::string_view snapshot_line_at(const PtyOutputSnapshot& snapshot, std::size_t index) {
+  if (index < snapshot.scrollback.lines.size()) {
+    return snapshot.scrollback.lines[index];
+  }
+
+  const auto screen_index = index - snapshot.scrollback.lines.size();
+  if (screen_index < snapshot.screen.lines.size()) {
+    return snapshot.screen.lines[screen_index];
+  }
+
+  return {};
+}
+
 std::string render_frame(
     const ActiveWindowFrame& frame,
     const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
     std::string_view status_override) {
   std::string out{kClearTerminal};
+  std::size_t active_viewport_offset = 0;
 
   for (const auto& pane : frame.panes) {
     append_pane_border(out, pane.rect, pane.active);
@@ -395,13 +431,24 @@ std::string render_frame(
       continue;
     }
 
-    const auto& lines = snapshot->second.screen.lines;
-    const int first_row = std::max(0, static_cast<int>(lines.size()) - height);
+    const auto total_lines = snapshot_line_count(snapshot->second);
+    const auto viewport = viewport_states.find(pane.rect.pane_id);
+    const auto requested_offset =
+        viewport == viewport_states.end() ? std::size_t{0} : viewport->second.offset;
+    const auto viewport_offset =
+        std::min(requested_offset, max_viewport_offset(snapshot->second, height));
+    if (pane.active) {
+      active_viewport_offset = viewport_offset;
+    }
+
+    const int first_row = std::max(
+        0,
+        static_cast<int>(total_lines) - height - static_cast<int>(viewport_offset));
     for (int row = 0; row < height; ++row) {
       append_cursor_move(out, top + row, left);
       const int line_index = first_row + row;
-      if (line_index >= 0 && line_index < static_cast<int>(lines.size())) {
-        append_clipped_text(out, lines[static_cast<std::size_t>(line_index)], width);
+      if (line_index >= 0 && line_index < static_cast<int>(total_lines)) {
+        append_clipped_text(out, snapshot_line_at(snapshot->second, line_index), width);
       } else {
         out.append(static_cast<std::size_t>(width), ' ');
       }
@@ -413,6 +460,9 @@ std::string render_frame(
     if (status_override.empty()) {
       status << " wmux [" << frame.session_name << "] window " << frame.window_name
              << " pane " << frame.active_pane_id << " ";
+      if (active_viewport_offset > 0) {
+        status << "scroll " << active_viewport_offset << " ";
+      }
     } else {
       status << status_override;
     }
@@ -1042,6 +1092,72 @@ bool read_attach_frame(
   return true;
 }
 
+void update_viewport_states(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    PaneViewportStates& viewport_states) {
+  for (const auto& pane : frame.panes) {
+    const auto snapshot = snapshots.find(pane.rect.pane_id);
+    if (snapshot == snapshots.end()) {
+      continue;
+    }
+
+    const auto total_lines = snapshot_line_count(snapshot->second);
+    auto& viewport = viewport_states[pane.rect.pane_id];
+    if (viewport.offset > 0 && viewport.observed_line_count > 0 &&
+        total_lines > viewport.observed_line_count) {
+      viewport.offset += total_lines - viewport.observed_line_count;
+    }
+
+    viewport.observed_line_count = total_lines;
+    viewport.offset =
+        std::min(viewport.offset, max_viewport_offset(snapshot->second, body_height(pane.rect)));
+  }
+}
+
+bool apply_active_viewport_scroll(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    PaneViewportStates& viewport_states,
+    AttachScrollAction action) {
+  const auto pane = std::ranges::find_if(frame.panes, [&](const auto& candidate) {
+    return candidate.rect.pane_id == frame.active_pane_id;
+  });
+  if (pane == frame.panes.end()) {
+    return false;
+  }
+
+  const auto snapshot = snapshots.find(frame.active_pane_id);
+  if (snapshot == snapshots.end()) {
+    return false;
+  }
+
+  const int height = body_height(pane->rect);
+  const auto max_offset = max_viewport_offset(snapshot->second, height);
+  auto& viewport = viewport_states[frame.active_pane_id];
+
+  const auto page_delta = static_cast<std::size_t>(std::max(1, height - 1));
+  switch (action) {
+    case AttachScrollAction::LineUp:
+      viewport.offset = std::min(max_offset, viewport.offset + 1);
+      break;
+    case AttachScrollAction::LineDown:
+      viewport.offset = viewport.offset > 0 ? viewport.offset - 1 : 0;
+      break;
+    case AttachScrollAction::PageUp:
+      viewport.offset = std::min(max_offset, viewport.offset + page_delta);
+      break;
+    case AttachScrollAction::PageDown:
+      viewport.offset = viewport.offset > page_delta ? viewport.offset - page_delta : 0;
+      break;
+    case AttachScrollAction::Bottom:
+      viewport.offset = 0;
+      break;
+  }
+
+  return true;
+}
+
 void run_attach_connection(
     HANDLE pipe,
     DaemonState& state,
@@ -1064,10 +1180,11 @@ void run_attach_connection(
   std::mutex stream_mutex;
   std::unordered_map<PaneId, std::shared_ptr<PtyProcess>> current_shells;
   std::unordered_map<PaneId, std::uint64_t> next_sequences;
+  PaneViewportStates viewport_states;
   std::string status_override;
   MouseDragState mouse_drag;
 
-  const auto replay_active_window = [&](std::string& error) {
+  const auto replay_active_window = [&](std::string& error, std::optional<AttachScrollAction> scroll) {
     std::lock_guard stream_lock(stream_mutex);
     auto frame = active_window_frame(
         state,
@@ -1090,7 +1207,12 @@ void run_attach_connection(
       snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
     }
 
-    const auto replay = render_frame(*frame, snapshots, status_override);
+    update_viewport_states(*frame, snapshots, viewport_states);
+    if (scroll) {
+      (void)apply_active_viewport_scroll(*frame, snapshots, viewport_states, *scroll);
+    }
+
+    const auto replay = render_frame(*frame, snapshots, viewport_states, status_override);
 
     if (!write_all(pipe, replay)) {
       output_closed = true;
@@ -1113,7 +1235,7 @@ void run_attach_connection(
 
   {
     std::string error;
-    if (!replay_active_window(error)) {
+    if (!replay_active_window(error, std::nullopt)) {
       if (!error.empty()) {
         write_all(pipe, error);
       }
@@ -1170,7 +1292,7 @@ void run_attach_connection(
         }
 
         std::string error;
-        if (!replay_active_window(error)) {
+        if (!replay_active_window(error, std::nullopt)) {
           stop_requested = true;
           break;
         }
@@ -1199,7 +1321,7 @@ void run_attach_connection(
         end_reason = AttachEndReason::ProtocolError;
         break;
       }
-      if (!replay_active_window(error)) {
+      if (!replay_active_window(error, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1216,7 +1338,7 @@ void run_attach_connection(
       current_columns.store(static_cast<short>(dimensions->first), std::memory_order_relaxed);
       current_rows.store(static_cast<short>(dimensions->second), std::memory_order_relaxed);
       std::string error;
-      if (!replay_active_window(error)) {
+      if (!replay_active_window(error, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1247,7 +1369,7 @@ void run_attach_connection(
         continue;
       }
 
-      if (*changed && !replay_active_window(error)) {
+      if (*changed && !replay_active_window(error, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1262,6 +1384,24 @@ void run_attach_connection(
       }
 
       std::string error;
+      if (mouse->action == AttachMouseAction::Wheel) {
+        const auto scroll =
+            mouse->button == AttachMouseButton::WheelUp
+                ? AttachScrollAction::LineUp
+                : mouse->button == AttachMouseButton::WheelDown
+                      ? AttachScrollAction::LineDown
+                      : AttachScrollAction::Bottom;
+        if (scroll == AttachScrollAction::Bottom) {
+          continue;
+        }
+
+        if (!replay_active_window(error, scroll)) {
+          end_reason = AttachEndReason::OutputClosed;
+          break;
+        }
+        continue;
+      }
+
       const auto changed = handle_interactive_mouse_event(
           state,
           session_id,
@@ -1278,7 +1418,22 @@ void run_attach_connection(
         continue;
       }
 
-      if (*changed && !replay_active_window(error)) {
+      if (*changed && !replay_active_window(error, std::nullopt)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::Scroll) {
+      const auto scroll = parse_attach_scroll_payload(frame.payload);
+      if (!scroll) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      std::string error;
+      if (!replay_active_window(error, *scroll)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1292,7 +1447,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_active_window(error)) {
+      if (!replay_active_window(error, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1308,7 +1463,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_active_window(error)) {
+      if (!replay_active_window(error, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1317,7 +1472,17 @@ void run_attach_connection(
 
     std::string error;
     auto shell = active_shell_for_session(state, session_id, error);
-    if (!shell || !shell->shell->write_input(frame.payload)) {
+    if (!shell) {
+      end_reason = AttachEndReason::ShellClosed;
+      break;
+    }
+
+    {
+      std::lock_guard stream_lock(stream_mutex);
+      viewport_states[shell->pane_id].offset = 0;
+    }
+
+    if (!shell->shell->write_input(frame.payload)) {
       end_reason = AttachEndReason::ShellClosed;
       break;
     }
