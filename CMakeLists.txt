@@ -55,6 +55,7 @@ endif()
 set(WMUX_COMMON_SOURCES
   src/commands/commands.cpp
   src/core/command_mode.cpp
+  src/core/copy_selection.cpp
   src/core/mouse_input.cpp
   src/core/session_manager.cpp
   src/core/terminal_grid.cpp
@@ -70,6 +71,7 @@ set(WMUX_RUNTIME_SOURCES
   src/daemon/daemon_shell.cpp
   src/daemon/daemon_state.cpp
   src/ipc/transport.cpp
+  src/platform/windows_clipboard.cpp
   src/pty/pty_process.cpp
 )
 
@@ -87,6 +89,7 @@ target_compile_definitions(wmux PRIVATE
 
 if(WIN32)
   target_compile_definitions(wmux PRIVATE _WIN32_WINNT=0x0A00)
+  target_link_libraries(wmux PRIVATE user32)
 endif()
 
 if(MSVC)
@@ -101,11 +104,14 @@ if(WMUX_BUILD_TESTS)
   add_executable(wmux_tests
     tests/command_mode_test.cpp
     tests/command_parser_test.cpp
+    tests/copy_selection_test.cpp
     tests/ipc_protocol_test.cpp
     tests/mouse_input_test.cpp
     tests/session_manager_test.cpp
     tests/terminal_grid_test.cpp
+    tests/windows_clipboard_test.cpp
     ${WMUX_COMMON_SOURCES}
+    src/platform/windows_clipboard.cpp
   )
   target_include_directories(wmux_tests PRIVATE include)
   target_link_libraries(wmux_tests PRIVATE "${WMUX_CLI11_TARGET}" "${WMUX_SPDLOG_TARGET}")
@@ -115,6 +121,7 @@ if(WMUX_BUILD_TESTS)
 
   if(WIN32)
     target_compile_definitions(wmux_tests PRIVATE _WIN32_WINNT=0x0A00)
+    target_link_libraries(wmux_tests PRIVATE user32)
   endif()
 
   if(MSVC)

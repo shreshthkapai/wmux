@@ -186,6 +186,31 @@ void preserves_normal_screen_across_alternate_screen() {
   assert(screen.lines[0] == "normal      ");
 }
 
+void reports_active_alternate_screen_without_losing_normal_scrollback() {
+  wmux::TerminalGrid grid{5, 2};
+
+  grid.feed("a\r\nb\r\nc\x1b[?1049halt");
+
+  const auto screen = grid.snapshot();
+  assert(screen.alternate_screen);
+  assert(screen.lines[0] == "alt  ");
+  assert(grid.scrollback_snapshot().lines.size() == 1);
+}
+
+void accepts_utf8_bytes_without_overflowing_grid_rows() {
+  wmux::TerminalGrid grid{4, 2};
+  std::string input{"a", 1};
+  input.push_back(static_cast<char>(0xce));
+  input.push_back(static_cast<char>(0xbb));
+  input.push_back('z');
+
+  grid.feed(input);
+
+  const auto screen = grid.snapshot();
+  assert(screen.lines.size() == 2);
+  assert(screen.lines[0].size() == 4);
+}
+
 void resizes_while_preserving_visible_cells() {
   wmux::TerminalGrid grid{8, 2};
 
@@ -230,6 +255,8 @@ void run_terminal_grid_tests() {
   csi_3j_in_alternate_screen_does_not_clear_normal_scrollback();
   tracks_sgr_state_without_rendering_escape_bytes();
   preserves_normal_screen_across_alternate_screen();
+  reports_active_alternate_screen_without_losing_normal_scrollback();
+  accepts_utf8_bytes_without_overflowing_grid_rows();
   resizes_while_preserving_visible_cells();
   preserves_wrapped_line_metadata_across_resize();
 }

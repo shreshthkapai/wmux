@@ -316,6 +316,10 @@ bool send_attach_scroll(HANDLE pipe, AttachScrollAction action) {
   return write_attach_frame(pipe, make_attach_scroll_frame(action));
 }
 
+bool send_attach_copy_mode(HANDLE pipe, AttachCopyModeAction action) {
+  return write_attach_frame(pipe, make_attach_copy_mode_frame(action));
+}
+
 bool same_terminal_size(TerminalSize lhs, TerminalSize rhs) {
   return lhs.columns == rhs.columns && lhs.rows == rhs.rows;
 }
@@ -361,6 +365,60 @@ std::size_t prefixed_scroll_sequence_size(AttachScrollAction action) {
   return 0;
 }
 
+struct CopyModeKeyAction {
+  AttachCopyModeAction action{AttachCopyModeAction::Exit};
+  std::size_t bytes_consumed{1};
+};
+
+std::optional<CopyModeKeyAction> copy_mode_sequence(std::string_view bytes) {
+  if (bytes.empty()) {
+    return std::nullopt;
+  }
+
+  if (bytes[0] == 'q' || bytes[0] == '\x1b') {
+    if (bytes.rfind("\x1b[A", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::CursorUp, 3};
+    }
+    if (bytes.rfind("\x1b[B", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::CursorDown, 3};
+    }
+    if (bytes.rfind("\x1b[C", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::CursorRight, 3};
+    }
+    if (bytes.rfind("\x1b[D", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::CursorLeft, 3};
+    }
+    if (bytes.rfind("\x1b[5~", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::PageUp, 4};
+    }
+    if (bytes.rfind("\x1b[6~", 0) == 0) {
+      return CopyModeKeyAction{AttachCopyModeAction::PageDown, 4};
+    }
+    return CopyModeKeyAction{AttachCopyModeAction::Exit, 1};
+  }
+
+  if (bytes[0] == 'k') {
+    return CopyModeKeyAction{AttachCopyModeAction::CursorUp, 1};
+  }
+  if (bytes[0] == 'j') {
+    return CopyModeKeyAction{AttachCopyModeAction::CursorDown, 1};
+  }
+  if (bytes[0] == 'h') {
+    return CopyModeKeyAction{AttachCopyModeAction::CursorLeft, 1};
+  }
+  if (bytes[0] == 'l') {
+    return CopyModeKeyAction{AttachCopyModeAction::CursorRight, 1};
+  }
+  if (bytes[0] == ' ') {
+    return CopyModeKeyAction{AttachCopyModeAction::StartSelection, 1};
+  }
+  if (bytes[0] == '\r' || bytes[0] == '\n') {
+    return CopyModeKeyAction{AttachCopyModeAction::CopySelection, 1};
+  }
+
+  return std::nullopt;
+}
+
 bool read_response_line(HANDLE pipe, std::string& response) {
   response.clear();
   char ch = '\0';
@@ -382,6 +440,7 @@ bool send_processed_input(
     std::string& pending_mouse_sequence,
     bool mouse_enabled,
     bool& prefix_pending,
+    bool& copy_mode_active,
     std::atomic_bool& stop_requested,
     HANDLE stop_event) {
   std::string to_send;
@@ -464,6 +523,23 @@ bool send_processed_input(
       continue;
     }
 
+    if (copy_mode_active) {
+      const auto action = copy_mode_sequence(bytes.substr(index));
+      if (!action) {
+        continue;
+      }
+
+      const auto consumed = action->bytes_consumed;
+      if (consumed > 0) {
+        index += std::min(consumed, bytes.size() - index) - 1;
+      }
+      if (action->action == AttachCopyModeAction::Exit ||
+          action->action == AttachCopyModeAction::CopySelection) {
+        copy_mode_active = false;
+      }
+      return send_attach_copy_mode(pipe, action->action);
+    }
+
     if (prefix_pending) {
       prefix_pending = false;
       if (byte == 'd') {
@@ -493,6 +569,10 @@ bool send_processed_input(
       if (byte == ':') {
         start_command_prompt(command_prompt);
         return send_attach_status(pipe, command_prompt_status_text(command_prompt));
+      }
+      if (byte == '[') {
+        copy_mode_active = true;
+        return send_attach_copy_mode(pipe, AttachCopyModeAction::Enter);
       }
       if (byte == '\x1b') {
         const auto scroll = prefixed_scroll_sequence(bytes.substr(index));
@@ -636,6 +716,7 @@ int run_attach_client(const CommandLine& command) {
   CommandPromptState command_prompt;
   std::string pending_mouse_sequence;
   bool prefix_pending = false;
+  bool copy_mode_active = false;
   char buffer[512];
   while (!stop_requested) {
     HANDLE handles[] = {input, stop_event.get()};
@@ -675,6 +756,7 @@ int run_attach_client(const CommandLine& command) {
             pending_mouse_sequence,
             response->mouse_enabled,
             prefix_pending,
+            copy_mode_active,
             stop_requested,
             stop_event.get())) {
       stop_requested = true;

@@ -240,6 +240,23 @@ void expects_attach_scroll_frame() {
   assert(*scroll == wmux::AttachScrollAction::PageUp);
 }
 
+void expects_attach_copy_mode_frame() {
+  const auto frame =
+      wmux::make_attach_copy_mode_frame(wmux::AttachCopyModeAction::CopySelection);
+  assert(frame.size() == wmux::kAttachFrameHeaderSize + 1);
+
+  const auto header = wmux::parse_attach_frame_header(
+      std::string_view{frame.data(), wmux::kAttachFrameHeaderSize});
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::CopyMode);
+  assert(header->payload_size == 1);
+
+  const auto action =
+      wmux::parse_attach_copy_mode_payload(frame.substr(wmux::kAttachFrameHeaderSize));
+  assert(action);
+  assert(*action == wmux::AttachCopyModeAction::CopySelection);
+}
+
 void rejects_bad_attach_resize_payload() {
   assert(!wmux::parse_attach_resize_payload(""));
   assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
@@ -260,6 +277,11 @@ void rejects_bad_attach_mouse_event_payload() {
 void rejects_bad_attach_scroll_payload() {
   assert(!wmux::parse_attach_scroll_payload(""));
   assert(!wmux::parse_attach_scroll_payload(std::string_view{"\x05", 1}));
+}
+
+void rejects_bad_attach_copy_mode_payload() {
+  assert(!wmux::parse_attach_copy_mode_payload(""));
+  assert(!wmux::parse_attach_copy_mode_payload(std::string_view{"\x0a", 1}));
 }
 
 void expects_bad_json_rejected() {
@@ -289,9 +311,11 @@ void run_ipc_protocol_tests() {
   expects_attach_mouse_focus_frame();
   expects_attach_mouse_event_frame();
   expects_attach_scroll_frame();
+  expects_attach_copy_mode_frame();
   rejects_bad_attach_resize_payload();
   rejects_bad_attach_mouse_focus_payload();
   rejects_bad_attach_mouse_event_payload();
   rejects_bad_attach_scroll_payload();
+  rejects_bad_attach_copy_mode_payload();
   expects_bad_json_rejected();
 }

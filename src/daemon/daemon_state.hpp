@@ -36,6 +36,7 @@ struct DaemonState {
   std::condition_variable attach_clients_changed;
   SessionManager sessions;
   bool mouse_enabled{false};
+  std::string paste_buffer;
 
   struct PaneRuntime {
     std::shared_ptr<PtyProcess> shell;

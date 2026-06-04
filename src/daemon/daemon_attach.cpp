@@ -3,8 +3,10 @@
 #include "daemon_shell.hpp"
 #include "wmux/command_mode.hpp"
 #include "wmux/commands.hpp"
+#include "wmux/copy_selection.hpp"
 #include "wmux/ipc_transport.hpp"
 #include "wmux/pty_process.hpp"
+#include "wmux/windows_clipboard.hpp"
 
 #include <algorithm>
 #include <array>
@@ -325,6 +327,69 @@ void append_clipped_text(std::string& out, std::string_view line, int width) {
   }
 }
 
+struct CopyLineOverlay {
+  std::optional<int> cursor_column;
+  std::optional<std::pair<int, int>> selected_columns;
+};
+
+void append_clipped_text_with_overlay(
+    std::string& out,
+    std::string_view line,
+    int width,
+    const CopyLineOverlay& overlay) {
+  if (!overlay.cursor_column && !overlay.selected_columns) {
+    append_clipped_text(out, line, width);
+    return;
+  }
+
+  if (width <= 0) {
+    return;
+  }
+
+  std::optional<int> cursor;
+  if (overlay.cursor_column) {
+    cursor = std::clamp(*overlay.cursor_column, 0, width - 1);
+  }
+  std::optional<std::pair<int, int>> selected;
+  if (overlay.selected_columns) {
+    const int first = std::clamp(overlay.selected_columns->first, 0, width - 1);
+    const int last = std::clamp(overlay.selected_columns->second, 0, width - 1);
+    selected = std::pair{std::min(first, last), std::max(first, last)};
+  }
+
+  bool inverse = false;
+  const auto set_inverse = [&](bool enabled) {
+    if (enabled == inverse) {
+      return;
+    }
+    out += enabled ? "\x1b[7m" : "\x1b[0m";
+    inverse = enabled;
+  };
+
+  for (int column = 0; column < width; ++column) {
+    const char ch = column < static_cast<int>(line.size())
+                        ? line[static_cast<std::size_t>(column)]
+                        : ' ';
+    const bool selected_column =
+        selected && column >= selected->first && column <= selected->second;
+    set_inverse((cursor && column == *cursor) || selected_column);
+    out.push_back(ch);
+  }
+  set_inverse(false);
+}
+
+struct CopyModePoint {
+  std::size_t line{0};
+  std::size_t column{0};
+};
+
+bool operator<(const CopyModePoint& left, const CopyModePoint& right) {
+  if (left.line != right.line) {
+    return left.line < right.line;
+  }
+  return left.column < right.column;
+}
+
 std::string sanitize_status_text(std::string_view value) {
   constexpr std::size_t kMaxStatusBytes = 4096;
   std::string sanitized;
@@ -384,8 +449,22 @@ struct PaneViewportState {
 
 using PaneViewportStates = std::unordered_map<PaneId, PaneViewportState>;
 
+struct CopyModeState {
+  bool active{false};
+  PaneId pane_id{0};
+  std::size_t cursor_row{0};
+  std::size_t cursor_column{0};
+  bool selection_active{false};
+  CopyModePoint selection_anchor;
+};
+
 std::size_t snapshot_line_count(const PtyOutputSnapshot& snapshot) {
-  return snapshot.scrollback.lines.size() + snapshot.screen.lines.size();
+  if (snapshot.screen.alternate_screen) {
+    return std::max(snapshot.screen.line_snapshots.size(), snapshot.screen.lines.size());
+  }
+
+  return std::max(snapshot.scrollback.line_snapshots.size(), snapshot.scrollback.lines.size()) +
+         std::max(snapshot.screen.line_snapshots.size(), snapshot.screen.lines.size());
 }
 
 std::size_t max_viewport_offset(const PtyOutputSnapshot& snapshot, int height) {
@@ -398,7 +477,36 @@ std::size_t max_viewport_offset(const PtyOutputSnapshot& snapshot, int height) {
   return total > visible ? total - visible : 0;
 }
 
+std::size_t first_visible_line_index(
+    const PtyOutputSnapshot& snapshot,
+    int height,
+    std::size_t viewport_offset) {
+  if (height <= 0) {
+    return 0;
+  }
+
+  const auto total_lines = snapshot_line_count(snapshot);
+  const auto visible_lines = std::min(total_lines, static_cast<std::size_t>(height));
+  const auto max_offset = total_lines - visible_lines;
+  const auto clamped_offset = std::min(viewport_offset, max_offset);
+  return total_lines - visible_lines - clamped_offset;
+}
+
+std::size_t clamped_viewport_offset(
+    const PtyOutputSnapshot& snapshot,
+    int height,
+    std::size_t viewport_offset) {
+  return std::min(viewport_offset, max_viewport_offset(snapshot, height));
+}
+
 std::string_view snapshot_line_at(const PtyOutputSnapshot& snapshot, std::size_t index) {
+  if (snapshot.screen.alternate_screen) {
+    if (index < snapshot.screen.lines.size()) {
+      return snapshot.screen.lines[index];
+    }
+    return {};
+  }
+
   if (index < snapshot.scrollback.lines.size()) {
     return snapshot.scrollback.lines[index];
   }
@@ -411,10 +519,61 @@ std::string_view snapshot_line_at(const PtyOutputSnapshot& snapshot, std::size_t
   return {};
 }
 
+CopyModePoint copy_mode_cursor_point(
+    const CopyModeState& copy_mode,
+    const PtyOutputSnapshot& snapshot,
+    int height,
+    std::size_t viewport_offset) {
+  return CopyModePoint{
+      first_visible_line_index(snapshot, height, viewport_offset) + copy_mode.cursor_row,
+      copy_mode.cursor_column};
+}
+
+std::optional<std::pair<int, int>> selected_columns_for_line(
+    const CopyModeState& copy_mode,
+    const CopyModePoint& cursor,
+    std::size_t line,
+    int width) {
+  if (!copy_mode.selection_active || width <= 0) {
+    return std::nullopt;
+  }
+
+  auto first = copy_mode.selection_anchor;
+  auto last = cursor;
+  if (last < first) {
+    std::swap(first, last);
+  }
+
+  if (line < first.line || line > last.line) {
+    return std::nullopt;
+  }
+
+  if (first.line == last.line) {
+    return std::pair{
+        static_cast<int>(std::min(first.column, static_cast<std::size_t>(width - 1))),
+        static_cast<int>(std::min(last.column, static_cast<std::size_t>(width - 1)))};
+  }
+
+  if (line == first.line) {
+    return std::pair{
+        static_cast<int>(std::min(first.column, static_cast<std::size_t>(width - 1))),
+        width - 1};
+  }
+
+  if (line == last.line) {
+    return std::pair{
+        0,
+        static_cast<int>(std::min(last.column, static_cast<std::size_t>(width - 1)))};
+  }
+
+  return std::pair{0, width - 1};
+}
+
 std::string render_frame(
     const ActiveWindowFrame& frame,
     const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
     const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
     std::string_view status_override) {
   std::string out{kClearTerminal};
   std::size_t active_viewport_offset = 0;
@@ -435,22 +594,38 @@ std::string render_frame(
     const auto viewport = viewport_states.find(pane.rect.pane_id);
     const auto requested_offset =
         viewport == viewport_states.end() ? std::size_t{0} : viewport->second.offset;
-    const auto viewport_offset =
-        std::min(requested_offset, max_viewport_offset(snapshot->second, height));
+    const auto viewport_offset = clamped_viewport_offset(snapshot->second, height, requested_offset);
     if (pane.active) {
       active_viewport_offset = viewport_offset;
     }
 
-    const int first_row = std::max(
-        0,
-        static_cast<int>(total_lines) - height - static_cast<int>(viewport_offset));
+    const auto first_row =
+        first_visible_line_index(snapshot->second, height, viewport_offset);
     for (int row = 0; row < height; ++row) {
       append_cursor_move(out, top + row, left);
-      const int line_index = first_row + row;
-      if (line_index >= 0 && line_index < static_cast<int>(total_lines)) {
-        append_clipped_text(out, snapshot_line_at(snapshot->second, line_index), width);
+      const auto line_index = first_row + static_cast<std::size_t>(row);
+      std::optional<int> cursor_column;
+      CopyModePoint cursor_point;
+      std::optional<std::pair<int, int>> selected_columns;
+      if (copy_mode.active && copy_mode.pane_id == pane.rect.pane_id &&
+          row == static_cast<int>(copy_mode.cursor_row)) {
+        cursor_column = static_cast<int>(copy_mode.cursor_column);
+      }
+      if (copy_mode.active && copy_mode.pane_id == pane.rect.pane_id) {
+        cursor_point = copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+        selected_columns =
+            selected_columns_for_line(copy_mode, cursor_point, line_index, width);
+      }
+
+      if (line_index < total_lines) {
+        append_clipped_text_with_overlay(
+            out,
+            snapshot_line_at(snapshot->second, line_index),
+            width,
+            CopyLineOverlay{cursor_column, selected_columns});
       } else {
-        out.append(static_cast<std::size_t>(width), ' ');
+        append_clipped_text_with_overlay(
+            out, {}, width, CopyLineOverlay{cursor_column, selected_columns});
       }
     }
   }
@@ -458,8 +633,18 @@ std::string render_frame(
   if (frame.rows > 1) {
     std::ostringstream status;
     if (status_override.empty()) {
-      status << " wmux [" << frame.session_name << "] window " << frame.window_name
-             << " pane " << frame.active_pane_id << " ";
+      if (copy_mode.active) {
+        status << " copy-mode [" << frame.session_name << "] window " << frame.window_name
+               << " pane " << copy_mode.pane_id << " "
+               << "cursor " << copy_mode.cursor_row + 1 << ","
+               << copy_mode.cursor_column + 1 << " ";
+        if (copy_mode.selection_active) {
+          status << "selecting ";
+        }
+      } else {
+        status << " wmux [" << frame.session_name << "] window " << frame.window_name
+               << " pane " << frame.active_pane_id << " ";
+      }
       if (active_viewport_offset > 0) {
         status << "scroll " << active_viewport_offset << " ";
       }
@@ -1095,7 +1280,8 @@ bool read_attach_frame(
 void update_viewport_states(
     const ActiveWindowFrame& frame,
     const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
-    PaneViewportStates& viewport_states) {
+    PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode) {
   for (const auto& pane : frame.panes) {
     const auto snapshot = snapshots.find(pane.rect.pane_id);
     if (snapshot == snapshots.end()) {
@@ -1104,7 +1290,8 @@ void update_viewport_states(
 
     const auto total_lines = snapshot_line_count(snapshot->second);
     auto& viewport = viewport_states[pane.rect.pane_id];
-    if (viewport.offset > 0 && viewport.observed_line_count > 0 &&
+    const bool frozen = copy_mode.active && copy_mode.pane_id == pane.rect.pane_id;
+    if ((frozen || viewport.offset > 0) && viewport.observed_line_count > 0 &&
         total_lines > viewport.observed_line_count) {
       viewport.offset += total_lines - viewport.observed_line_count;
     }
@@ -1115,26 +1302,27 @@ void update_viewport_states(
   }
 }
 
-bool apply_active_viewport_scroll(
+bool apply_viewport_scroll(
+    PaneId pane_id,
     const ActiveWindowFrame& frame,
     const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
     PaneViewportStates& viewport_states,
     AttachScrollAction action) {
   const auto pane = std::ranges::find_if(frame.panes, [&](const auto& candidate) {
-    return candidate.rect.pane_id == frame.active_pane_id;
+    return candidate.rect.pane_id == pane_id;
   });
   if (pane == frame.panes.end()) {
     return false;
   }
 
-  const auto snapshot = snapshots.find(frame.active_pane_id);
+  const auto snapshot = snapshots.find(pane_id);
   if (snapshot == snapshots.end()) {
     return false;
   }
 
   const int height = body_height(pane->rect);
   const auto max_offset = max_viewport_offset(snapshot->second, height);
-  auto& viewport = viewport_states[frame.active_pane_id];
+  auto& viewport = viewport_states[pane_id];
 
   const auto page_delta = static_cast<std::size_t>(std::max(1, height - 1));
   switch (action) {
@@ -1155,6 +1343,211 @@ bool apply_active_viewport_scroll(
       break;
   }
 
+  return true;
+}
+
+bool apply_active_viewport_scroll(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    PaneViewportStates& viewport_states,
+    AttachScrollAction action) {
+  return apply_viewport_scroll(
+      frame.active_pane_id, frame, snapshots, viewport_states, action);
+}
+
+const RenderPane* active_render_pane(const ActiveWindowFrame& frame) {
+  const auto pane = std::ranges::find_if(frame.panes, [&](const auto& candidate) {
+    return candidate.rect.pane_id == frame.active_pane_id;
+  });
+  return pane == frame.panes.end() ? nullptr : &*pane;
+}
+
+std::size_t visible_copy_line_count(const PtyOutputSnapshot& snapshot, int height) {
+  if (height <= 0) {
+    return 0;
+  }
+
+  const auto total_lines = snapshot_line_count(snapshot);
+  if (total_lines == 0) {
+    return 1;
+  }
+
+  return std::min<std::size_t>(total_lines, static_cast<std::size_t>(height));
+}
+
+void clamp_copy_mode_cursor(
+    CopyModeState& copy_mode,
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots) {
+  if (!copy_mode.active) {
+    return;
+  }
+
+  const auto pane = std::ranges::find_if(frame.panes, [&](const auto& candidate) {
+    return candidate.rect.pane_id == copy_mode.pane_id;
+  });
+  if (pane == frame.panes.end()) {
+    copy_mode.active = false;
+    return;
+  }
+
+  const int width = body_width(pane->rect);
+  const int height = body_height(pane->rect);
+  if (width <= 0 || height <= 0) {
+    copy_mode.cursor_row = 0;
+    copy_mode.cursor_column = 0;
+    return;
+  }
+
+  const auto snapshot = snapshots.find(copy_mode.pane_id);
+  const auto visible_lines =
+      snapshot == snapshots.end() ? std::size_t{1}
+                                  : visible_copy_line_count(snapshot->second, height);
+  copy_mode.cursor_row = std::min(copy_mode.cursor_row, visible_lines - 1);
+  copy_mode.cursor_column =
+      std::min(copy_mode.cursor_column, static_cast<std::size_t>(width - 1));
+  if (copy_mode.selection_active) {
+    const auto total_lines =
+        snapshot == snapshots.end()
+            ? std::size_t{1}
+            : std::max<std::size_t>(1, snapshot_line_count(snapshot->second));
+    copy_mode.selection_anchor.line = std::min(copy_mode.selection_anchor.line, total_lines - 1);
+    copy_mode.selection_anchor.column =
+        std::min(copy_mode.selection_anchor.column, static_cast<std::size_t>(width - 1));
+  }
+}
+
+bool apply_copy_mode_action(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    PaneViewportStates& viewport_states,
+    CopyModeState& copy_mode,
+    AttachCopyModeAction action,
+    std::string& copied_text) {
+  if (action == AttachCopyModeAction::Enter) {
+    const auto pane = active_render_pane(frame);
+    if (pane == nullptr) {
+      return false;
+    }
+
+    const int width = body_width(pane->rect);
+    const int height = body_height(pane->rect);
+    copy_mode.active = true;
+    copy_mode.pane_id = frame.active_pane_id;
+    copy_mode.cursor_column = 0;
+    copy_mode.selection_active = false;
+    const auto snapshot = snapshots.find(copy_mode.pane_id);
+    const auto visible_lines =
+        snapshot == snapshots.end() ? std::size_t{1}
+                                    : visible_copy_line_count(snapshot->second, height);
+    copy_mode.cursor_row =
+        width > 0 && height > 0 ? std::min(visible_lines - 1, static_cast<std::size_t>(height - 1))
+                                : std::size_t{0};
+    return true;
+  }
+
+  if (!copy_mode.active) {
+    return true;
+  }
+
+  const auto pane = std::ranges::find_if(frame.panes, [&](const auto& candidate) {
+    return candidate.rect.pane_id == copy_mode.pane_id;
+  });
+  if (pane == frame.panes.end()) {
+    copy_mode.active = false;
+    return false;
+  }
+
+  const int height = body_height(pane->rect);
+  const int width = body_width(pane->rect);
+  const auto snapshot = snapshots.find(copy_mode.pane_id);
+  const auto visible_lines =
+      snapshot == snapshots.end() ? std::size_t{1}
+                                  : visible_copy_line_count(snapshot->second, height);
+
+  switch (action) {
+    case AttachCopyModeAction::Enter:
+      break;
+    case AttachCopyModeAction::Exit:
+      viewport_states[copy_mode.pane_id].offset = 0;
+      copy_mode = {};
+      return true;
+    case AttachCopyModeAction::CursorUp:
+      if (copy_mode.cursor_row > 0) {
+        --copy_mode.cursor_row;
+      } else {
+        (void)apply_viewport_scroll(
+            copy_mode.pane_id, frame, snapshots, viewport_states, AttachScrollAction::LineUp);
+      }
+      break;
+    case AttachCopyModeAction::CursorDown:
+      if (copy_mode.cursor_row + 1 < visible_lines) {
+        ++copy_mode.cursor_row;
+      } else {
+        (void)apply_viewport_scroll(
+            copy_mode.pane_id, frame, snapshots, viewport_states, AttachScrollAction::LineDown);
+      }
+      break;
+    case AttachCopyModeAction::CursorLeft:
+      if (copy_mode.cursor_column > 0) {
+        --copy_mode.cursor_column;
+      }
+      break;
+    case AttachCopyModeAction::CursorRight:
+      if (width > 0) {
+        copy_mode.cursor_column =
+            std::min(copy_mode.cursor_column + 1, static_cast<std::size_t>(width - 1));
+      }
+      break;
+    case AttachCopyModeAction::PageUp:
+      (void)apply_viewport_scroll(
+          copy_mode.pane_id, frame, snapshots, viewport_states, AttachScrollAction::PageUp);
+      break;
+    case AttachCopyModeAction::PageDown:
+      (void)apply_viewport_scroll(
+          copy_mode.pane_id, frame, snapshots, viewport_states, AttachScrollAction::PageDown);
+      break;
+    case AttachCopyModeAction::StartSelection:
+      copy_mode.selection_active = true;
+      if (snapshot == snapshots.end()) {
+        copy_mode.selection_anchor = CopyModePoint{copy_mode.cursor_row, copy_mode.cursor_column};
+      } else {
+        const auto viewport = viewport_states.find(copy_mode.pane_id);
+        const auto viewport_offset =
+            viewport == viewport_states.end()
+                ? std::size_t{0}
+                : clamped_viewport_offset(snapshot->second, height, viewport->second.offset);
+        copy_mode.selection_anchor =
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+      }
+      break;
+    case AttachCopyModeAction::CopySelection:
+      if (!copy_mode.selection_active || snapshot == snapshots.end() || width <= 0 || height <= 0) {
+        return false;
+      }
+      {
+        const auto viewport = viewport_states.find(copy_mode.pane_id);
+        const auto viewport_offset =
+            viewport == viewport_states.end()
+                ? std::size_t{0}
+                : clamped_viewport_offset(snapshot->second, height, viewport->second.offset);
+        const auto cursor =
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+        copied_text = extract_copy_selection_text(
+            snapshot->second,
+            CopySelectionRange{
+                CopySelectionPoint{
+                    copy_mode.selection_anchor.line,
+                    copy_mode.selection_anchor.column},
+                CopySelectionPoint{cursor.line, cursor.column}},
+            static_cast<std::size_t>(width));
+      }
+      viewport_states[copy_mode.pane_id].offset = 0;
+      copy_mode = {};
+      return true;
+  }
+
+  clamp_copy_mode_cursor(copy_mode, frame, snapshots);
   return true;
 }
 
@@ -1181,10 +1574,14 @@ void run_attach_connection(
   std::unordered_map<PaneId, std::shared_ptr<PtyProcess>> current_shells;
   std::unordered_map<PaneId, std::uint64_t> next_sequences;
   PaneViewportStates viewport_states;
+  CopyModeState copy_mode;
   std::string status_override;
   MouseDragState mouse_drag;
 
-  const auto replay_active_window = [&](std::string& error, std::optional<AttachScrollAction> scroll) {
+  const auto replay_active_window = [&](
+                                      std::string& error,
+                                      std::optional<AttachScrollAction> scroll,
+                                      std::optional<AttachCopyModeAction> copy_action) {
     std::lock_guard stream_lock(stream_mutex);
     auto frame = active_window_frame(
         state,
@@ -1207,12 +1604,34 @@ void run_attach_connection(
       snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
     }
 
-    update_viewport_states(*frame, snapshots, viewport_states);
+    update_viewport_states(*frame, snapshots, viewport_states, copy_mode);
     if (scroll) {
       (void)apply_active_viewport_scroll(*frame, snapshots, viewport_states, *scroll);
     }
+    if (copy_action) {
+      std::string copied_text;
+      const auto applied = apply_copy_mode_action(
+          *frame, snapshots, viewport_states, copy_mode, *copy_action, copied_text);
+      if (*copy_action == AttachCopyModeAction::CopySelection) {
+        if (applied) {
+          {
+            std::lock_guard state_lock(state.mutex);
+            state.paste_buffer = copied_text;
+          }
+          const auto clipboard = write_windows_clipboard_text(copied_text);
+          status_override = "wmux: copied " + std::to_string(copied_text.size()) + " bytes";
+          if (!clipboard.ok) {
+            status_override += "; clipboard unavailable";
+          }
+        } else {
+          status_override = "wmux: no copy selection";
+        }
+      }
+    }
+    clamp_copy_mode_cursor(copy_mode, *frame, snapshots);
 
-    const auto replay = render_frame(*frame, snapshots, viewport_states, status_override);
+    const auto replay =
+        render_frame(*frame, snapshots, viewport_states, copy_mode, status_override);
 
     if (!write_all(pipe, replay)) {
       output_closed = true;
@@ -1235,7 +1654,7 @@ void run_attach_connection(
 
   {
     std::string error;
-    if (!replay_active_window(error, std::nullopt)) {
+    if (!replay_active_window(error, std::nullopt, std::nullopt)) {
       if (!error.empty()) {
         write_all(pipe, error);
       }
@@ -1292,7 +1711,7 @@ void run_attach_connection(
         }
 
         std::string error;
-        if (!replay_active_window(error, std::nullopt)) {
+        if (!replay_active_window(error, std::nullopt, std::nullopt)) {
           stop_requested = true;
           break;
         }
@@ -1321,7 +1740,7 @@ void run_attach_connection(
         end_reason = AttachEndReason::ProtocolError;
         break;
       }
-      if (!replay_active_window(error, std::nullopt)) {
+      if (!replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1338,7 +1757,7 @@ void run_attach_connection(
       current_columns.store(static_cast<short>(dimensions->first), std::memory_order_relaxed);
       current_rows.store(static_cast<short>(dimensions->second), std::memory_order_relaxed);
       std::string error;
-      if (!replay_active_window(error, std::nullopt)) {
+      if (!replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1369,7 +1788,7 @@ void run_attach_connection(
         continue;
       }
 
-      if (*changed && !replay_active_window(error, std::nullopt)) {
+      if (*changed && !replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1395,7 +1814,7 @@ void run_attach_connection(
           continue;
         }
 
-        if (!replay_active_window(error, scroll)) {
+        if (!replay_active_window(error, scroll, std::nullopt)) {
           end_reason = AttachEndReason::OutputClosed;
           break;
         }
@@ -1418,7 +1837,7 @@ void run_attach_connection(
         continue;
       }
 
-      if (*changed && !replay_active_window(error, std::nullopt)) {
+      if (*changed && !replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1433,7 +1852,27 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_active_window(error, *scroll)) {
+      if (!replay_active_window(error, *scroll, std::nullopt)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
+    if (frame.type == AttachFrameType::CopyMode) {
+      const auto action = parse_attach_copy_mode_payload(frame.payload);
+      if (!action) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      {
+        std::lock_guard stream_lock(stream_mutex);
+        status_override.clear();
+      }
+
+      std::string error;
+      if (!replay_active_window(error, std::nullopt, *action)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1447,7 +1886,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_active_window(error, std::nullopt)) {
+      if (!replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -1463,7 +1902,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_active_window(error, std::nullopt)) {
+      if (!replay_active_window(error, std::nullopt, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }

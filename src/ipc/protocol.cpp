@@ -414,6 +414,12 @@ std::string make_attach_scroll_frame(AttachScrollAction action) {
   return make_attach_frame(AttachFrameType::Scroll, payload);
 }
 
+std::string make_attach_copy_mode_frame(AttachCopyModeAction action) {
+  std::string payload;
+  payload.push_back(static_cast<char>(action));
+  return make_attach_frame(AttachFrameType::CopyMode, payload);
+}
+
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header) {
   if (header.size() != kAttachFrameHeaderSize || header[0] != 'W' || header[1] != 'M') {
     return std::nullopt;
@@ -447,6 +453,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       break;
     case static_cast<std::uint8_t>(AttachFrameType::Scroll):
       parsed.type = AttachFrameType::Scroll;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::CopyMode):
+      parsed.type = AttachFrameType::CopyMode;
       break;
     default:
       return std::nullopt;
@@ -547,6 +556,19 @@ std::optional<AttachScrollAction> parse_attach_scroll_payload(std::string_view p
   }
 
   return static_cast<AttachScrollAction>(action);
+}
+
+std::optional<AttachCopyModeAction> parse_attach_copy_mode_payload(std::string_view payload) {
+  if (payload.size() != 1) {
+    return std::nullopt;
+  }
+
+  const auto action = static_cast<unsigned char>(payload[0]);
+  if (action > static_cast<unsigned char>(AttachCopyModeAction::CopySelection)) {
+    return std::nullopt;
+  }
+
+  return static_cast<AttachCopyModeAction>(action);
 }
 
 }  // namespace wmux

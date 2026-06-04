@@ -7,9 +7,11 @@
 
 void run_ipc_protocol_tests();
 void run_command_mode_tests();
+void run_copy_selection_tests();
 void run_mouse_input_tests();
 void run_session_manager_tests();
 void run_terminal_grid_tests();
+void run_windows_clipboard_tests();
 
 namespace {
 
@@ -319,7 +321,9 @@ int main() {
   expects_unknown_command_error();
   run_ipc_protocol_tests();
   run_command_mode_tests();
+  run_copy_selection_tests();
   run_mouse_input_tests();
   run_session_manager_tests();
   run_terminal_grid_tests();
+  run_windows_clipboard_tests();
 }
