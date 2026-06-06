@@ -5,6 +5,7 @@
 #include "daemon_state.hpp"
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/logging.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -33,6 +34,8 @@ using namespace daemon_internal;
 #ifdef _WIN32
 
 int run_windows_daemon() {
+  initialize_logging(LogRole::Daemon);
+  log_event(LogLevel::Info, "daemon.server", "start");
   std::atomic_bool should_stop{false};
   DaemonState state;
   load_daemon_config(state);
@@ -40,13 +43,21 @@ int run_windows_daemon() {
   std::thread attach_listener{[&] { run_windows_attach_listener(state, should_stop); }};
 
   while (!should_stop.load()) {
+    reap_finished_attach_workers(state);
+
     HANDLE pipe = create_server_pipe(endpoint, 0);
     if (pipe == INVALID_HANDLE_VALUE) {
+      log_event(LogLevel::Error, "daemon.server", "command_pipe_create_failed");
       should_stop = true;
       wake_attach_listener();
       if (attach_listener.joinable()) {
         attach_listener.join();
       }
+      disconnect_all_attach_clients(state);
+      if (!wait_for_no_attach_clients(state, std::chrono::seconds{2})) {
+        log_event(LogLevel::Warn, "daemon.attach", "clients_drain_timeout");
+      }
+      join_all_attach_workers(state);
       return 1;
     }
 
@@ -55,8 +66,10 @@ int run_windows_daemon() {
       if (read_request(pipe, request)) {
         const auto parsed = parse_request_json(request);
         if (!parsed) {
+          log_event(LogLevel::Warn, "daemon.ipc", "malformed_request");
           write_all(pipe, make_response_json(false, "wmux: malformed daemon request\n"));
         } else {
+          log_event(LogLevel::Debug, "daemon.ipc", "request", {{"type", parsed->type}});
           write_all(pipe, handle_request(*parsed, should_stop, state));
         }
       }
@@ -65,6 +78,7 @@ int run_windows_daemon() {
     if (pipe != INVALID_HANDLE_VALUE) {
       close_pipe(pipe);
     }
+    reap_finished_attach_workers(state);
   }
 
   disconnect_all_attach_clients(state);
@@ -72,7 +86,12 @@ int run_windows_daemon() {
   if (attach_listener.joinable()) {
     attach_listener.join();
   }
-  wait_for_no_attach_clients(state, std::chrono::seconds{2});
+  if (!wait_for_no_attach_clients(state, std::chrono::seconds{2})) {
+    log_event(LogLevel::Warn, "daemon.attach", "clients_drain_timeout");
+  }
+  join_all_attach_workers(state);
+  log_event(LogLevel::Info, "daemon.server", "stop");
+  shutdown_logging();
   return 0;
 }
 
@@ -189,6 +208,8 @@ EndpointState endpoint_state(const std::string& endpoint) {
 }
 
 int run_posix_daemon() {
+  initialize_logging(LogRole::Daemon);
+  log_event(LogLevel::Info, "daemon.server", "start");
   Fd server{socket(AF_UNIX, SOCK_STREAM, 0)};
   if (!server) {
     return 10;
@@ -237,6 +258,9 @@ int run_posix_daemon() {
     std::string request;
     if (read_request(client.get(), request)) {
       const auto parsed = parse_request_json(request);
+      if (!parsed) {
+        log_event(LogLevel::Warn, "daemon.ipc", "malformed_request");
+      }
       const auto response = parsed ? handle_request(*parsed, should_stop, state)
                                    : make_response_json(false, "wmux: malformed daemon request\n");
       write_all(client.get(), response);
@@ -244,6 +268,8 @@ int run_posix_daemon() {
   }
 
   unlink(endpoint.c_str());
+  log_event(LogLevel::Info, "daemon.server", "stop");
+  shutdown_logging();
   return 0;
 }
 

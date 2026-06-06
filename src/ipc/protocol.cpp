@@ -193,6 +193,8 @@ std::string request_type_for_command(CommandKind kind) {
       return "ServerStatus";
     case CommandKind::ServerStop:
       return "ServerStop";
+    case CommandKind::ResetTerminal:
+      return {};
     case CommandKind::Daemon:
     case CommandKind::Help:
     case CommandKind::Version:

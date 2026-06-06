@@ -1,5 +1,7 @@
 #include "wmux/pty_process.hpp"
 
+#include "wmux/logging.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -215,6 +217,7 @@ struct PtyProcess::Impl {
   UniqueHandle job;
   UniqueHandle process;
   UniquePseudoConsole console;
+  std::uint32_t process_id{0};
 #endif
 
   mutable std::mutex output_mutex;
@@ -321,6 +324,11 @@ struct PtyProcess::Impl {
       append_output(std::string{buffer, buffer + bytes_read});
     }
 
+    log_event(
+        LogLevel::Info,
+        "pty",
+        "reader_exit",
+        {{"process_id", std::to_string(process_id)}});
     mark_reader_done();
   }
 
@@ -358,6 +366,13 @@ struct PtyProcess::Impl {
 
     const COORD size{columns, rows};
     if (!SUCCEEDED(ResizePseudoConsole(console.get(), size))) {
+      log_event(
+          LogLevel::Warn,
+          "pty",
+          "resize_failed",
+          {{"process_id", std::to_string(process_id)},
+           {"columns", std::to_string(columns)},
+           {"rows", std::to_string(rows)}});
       return false;
     }
 
@@ -365,6 +380,13 @@ struct PtyProcess::Impl {
       std::lock_guard output_lock(output_mutex);
       screen.resize(columns, rows);
     }
+    log_event(
+        LogLevel::Info,
+        "pty",
+        "resize",
+        {{"process_id", std::to_string(process_id)},
+         {"columns", std::to_string(columns)},
+         {"rows", std::to_string(rows)}});
     return true;
   }
 
@@ -374,7 +396,10 @@ struct PtyProcess::Impl {
       return;
     }
 
-    input_write.reset();
+    {
+      std::lock_guard write_lock(write_mutex);
+      input_write.reset();
+    }
     {
       std::lock_guard lock(console_mutex);
       console.reset();
@@ -388,6 +413,11 @@ struct PtyProcess::Impl {
     if (process.valid()) {
       const DWORD wait_result = WaitForSingleObject(process.get(), 500);
       if (wait_result == WAIT_TIMEOUT) {
+        log_event(
+            LogLevel::Warn,
+            "pty",
+            "terminate_process",
+            {{"process_id", std::to_string(process_id)}});
         TerminateProcess(process.get(), 0);
         WaitForSingleObject(process.get(), 1000);
       }
@@ -398,6 +428,14 @@ struct PtyProcess::Impl {
     }
 
     mark_reader_done();
+    input_read.reset();
+    output_read.reset();
+    process.reset();
+    log_event(
+        LogLevel::Info,
+        "pty",
+        "terminated",
+        {{"process_id", std::to_string(process_id)}});
   }
 #else
   bool write(std::string_view) {
@@ -552,11 +590,19 @@ PtyProcessResult PtyProcess::start(std::string_view command_line, short columns,
   impl->output_read = std::move(output_read);
   impl->job = std::move(job);
   impl->process = std::move(process);
+  impl->process_id = process_info.dwProcessId;
   impl->console = std::move(console);
   impl->screen.resize(columns, rows);
 
   auto pty = std::shared_ptr<PtyProcess>(new PtyProcess(std::move(impl)));
   pty->impl_->start_reader();
+  log_event(
+      LogLevel::Info,
+      "pty",
+      "spawn",
+      {{"process_id", std::to_string(process_info.dwProcessId)},
+       {"columns", std::to_string(columns)},
+       {"rows", std::to_string(rows)}});
   return {pty, {}};
 #else
   (void)command_line;
@@ -572,6 +618,14 @@ bool PtyProcess::write_input(std::string_view bytes) {
 
 bool PtyProcess::resize(short columns, short rows) {
   return impl_->resize(columns, rows);
+}
+
+std::uint32_t PtyProcess::process_id() const {
+#ifdef _WIN32
+  return impl_->process_id;
+#else
+  return 0;
+#endif
 }
 
 PtyOutputSnapshot PtyProcess::output_snapshot() const {

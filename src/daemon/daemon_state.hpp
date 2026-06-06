@@ -9,8 +9,10 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +45,7 @@ struct DaemonConfigState {
 struct DaemonState {
   std::mutex mutex;
   std::condition_variable attach_clients_changed;
+  std::condition_variable attach_workers_changed;
   SessionManager sessions;
   DaemonConfigState config;
   bool mouse_enabled{false};
@@ -68,14 +71,26 @@ struct DaemonState {
 #endif
   };
 
+  struct AttachWorkerRuntime {
+    ClientId client_id{0};
+    std::shared_ptr<std::atomic_bool> done;
+    std::thread thread;
+  };
+
   std::unordered_map<SessionId, SessionRuntime> runtimes;
   std::unordered_map<ClientId, AttachClientRuntime> attach_clients;
+  std::vector<AttachWorkerRuntime> attach_workers;
   ClientId next_client_id{1};
 };
 
 struct DaemonStats {
   std::size_t session_count{0};
   std::size_t attach_client_count{0};
+  std::size_t runtime_session_count{0};
+  std::size_t runtime_window_count{0};
+  std::size_t runtime_pane_count{0};
+  std::size_t live_shell_count{0};
+  std::size_t attach_worker_count{0};
   bool mouse_enabled{false};
   DaemonConfigState config;
 };

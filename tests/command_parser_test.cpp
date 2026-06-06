@@ -176,6 +176,13 @@ void expects_server_status_command() {
   assert(result.error.empty());
 }
 
+void expects_reset_terminal_command() {
+  const std::vector<std::string_view> args{"reset-terminal"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::ResetTerminal);
+  assert(result.error.empty());
+}
+
 void expects_server_stop_command() {
   const std::vector<std::string_view> args{"server", "stop"};
   const auto result = wmux::parse_command_line(args);
@@ -306,6 +313,7 @@ int main() {
   expects_set_mouse_on_command();
   expects_set_mouse_off_command();
   expects_server_status_command();
+  expects_reset_terminal_command();
   expects_server_stop_command();
   expects_forced_server_stop_command();
   expects_missing_session_name_error();

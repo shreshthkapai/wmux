@@ -5,6 +5,7 @@
 #include "wmux/commands.hpp"
 #include "wmux/copy_selection.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/logging.hpp"
 #include "wmux/paste_buffer.hpp"
 #include "wmux/pty_process.hpp"
 #include "wmux/windows_clipboard.hpp"
@@ -186,6 +187,16 @@ short attach_dimension(std::uint16_t value) {
   return static_cast<short>(value);
 }
 
+void run_attach_connection(
+    HANDLE pipe,
+    DaemonState& state,
+    ClientId client_id,
+    SessionId session_id,
+    std::string session_name,
+    short columns,
+    short rows,
+    DaemonAttachSettings settings);
+
 ClientId register_attach_client(
     DaemonState& state,
     SessionId session_id,
@@ -193,24 +204,137 @@ ClientId register_attach_client(
     HANDLE pipe) {
   std::lock_guard lock(state.mutex);
   const ClientId client_id = state.next_client_id++;
+  const auto registered_session_name = session_name;
   DaemonState::AttachClientRuntime client;
   client.session_id = session_id;
   client.session_name = std::move(session_name);
   client.pipe = pipe;
   state.attach_clients.emplace(client_id, std::move(client));
+  log_event(
+      LogLevel::Info,
+      "daemon.attach",
+      "register",
+      {{"client_id", std::to_string(client_id)},
+       {"session_id", std::to_string(session_id)},
+       {"session_name", registered_session_name}});
   return client_id;
+}
+
+std::string attach_end_reason_name(AttachEndReason reason) {
+  switch (reason) {
+    case AttachEndReason::Detached:
+      return "detached";
+    case AttachEndReason::ClientDisconnected:
+      return "client_disconnected";
+    case AttachEndReason::ShellClosed:
+      return "shell_closed";
+    case AttachEndReason::OutputClosed:
+      return "output_closed";
+    case AttachEndReason::ProtocolError:
+      return "protocol_error";
+  }
+
+  return "unknown";
 }
 
 void unregister_attach_client(
     DaemonState& state,
     ClientId client_id,
     AttachEndReason reason) {
-  (void)reason;
+  SessionId session_id{0};
+  std::string session_name;
   {
     std::lock_guard lock(state.mutex);
+    if (const auto client = state.attach_clients.find(client_id);
+        client != state.attach_clients.end()) {
+      session_id = client->second.session_id;
+      session_name = client->second.session_name;
+    }
     state.attach_clients.erase(client_id);
   }
+  log_event(
+      LogLevel::Info,
+      "daemon.attach",
+      "unregister",
+      {{"client_id", std::to_string(client_id)},
+       {"session_id", std::to_string(session_id)},
+       {"session_name", session_name},
+       {"reason", attach_end_reason_name(reason)}});
   state.attach_clients_changed.notify_all();
+}
+
+void start_attach_worker(
+    DaemonState& state,
+    HANDLE pipe,
+    ClientId client_id,
+    SessionId session_id,
+    std::string session_name,
+    short columns,
+    short rows,
+    DaemonAttachSettings settings) {
+  auto done = std::make_shared<std::atomic_bool>(false);
+  std::thread worker{[pipe,
+                      &state,
+                      client_id,
+                      session_id,
+                      session_name = std::move(session_name),
+                      columns,
+                      rows,
+                      settings,
+                      done] {
+    run_attach_connection(
+        pipe, state, client_id, session_id, session_name, columns, rows, settings);
+    done->store(true, std::memory_order_release);
+    state.attach_workers_changed.notify_all();
+  }};
+
+  {
+    std::lock_guard lock(state.mutex);
+    state.attach_workers.push_back(DaemonState::AttachWorkerRuntime{
+        client_id,
+        done,
+        std::move(worker)});
+  }
+
+  log_event(
+      LogLevel::Info,
+      "daemon.attach",
+      "worker_start",
+      {{"client_id", std::to_string(client_id)},
+       {"session_id", std::to_string(session_id)}});
+}
+
+void join_workers(
+    std::vector<std::pair<ClientId, std::thread>>& workers,
+    std::string_view event) {
+  for (auto& [client_id, worker] : workers) {
+    if (worker.joinable()) {
+      worker.join();
+      log_event(
+          LogLevel::Info,
+          "daemon.attach",
+          event,
+          {{"client_id", std::to_string(client_id)}});
+    }
+  }
+}
+
+std::vector<std::pair<ClientId, std::thread>> take_finished_attach_workers(
+    DaemonState& state) {
+  std::vector<std::pair<ClientId, std::thread>> workers;
+  std::lock_guard lock(state.mutex);
+
+  auto it = state.attach_workers.begin();
+  while (it != state.attach_workers.end()) {
+    if (it->done && it->done->load(std::memory_order_acquire)) {
+      workers.emplace_back(it->client_id, std::move(it->thread));
+      it = state.attach_workers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  return workers;
 }
 
 std::vector<HANDLE> attach_client_pipes_for_session(DaemonState& state, SessionId session_id) {
@@ -723,6 +847,14 @@ bool create_interactive_window_named(
 
     state.runtimes[result.session_id].windows[result.window_id].panes[result.pane_id].shell =
         std::move(shell_process);
+    log_event(
+        LogLevel::Info,
+        "daemon.window",
+        "interactive_create",
+        {{"session_id", std::to_string(result.session_id)},
+         {"window_id", std::to_string(result.window_id)},
+         {"pane_id", std::to_string(result.pane_id)},
+         {"window_name", std::string{name}}});
   }
 
   return true;
@@ -820,6 +952,14 @@ bool split_interactive_pane(
         .windows[result.window_id]
         .panes[result.pane_id]
         .shell = std::move(shell_process);
+    log_event(
+        LogLevel::Info,
+        "daemon.pane",
+        "interactive_split",
+        {{"session_id", std::to_string(result.session_id)},
+         {"window_id", std::to_string(result.window_id)},
+         {"pane_id", std::to_string(result.pane_id)},
+         {"direction", direction == SplitDirection::Horizontal ? "horizontal" : "vertical"}});
   }
 
   return true;
@@ -1022,6 +1162,13 @@ bool kill_interactive_pane(DaemonState& state, SessionId session_id, std::string
     removed_shell->terminate();
   }
 
+  log_event(
+      LogLevel::Info,
+      "daemon.pane",
+      "interactive_kill",
+      {{"session_id", std::to_string(result.session_id)},
+       {"window_id", std::to_string(result.window_id)},
+       {"pane_id", std::to_string(result.removed_pane_id)}});
   status = "wmux: killed pane " + std::to_string(result.removed_pane_id);
   return true;
 }
@@ -1059,6 +1206,13 @@ bool kill_interactive_window(DaemonState& state, SessionId session_id, std::stri
     }
   }
 
+  log_event(
+      LogLevel::Info,
+      "daemon.window",
+      "interactive_kill",
+      {{"session_id", std::to_string(result.session_id)},
+       {"window_id", std::to_string(result.removed_window_id)},
+       {"shells", std::to_string(removed_shells.size())}});
   status = "wmux: killed window " + std::to_string(result.removed_window_id);
   return true;
 }
@@ -1568,6 +1722,18 @@ void run_attach_connection(
     short columns,
     short rows,
     DaemonAttachSettings settings) {
+  log_event(
+      LogLevel::Info,
+      "daemon.attach",
+      "start",
+      {{"client_id", std::to_string(client_id)},
+       {"session_id", std::to_string(session_id)},
+       {"session_name", session_name},
+       {"columns", std::to_string(columns)},
+       {"rows", std::to_string(rows)},
+       {"mouse", settings.mouse_enabled ? "on" : "off"},
+       {"prefix", settings.prefix},
+       {"status", settings.status_bar_enabled ? "on" : "off"}});
   if (!write_all(pipe,
                  make_response_json(
                      true,
@@ -1614,8 +1780,20 @@ void run_attach_connection(
     for (const auto& pane : frame->panes) {
       const int width = std::max(1, body_width(pane.rect));
       const int height = std::max(1, body_height(pane.rect));
-      pane.shell->resize(static_cast<short>(std::min(width, 32767)),
-                         static_cast<short>(std::min(height, 32767)));
+      const auto pty_columns = static_cast<short>(std::min(width, 32767));
+      const auto pty_rows = static_cast<short>(std::min(height, 32767));
+      if (!pane.shell->resize(pty_columns, pty_rows)) {
+        log_event(
+            LogLevel::Warn,
+            "daemon.pane",
+            "resize_failed",
+            {{"session_id", std::to_string(session_id)},
+             {"window_id", std::to_string(frame->window_id)},
+             {"pane_id", std::to_string(pane.rect.pane_id)},
+             {"process_id", std::to_string(pane.shell->process_id())},
+             {"columns", std::to_string(pty_columns)},
+             {"rows", std::to_string(pty_rows)}});
+      }
       snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
     }
 
@@ -2108,6 +2286,31 @@ bool wait_for_no_attach_clients(DaemonState& state, std::chrono::milliseconds ti
       lock, timeout, [&] { return state.attach_clients.empty(); });
 }
 
+void reap_finished_attach_workers(DaemonState& state) {
+  auto workers = take_finished_attach_workers(state);
+  join_workers(workers, "worker_join");
+}
+
+void join_all_attach_workers(DaemonState& state) {
+  std::vector<std::pair<ClientId, std::thread>> workers;
+  {
+    std::unique_lock lock(state.mutex);
+    state.attach_workers_changed.wait(lock, [&] {
+      return std::ranges::all_of(state.attach_workers, [](const auto& worker) {
+        return worker.done && worker.done->load(std::memory_order_acquire);
+      });
+    });
+
+    workers.reserve(state.attach_workers.size());
+    for (auto& worker : state.attach_workers) {
+      workers.emplace_back(worker.client_id, std::move(worker.thread));
+    }
+    state.attach_workers.clear();
+  }
+
+  join_workers(workers, "worker_join_shutdown");
+}
+
 AttachDispatch dispatch_attach_connection(
     HANDLE pipe,
     const IpcRequest& request,
@@ -2128,18 +2331,15 @@ AttachDispatch dispatch_attach_connection(
   const auto settings = daemon_attach_settings(state);
   const ClientId client_id =
       register_attach_client(state, target->session_id, target->session_name, pipe);
-  std::thread{[pipe,
-               &state,
-               client_id,
-               session_id = target->session_id,
-               session_name = std::move(target->session_name),
-               columns,
-               rows,
-               settings] {
-    run_attach_connection(
-        pipe, state, client_id, session_id, session_name, columns, rows, settings);
-  }}
-      .detach();
+  start_attach_worker(
+      state,
+      pipe,
+      client_id,
+      target->session_id,
+      std::move(target->session_name),
+      columns,
+      rows,
+      settings);
   return AttachDispatch::HandedOff;
 }
 
@@ -2147,6 +2347,8 @@ void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_st
   const auto endpoint = widen(attach_endpoint_name());
 
   while (!should_stop.load()) {
+    reap_finished_attach_workers(state);
+
     HANDLE pipe = create_server_pipe(endpoint, 0);
     if (pipe == INVALID_HANDLE_VALUE) {
       return;
@@ -2185,6 +2387,8 @@ void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_st
       close_pipe(pipe);
     }
   }
+
+  reap_finished_attach_workers(state);
 }
 
 void wake_attach_listener() {

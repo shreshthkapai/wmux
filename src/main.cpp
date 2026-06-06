@@ -3,6 +3,8 @@
 #include "wmux/daemon.hpp"
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/logging.hpp"
+#include "wmux/terminal_control.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -13,8 +15,10 @@
 #include <vector>
 
 int main(int argc, char** argv) {
+  wmux::initialize_logging(wmux::LogRole::Client);
   spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
   spdlog::debug("wmux client starting");
+  wmux::log_event(wmux::LogLevel::Debug, "client", "start");
 
   std::vector<std::string_view> args;
   args.reserve(static_cast<std::size_t>(argc > 0 ? argc - 1 : 0));
@@ -27,6 +31,8 @@ int main(int argc, char** argv) {
 
   switch (command.kind) {
     case wmux::CommandKind::Daemon:
+      wmux::shutdown_logging();
+      wmux::initialize_logging(wmux::LogRole::Daemon);
       return wmux::run_daemon();
 
     case wmux::CommandKind::DefaultSession:
@@ -69,6 +75,9 @@ int main(int argc, char** argv) {
     case wmux::CommandKind::Version:
       std::cout << wmux::render_version();
       return 0;
+
+    case wmux::CommandKind::ResetTerminal:
+      return wmux::reset_terminal();
 
     case wmux::CommandKind::Unknown:
       std::cerr << "wmux: " << command.error << "\n\n";

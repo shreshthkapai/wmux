@@ -2,6 +2,7 @@
 
 #include "daemon_shell.hpp"
 #include "wmux/ipc_protocol.hpp"
+#include "wmux/logging.hpp"
 
 #include <chrono>
 #include <memory>
@@ -75,6 +76,14 @@ std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
       state.runtimes[result.id].windows[result.window_id].panes[result.pane_id].shell =
           std::move(shell_process);
     }
+    log_event(
+        LogLevel::Info,
+        "daemon.session",
+        "create",
+        {{"session_id", std::to_string(result.id)},
+         {"window_id", std::to_string(result.window_id)},
+         {"pane_id", std::to_string(result.pane_id)},
+         {"session_name", request.session_name}});
   }
 
   std::ostringstream out;
@@ -145,6 +154,13 @@ std::string handle_kill_session(const IpcRequest& request, DaemonState& state) {
       killed_shell->terminate();
     }
   }
+  log_event(
+      LogLevel::Info,
+      "daemon.session",
+      "kill",
+      {{"session_id", std::to_string(killed_session_id)},
+       {"session_name", request.session_name},
+       {"shells", std::to_string(killed_shells.size())}});
 
   std::ostringstream out;
   out << "wmux: killed session " << quoted(request.session_name) << "\n";
@@ -189,6 +205,14 @@ std::string handle_new_window(const IpcRequest& request, DaemonState& state) {
       state.runtimes[result.session_id].windows[result.window_id].panes[result.pane_id].shell =
           std::move(shell_process);
     }
+    log_event(
+        LogLevel::Info,
+        "daemon.window",
+        "create",
+        {{"session_id", std::to_string(result.session_id)},
+         {"window_id", std::to_string(result.window_id)},
+         {"pane_id", std::to_string(result.pane_id)},
+         {"window_name", request.window_name}});
   }
 
   std::ostringstream out;
@@ -296,6 +320,14 @@ std::string handle_split_window(const IpcRequest& request, DaemonState& state) {
           .panes[result.pane_id]
           .shell = std::move(shell_process);
     }
+    log_event(
+        LogLevel::Info,
+        "daemon.pane",
+        "split",
+        {{"session_id", std::to_string(result.session_id)},
+         {"window_id", std::to_string(result.window_id)},
+         {"pane_id", std::to_string(result.pane_id)},
+         {"direction", request.split_direction}});
   }
 
   std::ostringstream out;
@@ -385,7 +417,14 @@ std::string handle_request(
     out << "wmux: daemon is running\n";
     out << "sessions: " << stats.session_count << "\n";
     out << "attach clients: " << stats.attach_client_count << "\n";
+    out << "runtime sessions: " << stats.runtime_session_count << "\n";
+    out << "runtime windows: " << stats.runtime_window_count << "\n";
+    out << "runtime panes: " << stats.runtime_pane_count << "\n";
+    out << "live shells: " << stats.live_shell_count << "\n";
+    out << "attach workers: " << stats.attach_worker_count << "\n";
     out << "mouse: " << (stats.mouse_enabled ? "on" : "off") << "\n";
+    out << "daemon log: " << wmux::log_file_path(LogRole::Daemon).string() << "\n";
+    out << "client log: " << wmux::log_file_path(LogRole::Client).string() << "\n";
     out << "config: " << stats.config.path.string()
         << (stats.config.file_exists ? " (loaded)" : " (not found)") << "\n";
     out << "config prefix: " << stats.config.values.prefix << "\n";
@@ -411,6 +450,11 @@ std::string handle_request(
     }
 
     should_stop = true;
+    log_event(
+        LogLevel::Info,
+        "daemon.server",
+        "stop",
+        {{"force", request.force ? "true" : "false"}});
     if (request.force) {
       disconnect_all_attach_clients(state);
       auto shells = take_all_shells(state);

@@ -3,7 +3,9 @@
 #include "wmux/command_mode.hpp"
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/logging.hpp"
 #include "wmux/mouse_input.hpp"
+#include "wmux/terminal_control.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +31,16 @@ namespace {
 constexpr auto kAttachConnectAttempts = 40;
 constexpr auto kAttachConnectSleep = std::chrono::milliseconds{50};
 
+std::atomic<HANDLE> g_attach_stop_event{nullptr};
+std::atomic<HANDLE> g_attach_input_handle{nullptr};
+std::atomic<HANDLE> g_attach_output_handle{nullptr};
+std::atomic<DWORD> g_attach_original_input_mode{0};
+std::atomic<DWORD> g_attach_original_output_mode{0};
+std::atomic_bool g_attach_input_mode_active{false};
+std::atomic_bool g_attach_output_mode_active{false};
+
 bool write_all(HANDLE handle, std::string_view bytes);
+bool valid_handle(HANDLE handle);
 
 struct TerminalSize {
   std::uint16_t columns{0};
@@ -97,7 +108,11 @@ class ConsoleModeGuard {
   }
 
   bool set_mode(DWORD mode) const {
-    return active_ && SetConsoleMode(handle_, mode) != 0;
+    if (!active_ || SetConsoleMode(handle_, mode) == 0) {
+      return false;
+    }
+    current_mode_ = mode;
+    return true;
   }
 
   bool active() const {
@@ -108,10 +123,29 @@ class ConsoleModeGuard {
     return original_mode_;
   }
 
+  DWORD current_mode() const {
+    return current_mode_;
+  }
+
  private:
   HANDLE handle_{nullptr};
   DWORD original_mode_{0};
+  mutable DWORD current_mode_{0};
   bool active_{false};
+};
+
+class TerminalVisualGuard {
+ public:
+  explicit TerminalVisualGuard(HANDLE output) : output_(output) {}
+  TerminalVisualGuard(const TerminalVisualGuard&) = delete;
+  TerminalVisualGuard& operator=(const TerminalVisualGuard&) = delete;
+
+  ~TerminalVisualGuard() {
+    write_all(output_, terminal_reset_sequence());
+  }
+
+ private:
+  HANDLE output_{nullptr};
 };
 
 class MouseReportingGuard {
@@ -145,6 +179,71 @@ class MouseReportingGuard {
   HANDLE output_{nullptr};
   bool enabled_{false};
   bool active_{false};
+};
+
+void restore_attach_terminal_from_signal() {
+  const HANDLE output = g_attach_output_handle.load();
+  if (valid_handle(output)) {
+    write_all(output, terminal_reset_sequence());
+  }
+
+  const HANDLE input = g_attach_input_handle.load();
+  if (valid_handle(input) && g_attach_input_mode_active.load()) {
+    SetConsoleMode(input, g_attach_original_input_mode.load());
+  }
+
+  if (valid_handle(output) && g_attach_output_mode_active.load()) {
+    SetConsoleMode(output, g_attach_original_output_mode.load());
+  }
+}
+
+BOOL WINAPI attach_console_ctrl_handler(DWORD control_type) {
+  switch (control_type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      log_event(
+          LogLevel::Warn,
+          "client.attach",
+          "console_control",
+          {{"control_type", std::to_string(control_type)}});
+      restore_attach_terminal_from_signal();
+      if (const HANDLE stop_event = g_attach_stop_event.load(); valid_handle(stop_event)) {
+        SetEvent(stop_event);
+      }
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+class AttachConsoleCtrlGuard {
+ public:
+  AttachConsoleCtrlGuard(HANDLE input, HANDLE output, HANDLE stop_event) {
+    g_attach_input_handle.store(input);
+    g_attach_output_handle.store(output);
+    g_attach_stop_event.store(stop_event);
+    installed_ = SetConsoleCtrlHandler(attach_console_ctrl_handler, TRUE) != 0;
+  }
+
+  AttachConsoleCtrlGuard(const AttachConsoleCtrlGuard&) = delete;
+  AttachConsoleCtrlGuard& operator=(const AttachConsoleCtrlGuard&) = delete;
+
+  ~AttachConsoleCtrlGuard() {
+    if (installed_) {
+      SetConsoleCtrlHandler(attach_console_ctrl_handler, FALSE);
+    }
+    g_attach_stop_event.store(nullptr);
+    g_attach_input_handle.store(nullptr);
+    g_attach_output_handle.store(nullptr);
+    g_attach_input_mode_active.store(false);
+    g_attach_output_mode_active.store(false);
+  }
+
+ private:
+  bool installed_{false};
 };
 
 bool valid_handle(HANDLE handle) {
@@ -651,6 +750,12 @@ void stream_output(HANDLE pipe, HANDLE output, std::atomic_bool& stop_requested,
 
 int run_attach_client(const CommandLine& command) {
 #ifdef _WIN32
+  log_event(
+      LogLevel::Info,
+      "client.attach",
+      "start",
+      {{"session_name", command.session_name}});
+
   const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
   const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
   if (!valid_handle(input) || !valid_handle(output)) {
@@ -664,6 +769,9 @@ int run_attach_client(const CommandLine& command) {
     std::cerr << "wmux: attach requires an interactive Windows console\n";
     return 1;
   }
+
+  g_attach_original_input_mode.store(input_guard.original_mode());
+  g_attach_original_output_mode.store(output_guard.original_mode());
 
   const auto size = current_terminal_size(output);
 
@@ -695,6 +803,13 @@ int run_attach_client(const CommandLine& command) {
     return 1;
   }
 
+  UniqueHandle stop_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+  if (!stop_event.valid()) {
+    std::cerr << "wmux: failed to create attach stop event\n";
+    return 1;
+  }
+  AttachConsoleCtrlGuard console_ctrl_guard{input, output, stop_event.get()};
+
   {
     DWORD mode = input_guard.original_mode();
     mode &= ~ENABLE_ECHO_INPUT;
@@ -707,6 +822,7 @@ int run_attach_client(const CommandLine& command) {
       std::cerr << "wmux: failed to enter raw input mode\n";
       return 1;
     }
+    g_attach_input_mode_active.store(true);
   }
 
   {
@@ -716,17 +832,13 @@ int run_attach_client(const CommandLine& command) {
       std::cerr << "wmux: failed to enable virtual terminal output mode\n";
       return 1;
     }
+    g_attach_output_mode_active.store(true);
   }
 
+  TerminalVisualGuard terminal_visual_guard{output};
   MouseReportingGuard mouse_reporting{output, response->mouse_enabled};
   if (mouse_reporting.enabled() && !mouse_reporting.active()) {
     std::cerr << "wmux: failed to enable mouse reporting\n";
-    return 1;
-  }
-
-  UniqueHandle stop_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-  if (!stop_event.valid()) {
-    std::cerr << "wmux: failed to create attach stop event\n";
     return 1;
   }
 
@@ -798,6 +910,11 @@ int run_attach_client(const CommandLine& command) {
     output_thread.join();
   }
 
+  log_event(
+      LogLevel::Info,
+      "client.attach",
+      "stop",
+      {{"session_name", command.session_name}});
   return 0;
 #else
   const auto response = send_ipc_request(make_command_request_json(command));

@@ -36,6 +36,8 @@ AttachDispatch dispatch_attach_connection(
 void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_stop);
 void wake_attach_listener();
 bool wait_for_no_attach_clients(DaemonState& state, std::chrono::milliseconds timeout);
+void reap_finished_attach_workers(DaemonState& state);
+void join_all_attach_workers(DaemonState& state);
 
 }  // namespace wmux::daemon_internal
 #endif

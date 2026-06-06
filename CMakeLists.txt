@@ -57,9 +57,11 @@ set(WMUX_COMMON_SOURCES
   src/core/command_mode.cpp
   src/core/config.cpp
   src/core/copy_selection.cpp
+  src/core/logging.cpp
   src/core/mouse_input.cpp
   src/core/paste_buffer.cpp
   src/core/session_manager.cpp
+  src/core/terminal_control.cpp
   src/core/terminal_grid.cpp
   src/core/version.cpp
   src/ipc/protocol.cpp

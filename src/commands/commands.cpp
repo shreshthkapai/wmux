@@ -301,6 +301,10 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_server_command(args);
   }
 
+  if (args[0] == "reset-terminal") {
+    return parse_no_args_command(args, CommandKind::ResetTerminal, "reset-terminal");
+  }
+
   std::ostringstream message;
   message << "unknown command";
   if (!args.empty()) {
@@ -331,6 +335,7 @@ std::string render_help(std::string_view executable_name) {
   out << "  set -g mouse on|off           Enable or disable mouse mode\n";
   out << "  server status                  Show daemon status\n";
   out << "  server stop [--force]          Stop daemon\n";
+  out << "  reset-terminal                 Restore terminal cursor/mouse/display state\n";
   out << "  version                        Print wmux version information\n";
   out << "  help                           Print this help message\n\n";
   out << "Options:\n";
@@ -411,6 +416,9 @@ std::string render_placeholder_response(const CommandLine& command) {
         out << " (forced)";
       }
       out << "\n";
+      break;
+    case CommandKind::ResetTerminal:
+      out << "wmux: would reset terminal state\n";
       break;
     case CommandKind::Help:
     case CommandKind::Version:

@@ -109,9 +109,32 @@ void load_daemon_config(DaemonState& state) {
 
 DaemonStats daemon_stats(DaemonState& state) {
   std::lock_guard lock(state.mutex);
+  std::size_t runtime_window_count = 0;
+  std::size_t runtime_pane_count = 0;
+  std::size_t live_shell_count = 0;
+  for (const auto& [session_id, runtime] : state.runtimes) {
+    (void)session_id;
+    runtime_window_count += runtime.windows.size();
+    for (const auto& [window_id, window] : runtime.windows) {
+      (void)window_id;
+      runtime_pane_count += window.panes.size();
+      for (const auto& [pane_id, pane] : window.panes) {
+        (void)pane_id;
+        if (pane.shell) {
+          ++live_shell_count;
+        }
+      }
+    }
+  }
+
   return {
       state.sessions.session_count(),
       state.attach_clients.size(),
+      state.runtimes.size(),
+      runtime_window_count,
+      runtime_pane_count,
+      live_shell_count,
+      state.attach_workers.size(),
       state.mouse_enabled,
       state.config};
 }

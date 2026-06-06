@@ -1,6 +1,7 @@
 #include "daemon_shell.hpp"
 
 #include "daemon_state.hpp"
+#include "wmux/logging.hpp"
 
 #include <mutex>
 #include <string>
@@ -43,7 +44,17 @@ std::string configured_shell_command(DaemonState& state) {
 
 PtyProcessResult start_shell(std::string_view command_line, short columns, short rows) {
 #ifdef _WIN32
-  return PtyProcess::start(command_line, columns, rows);
+  auto result = PtyProcess::start(command_line, columns, rows);
+  if (!result.process) {
+    log_event(
+        LogLevel::Error,
+        "daemon.shell",
+        "spawn_failed",
+        {{"columns", std::to_string(columns)},
+         {"rows", std::to_string(rows)},
+         {"error", result.error}});
+  }
+  return result;
 #else
   (void)command_line;
   (void)columns;

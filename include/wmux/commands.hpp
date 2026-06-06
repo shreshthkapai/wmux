@@ -23,6 +23,7 @@ enum class CommandKind {
   SetOption,
   ServerStatus,
   ServerStop,
+  ResetTerminal,
   Unknown,
 };
 
