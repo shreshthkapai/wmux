@@ -35,6 +35,7 @@ using namespace daemon_internal;
 int run_windows_daemon() {
   std::atomic_bool should_stop{false};
   DaemonState state;
+  load_daemon_config(state);
   const auto endpoint = widen(command_endpoint_name());
   std::thread attach_listener{[&] { run_windows_attach_listener(state, should_stop); }};
 
@@ -223,6 +224,7 @@ int run_posix_daemon() {
 
   std::atomic_bool should_stop{false};
   DaemonState state;
+  load_daemon_config(state);
   while (!should_stop.load()) {
     Fd client{accept(server.get(), nullptr, nullptr)};
     if (!client) {

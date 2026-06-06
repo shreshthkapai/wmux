@@ -5,6 +5,7 @@
 #include "wmux/commands.hpp"
 #include "wmux/copy_selection.hpp"
 #include "wmux/ipc_transport.hpp"
+#include "wmux/paste_buffer.hpp"
 #include "wmux/pty_process.hpp"
 #include "wmux/windows_clipboard.hpp"
 
@@ -57,6 +58,7 @@ struct ActiveWindowFrame {
   std::string window_name;
   int columns{120};
   int rows{30};
+  bool status_bar_enabled{true};
   std::vector<RenderPane> panes;
 };
 
@@ -122,10 +124,12 @@ std::optional<ActiveWindowFrame> active_window_frame(
     std::string_view session_name,
     short columns,
     short rows,
+    bool status_bar_enabled,
     std::string& error) {
   ActiveWindowFrame frame;
   frame.columns = columns > 0 ? columns : 120;
   frame.rows = rows > 0 ? rows : 30;
+  frame.status_bar_enabled = status_bar_enabled;
 
   std::lock_guard lock(state.mutex);
   const auto window = state.sessions.active_window_summary(session_id);
@@ -146,7 +150,8 @@ std::optional<ActiveWindowFrame> active_window_frame(
     return {};
   }
 
-  const int pane_rows = std::max(1, frame.rows - 1);
+  const int pane_rows =
+      std::max(1, frame.rows - (frame.status_bar_enabled && frame.rows > 1 ? 1 : 0));
   const auto rects = compute_pane_layout_rects(window->pane_tree, frame.columns, pane_rows);
 
   frame.window_id = window->id;
@@ -630,7 +635,10 @@ std::string render_frame(
     }
   }
 
-  if (frame.rows > 1) {
+  const bool show_status = frame.rows > 1 &&
+                           (frame.status_bar_enabled || !status_override.empty() ||
+                            copy_mode.active);
+  if (show_status) {
     std::ostringstream status;
     if (status_override.empty()) {
       if (copy_mode.active) {
@@ -697,7 +705,7 @@ bool create_interactive_window_named(
     SessionId session_id,
     std::string_view name,
     std::string& error) {
-  auto shell = start_default_shell();
+  auto shell = start_configured_shell(state);
   if (!shell.process) {
     error = shell.error;
     return false;
@@ -792,7 +800,7 @@ bool split_interactive_pane(
     SessionId session_id,
     SplitDirection direction,
     std::string& error) {
-  auto shell = start_default_shell();
+  auto shell = start_configured_shell(state);
   if (!shell.process) {
     error = shell.error;
     return false;
@@ -1559,8 +1567,14 @@ void run_attach_connection(
     std::string session_name,
     short columns,
     short rows,
-    bool mouse_enabled) {
-  if (!write_all(pipe, make_response_json(true, "", mouse_enabled))) {
+    DaemonAttachSettings settings) {
+  if (!write_all(pipe,
+                 make_response_json(
+                     true,
+                     "",
+                     settings.mouse_enabled,
+                     settings.prefix,
+                     settings.status_bar_enabled))) {
     close_attach_pipe(pipe);
     unregister_attach_client(state, client_id, AttachEndReason::OutputClosed);
     return;
@@ -1589,6 +1603,7 @@ void run_attach_connection(
         session_name,
         current_columns.load(std::memory_order_relaxed),
         current_rows.load(std::memory_order_relaxed),
+        settings.status_bar_enabled,
         error);
     if (!frame) {
       return false;
@@ -1909,6 +1924,57 @@ void run_attach_connection(
       continue;
     }
 
+    if (frame.type == AttachFrameType::Paste) {
+      if (!frame.payload.empty()) {
+        end_reason = AttachEndReason::ProtocolError;
+        break;
+      }
+
+      std::string paste_buffer;
+      {
+        std::lock_guard state_lock(state.mutex);
+        paste_buffer = state.paste_buffer;
+      }
+
+      if (paste_buffer.empty()) {
+        {
+          std::lock_guard stream_lock(stream_mutex);
+          status_override = "wmux: paste buffer empty";
+        }
+        std::string error;
+        if (!replay_active_window(error, std::nullopt, std::nullopt)) {
+          end_reason = AttachEndReason::OutputClosed;
+          break;
+        }
+        continue;
+      }
+
+      std::string error;
+      auto shell = active_shell_for_session(state, session_id, error);
+      if (!shell) {
+        end_reason = AttachEndReason::ShellClosed;
+        break;
+      }
+
+      const auto normalized = normalize_paste_text_for_terminal(paste_buffer);
+      {
+        std::lock_guard stream_lock(stream_mutex);
+        viewport_states[shell->pane_id].offset = 0;
+        status_override = "wmux: pasted " + std::to_string(paste_buffer.size()) + " bytes";
+      }
+
+      if (!normalized.empty() && !shell->shell->write_input(normalized)) {
+        end_reason = AttachEndReason::ShellClosed;
+        break;
+      }
+
+      if (!replay_active_window(error, std::nullopt, std::nullopt)) {
+        end_reason = AttachEndReason::OutputClosed;
+        break;
+      }
+      continue;
+    }
+
     std::string error;
     auto shell = active_shell_for_session(state, session_id, error);
     if (!shell) {
@@ -2059,7 +2125,7 @@ AttachDispatch dispatch_attach_connection(
 
   const short columns = attach_dimension(request.terminal_columns);
   const short rows = attach_dimension(request.terminal_rows);
-  const bool mouse_enabled = daemon_mouse_enabled(state);
+  const auto settings = daemon_attach_settings(state);
   const ClientId client_id =
       register_attach_client(state, target->session_id, target->session_name, pipe);
   std::thread{[pipe,
@@ -2069,9 +2135,9 @@ AttachDispatch dispatch_attach_connection(
                session_name = std::move(target->session_name),
                columns,
                rows,
-               mouse_enabled] {
+               settings] {
     run_attach_connection(
-        pipe, state, client_id, session_id, session_name, columns, rows, mouse_enabled);
+        pipe, state, client_id, session_id, session_name, columns, rows, settings);
   }}
       .detach();
   return AttachDispatch::HandedOff;

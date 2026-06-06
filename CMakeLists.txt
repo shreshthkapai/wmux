@@ -55,8 +55,10 @@ endif()
 set(WMUX_COMMON_SOURCES
   src/commands/commands.cpp
   src/core/command_mode.cpp
+  src/core/config.cpp
   src/core/copy_selection.cpp
   src/core/mouse_input.cpp
+  src/core/paste_buffer.cpp
   src/core/session_manager.cpp
   src/core/terminal_grid.cpp
   src/core/version.cpp
@@ -104,9 +106,11 @@ if(WMUX_BUILD_TESTS)
   add_executable(wmux_tests
     tests/command_mode_test.cpp
     tests/command_parser_test.cpp
+    tests/config_test.cpp
     tests/copy_selection_test.cpp
     tests/ipc_protocol_test.cpp
     tests/mouse_input_test.cpp
+    tests/paste_buffer_test.cpp
     tests/session_manager_test.cpp
     tests/terminal_grid_test.cpp
     tests/windows_clipboard_test.cpp

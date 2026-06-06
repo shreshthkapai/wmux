@@ -338,6 +338,22 @@ std::string make_response_json(bool ok, std::string_view message, bool mouse_ena
   return out.str();
 }
 
+std::string make_response_json(
+    bool ok,
+    std::string_view message,
+    bool mouse_enabled,
+    std::string_view prefix,
+    bool status_bar_enabled) {
+  std::ostringstream out;
+  out << "{\"ok\":" << (ok ? "true" : "false");
+  append_json_field(out, "message", message);
+  append_json_bool(out, "mouse_enabled", mouse_enabled);
+  append_json_field(out, "prefix", prefix);
+  append_json_bool(out, "status_bar_enabled", status_bar_enabled);
+  out << "}\n";
+  return out.str();
+}
+
 std::optional<IpcResponse> parse_response_json(std::string_view json) {
   const auto ok = find_json_bool(json, "ok");
   const auto message = find_json_string(json, "message");
@@ -350,6 +366,12 @@ std::optional<IpcResponse> parse_response_json(std::string_view json) {
   response.message = *message;
   if (const auto mouse_enabled = find_json_bool(json, "mouse_enabled")) {
     response.mouse_enabled = *mouse_enabled;
+  }
+  if (const auto prefix = find_json_string(json, "prefix")) {
+    response.prefix = *prefix;
+  }
+  if (const auto status_bar_enabled = find_json_bool(json, "status_bar_enabled")) {
+    response.status_bar_enabled = *status_bar_enabled;
   }
   return response;
 }
@@ -456,6 +478,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       break;
     case static_cast<std::uint8_t>(AttachFrameType::CopyMode):
       parsed.type = AttachFrameType::CopyMode;
+      break;
+    case static_cast<std::uint8_t>(AttachFrameType::Paste):
+      parsed.type = AttachFrameType::Paste;
       break;
     default:
       return std::nullopt;
@@ -569,6 +594,10 @@ std::optional<AttachCopyModeAction> parse_attach_copy_mode_payload(std::string_v
   }
 
   return static_cast<AttachCopyModeAction>(action);
+}
+
+std::string make_attach_paste_frame() {
+  return make_attach_frame(AttachFrameType::Paste, {});
 }
 
 }  // namespace wmux

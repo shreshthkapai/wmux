@@ -28,6 +28,8 @@ struct IpcResponse {
   bool ok{false};
   std::string message;
   bool mouse_enabled{false};
+  std::string prefix{"C-b"};
+  bool status_bar_enabled{true};
 };
 
 enum class AttachFrameType : std::uint8_t {
@@ -41,6 +43,7 @@ enum class AttachFrameType : std::uint8_t {
   MouseEvent = 8,
   Scroll = 9,
   CopyMode = 10,
+  Paste = 11,
 };
 
 struct AttachFrameHeader {
@@ -111,6 +114,12 @@ std::string make_attach_request_json(
 std::optional<IpcRequest> parse_request_json(std::string_view json);
 std::string make_response_json(bool ok, std::string_view message);
 std::string make_response_json(bool ok, std::string_view message, bool mouse_enabled);
+std::string make_response_json(
+    bool ok,
+    std::string_view message,
+    bool mouse_enabled,
+    std::string_view prefix,
+    bool status_bar_enabled);
 std::optional<IpcResponse> parse_response_json(std::string_view json);
 std::string make_attach_input_frame(std::string_view bytes);
 std::string make_attach_detach_frame();
@@ -122,6 +131,7 @@ std::string make_attach_mouse_focus_frame(std::uint16_t column, std::uint16_t ro
 std::string make_attach_mouse_event_frame(const AttachMouseEventPayload& event);
 std::string make_attach_scroll_frame(AttachScrollAction action);
 std::string make_attach_copy_mode_frame(AttachCopyModeAction action);
+std::string make_attach_paste_frame();
 std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view header);
 std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_payload(
     std::string_view payload);

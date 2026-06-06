@@ -1,5 +1,8 @@
 #include "daemon_shell.hpp"
 
+#include "daemon_state.hpp"
+
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -31,14 +34,30 @@ std::string default_shell_command() {
 #endif
 }
 
-PtyProcessResult start_default_shell(short columns, short rows) {
+std::string configured_shell_command(DaemonState& state) {
+  std::lock_guard lock(state.mutex);
+  return state.config.values.default_shell.empty()
+             ? default_shell_command()
+             : state.config.values.default_shell;
+}
+
+PtyProcessResult start_shell(std::string_view command_line, short columns, short rows) {
 #ifdef _WIN32
-  return PtyProcess::start(default_shell_command(), columns, rows);
+  return PtyProcess::start(command_line, columns, rows);
 #else
+  (void)command_line;
   (void)columns;
   (void)rows;
   return {nullptr, "wmux: shell processes require Windows ConPTY\n"};
 #endif
+}
+
+PtyProcessResult start_default_shell(short columns, short rows) {
+  return start_shell(default_shell_command(), columns, rows);
+}
+
+PtyProcessResult start_configured_shell(DaemonState& state, short columns, short rows) {
+  return start_shell(configured_shell_command(state), columns, rows);
 }
 
 }  // namespace wmux::daemon_internal

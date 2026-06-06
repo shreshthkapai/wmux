@@ -90,20 +90,32 @@ void expects_response_json() {
   assert(response->ok);
   assert(response->message == "wmux: ok\n");
   assert(!response->mouse_enabled);
+  assert(response->prefix == "C-b");
+  assert(response->status_bar_enabled);
 }
 
-void expects_attach_response_json_with_mouse_setting() {
+void expects_attach_response_json_with_settings() {
   const auto enabled = wmux::parse_response_json(wmux::make_response_json(true, "", true));
   assert(enabled);
   assert(enabled->ok);
   assert(enabled->message.empty());
   assert(enabled->mouse_enabled);
+  assert(enabled->prefix == "C-b");
+  assert(enabled->status_bar_enabled);
 
   const auto disabled = wmux::parse_response_json(wmux::make_response_json(true, "", false));
   assert(disabled);
   assert(disabled->ok);
   assert(disabled->message.empty());
   assert(!disabled->mouse_enabled);
+
+  const auto configured =
+      wmux::parse_response_json(wmux::make_response_json(true, "", true, "C-a", false));
+  assert(configured);
+  assert(configured->ok);
+  assert(configured->mouse_enabled);
+  assert(configured->prefix == "C-a");
+  assert(!configured->status_bar_enabled);
 }
 
 void expects_attach_input_frame() {
@@ -257,6 +269,16 @@ void expects_attach_copy_mode_frame() {
   assert(*action == wmux::AttachCopyModeAction::CopySelection);
 }
 
+void expects_attach_paste_frame() {
+  const auto frame = wmux::make_attach_paste_frame();
+  assert(frame.size() == wmux::kAttachFrameHeaderSize);
+
+  const auto header = wmux::parse_attach_frame_header(frame);
+  assert(header);
+  assert(header->type == wmux::AttachFrameType::Paste);
+  assert(header->payload_size == 0);
+}
+
 void rejects_bad_attach_resize_payload() {
   assert(!wmux::parse_attach_resize_payload(""));
   assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
@@ -301,7 +323,7 @@ void run_ipc_protocol_tests() {
   expects_attach_request_json_with_terminal_size();
   expects_json_escaping();
   expects_response_json();
-  expects_attach_response_json_with_mouse_setting();
+  expects_attach_response_json_with_settings();
   expects_attach_input_frame();
   expects_attach_detach_frame();
   expects_attach_command_frame();
@@ -312,6 +334,7 @@ void run_ipc_protocol_tests() {
   expects_attach_mouse_event_frame();
   expects_attach_scroll_frame();
   expects_attach_copy_mode_frame();
+  expects_attach_paste_frame();
   rejects_bad_attach_resize_payload();
   rejects_bad_attach_mouse_focus_payload();
   rejects_bad_attach_mouse_event_payload();

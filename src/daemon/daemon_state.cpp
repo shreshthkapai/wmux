@@ -1,6 +1,9 @@
 #include "daemon_state.hpp"
 
+#include <filesystem>
 #include <sstream>
+#include <system_error>
+#include <utility>
 
 namespace wmux::daemon_internal {
 
@@ -82,14 +85,43 @@ std::string pane_error_message(PaneError error) {
   return out.str();
 }
 
-DaemonStats daemon_stats(DaemonState& state) {
+void apply_daemon_config(
+    DaemonState& state,
+    std::filesystem::path path,
+    ConfigParseResult result,
+    bool file_exists) {
   std::lock_guard lock(state.mutex);
-  return {state.sessions.session_count(), state.attach_clients.size(), state.mouse_enabled};
+  state.config.path = std::move(path);
+  state.config.file_exists = file_exists;
+  state.config.values = std::move(result.config);
+  state.config.errors = std::move(result.errors);
+  state.mouse_enabled = state.config.values.mouse_enabled;
 }
 
-bool daemon_mouse_enabled(DaemonState& state) {
+void load_daemon_config(DaemonState& state) {
+  const auto path = default_config_path();
+
+  std::error_code exists_error;
+  const bool file_exists = std::filesystem::exists(path, exists_error);
+  auto result = load_config_file(path);
+  apply_daemon_config(state, path, std::move(result), file_exists && !exists_error);
+}
+
+DaemonStats daemon_stats(DaemonState& state) {
   std::lock_guard lock(state.mutex);
-  return state.mouse_enabled;
+  return {
+      state.sessions.session_count(),
+      state.attach_clients.size(),
+      state.mouse_enabled,
+      state.config};
+}
+
+DaemonAttachSettings daemon_attach_settings(DaemonState& state) {
+  std::lock_guard lock(state.mutex);
+  return {
+      state.mouse_enabled,
+      state.config.values.prefix,
+      state.config.values.status_bar_enabled};
 }
 
 void set_daemon_mouse_enabled(DaemonState& state, bool enabled) {

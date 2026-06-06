@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <iostream>
 #include <optional>
@@ -320,6 +321,10 @@ bool send_attach_copy_mode(HANDLE pipe, AttachCopyModeAction action) {
   return write_attach_frame(pipe, make_attach_copy_mode_frame(action));
 }
 
+bool send_attach_paste(HANDLE pipe) {
+  return write_attach_frame(pipe, make_attach_paste_frame());
+}
+
 bool same_terminal_size(TerminalSize lhs, TerminalSize rhs) {
   return lhs.columns == rhs.columns && lhs.rows == rhs.rows;
 }
@@ -433,12 +438,26 @@ bool read_response_line(HANDLE pipe, std::string& response) {
   return !response.empty();
 }
 
+char control_prefix_byte(std::string_view prefix) {
+  if (prefix.size() != 3 || (prefix[0] != 'C' && prefix[0] != 'c') || prefix[1] != '-') {
+    return '\x02';
+  }
+
+  const auto key = static_cast<unsigned char>(prefix[2]);
+  if (key == '?') {
+    return '\x7f';
+  }
+
+  return static_cast<char>(std::toupper(key) & 0x1F);
+}
+
 bool send_processed_input(
     HANDLE pipe,
     std::string_view bytes,
     CommandPromptState& command_prompt,
     std::string& pending_mouse_sequence,
     bool mouse_enabled,
+    char prefix_byte,
     bool& prefix_pending,
     bool& copy_mode_active,
     std::atomic_bool& stop_requested,
@@ -574,6 +593,9 @@ bool send_processed_input(
         copy_mode_active = true;
         return send_attach_copy_mode(pipe, AttachCopyModeAction::Enter);
       }
+      if (byte == ']') {
+        return send_attach_paste(pipe);
+      }
       if (byte == '\x1b') {
         const auto scroll = prefixed_scroll_sequence(bytes.substr(index));
         if (scroll) {
@@ -588,12 +610,12 @@ bool send_processed_input(
         }
       }
 
-      to_send.push_back('\x02');
+      to_send.push_back(prefix_byte);
       to_send.push_back(byte);
       continue;
     }
 
-    if (byte == '\x02') {
+    if (byte == prefix_byte) {
       prefix_pending = true;
       continue;
     }
@@ -715,6 +737,7 @@ int run_attach_client(const CommandLine& command) {
   TerminalSize last_size = size;
   CommandPromptState command_prompt;
   std::string pending_mouse_sequence;
+  const char prefix_byte = control_prefix_byte(response->prefix);
   bool prefix_pending = false;
   bool copy_mode_active = false;
   char buffer[512];
@@ -755,6 +778,7 @@ int run_attach_client(const CommandLine& command) {
             command_prompt,
             pending_mouse_sequence,
             response->mouse_enabled,
+            prefix_byte,
             prefix_pending,
             copy_mode_active,
             stop_requested,

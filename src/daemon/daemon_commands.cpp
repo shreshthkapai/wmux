@@ -55,7 +55,7 @@ std::string handle_new_session(const IpcRequest& request, DaemonState& state) {
   }
 
   std::shared_ptr<PtyProcess> shell_process;
-  auto shell = start_default_shell();
+  auto shell = start_configured_shell(state);
   if (!shell.process) {
     return make_response_json(false, shell.error);
   }
@@ -168,7 +168,7 @@ std::string handle_new_window(const IpcRequest& request, DaemonState& state) {
   }
 
   std::shared_ptr<PtyProcess> shell_process;
-  auto shell = start_default_shell();
+  auto shell = start_configured_shell(state);
   if (!shell.process) {
     return make_response_json(false, shell.error);
   }
@@ -273,7 +273,7 @@ std::string handle_split_window(const IpcRequest& request, DaemonState& state) {
   }
 
   std::shared_ptr<PtyProcess> shell_process;
-  auto shell = start_default_shell();
+  auto shell = start_configured_shell(state);
   if (!shell.process) {
     return make_response_json(false, shell.error);
   }
@@ -386,6 +386,17 @@ std::string handle_request(
     out << "sessions: " << stats.session_count << "\n";
     out << "attach clients: " << stats.attach_client_count << "\n";
     out << "mouse: " << (stats.mouse_enabled ? "on" : "off") << "\n";
+    out << "config: " << stats.config.path.string()
+        << (stats.config.file_exists ? " (loaded)" : " (not found)") << "\n";
+    out << "config prefix: " << stats.config.values.prefix << "\n";
+    out << "config default shell: " << stats.config.values.default_shell << "\n";
+    out << "config status: " << (stats.config.values.status_bar_enabled ? "on" : "off") << "\n";
+    if (!stats.config.errors.empty()) {
+      out << "config errors: " << stats.config.errors.size() << "\n";
+      for (const auto& error : stats.config.errors) {
+        out << "  line " << error.line << ": " << error.message << "\n";
+      }
+    }
     return make_response_json(true, out.str());
   }
 

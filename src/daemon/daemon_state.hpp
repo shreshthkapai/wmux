@@ -1,10 +1,12 @@
 #pragma once
 
+#include "wmux/config.hpp"
 #include "wmux/pty_process.hpp"
 #include "wmux/session_manager.hpp"
 
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,10 +33,18 @@ enum class AttachEndReason {
   ProtocolError,
 };
 
+struct DaemonConfigState {
+  Config values;
+  std::filesystem::path path;
+  bool file_exists{false};
+  std::vector<ConfigParseError> errors;
+};
+
 struct DaemonState {
   std::mutex mutex;
   std::condition_variable attach_clients_changed;
   SessionManager sessions;
+  DaemonConfigState config;
   bool mouse_enabled{false};
   std::string paste_buffer;
 
@@ -67,14 +77,27 @@ struct DaemonStats {
   std::size_t session_count{0};
   std::size_t attach_client_count{0};
   bool mouse_enabled{false};
+  DaemonConfigState config;
+};
+
+struct DaemonAttachSettings {
+  bool mouse_enabled{false};
+  std::string prefix{"C-b"};
+  bool status_bar_enabled{true};
 };
 
 std::string quoted(std::string_view value);
 std::string session_error_message(SessionError error, std::string_view name);
 std::string window_error_message(WindowError error, std::string_view name);
 std::string pane_error_message(PaneError error);
+void apply_daemon_config(
+    DaemonState& state,
+    std::filesystem::path path,
+    ConfigParseResult result,
+    bool file_exists);
+void load_daemon_config(DaemonState& state);
 DaemonStats daemon_stats(DaemonState& state);
-bool daemon_mouse_enabled(DaemonState& state);
+DaemonAttachSettings daemon_attach_settings(DaemonState& state);
 void set_daemon_mouse_enabled(DaemonState& state, bool enabled);
 std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state);
 
