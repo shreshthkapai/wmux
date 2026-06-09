@@ -320,7 +320,7 @@ std::string render_help(std::string_view executable_name) {
   out << "Usage:\n";
   out << "  " << executable_name << " [command]\n\n";
   out << "Commands:\n";
-  out << "  new -s <name>                  Create a session\n";
+  out << "  new -s <name>                  Create and attach to a session\n";
   out << "  ls                             List sessions\n";
   out << "  attach -t <name>               Attach to a session\n";
   out << "  rename-session -t <old> <new>  Rename a session\n";

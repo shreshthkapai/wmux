@@ -12,6 +12,13 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 bool recoverable_ipc_failure(std::string_view message) {
@@ -19,6 +26,22 @@ bool recoverable_ipc_failure(std::string_view message) {
          message.find("wmux: failed to write daemon request") != std::string_view::npos ||
          message.find("wmux: daemon returned an invalid response") != std::string_view::npos ||
          message.find("wmux: daemon did not become ready") != std::string_view::npos;
+}
+
+bool running_in_interactive_console() {
+#ifdef _WIN32
+  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (input == nullptr || input == INVALID_HANDLE_VALUE || output == nullptr ||
+      output == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  DWORD mode = 0;
+  return GetConsoleMode(input, &mode) != 0 && GetConsoleMode(output, &mode) != 0;
+#else
+  return false;
+#endif
 }
 
 }  // namespace
@@ -79,6 +102,9 @@ int main(int argc, char** argv) {
         }
       }
       if (response.ok) {
+        if (command.kind == wmux::CommandKind::NewSession && running_in_interactive_console()) {
+          return wmux::run_attach_client(command);
+        }
         std::cout << response.message;
         return 0;
       }

@@ -141,11 +141,11 @@ cmake --build build-vs --config Debug
 
 ### First Run
 
-Start a session and attach to it:
+Start a session. In an interactive PowerShell window this creates the session
+and immediately attaches to it:
 
 ```powershell
 .\build-vs\Debug\wmux.exe new -s main
-.\build-vs\Debug\wmux.exe attach -t main
 ```
 
 Detach from the session with:

@@ -17,6 +17,10 @@ std::string_view terminal_reset_sequence() {
   return "\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[0m";
 }
 
+std::string_view terminal_attach_enter_sequence() {
+  return "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
+}
+
 int reset_terminal() {
 #ifdef _WIN32
   const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);

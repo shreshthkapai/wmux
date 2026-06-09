@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -137,7 +138,9 @@ class ConsoleModeGuard {
 
 class TerminalVisualGuard {
  public:
-  explicit TerminalVisualGuard(HANDLE output) : output_(output) {}
+  explicit TerminalVisualGuard(HANDLE output) : output_(output) {
+    (void)write_all(output_, terminal_attach_enter_sequence());
+  }
   TerminalVisualGuard(const TerminalVisualGuard&) = delete;
   TerminalVisualGuard& operator=(const TerminalVisualGuard&) = delete;
 
@@ -495,6 +498,108 @@ struct CopyModeKeyAction {
   AttachCopyModeAction action{AttachCopyModeAction::Exit};
   std::size_t bytes_consumed{1};
 };
+
+std::string utf8_from_wide_char(wchar_t ch) {
+  if (ch == L'\0') {
+    return {};
+  }
+
+  char buffer[8]{};
+  const int bytes = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, buffer, sizeof(buffer), nullptr, nullptr);
+  if (bytes <= 0) {
+    return {};
+  }
+
+  return std::string{buffer, static_cast<std::size_t>(bytes)};
+}
+
+std::string key_event_bytes(const KEY_EVENT_RECORD& key) {
+  if (!key.bKeyDown) {
+    return {};
+  }
+
+  std::string bytes;
+  const auto repeat_count = std::max<WORD>(1, key.wRepeatCount);
+  const auto append_repeated = [&](std::string_view value) {
+    for (WORD repeat = 0; repeat < repeat_count; ++repeat) {
+      bytes.append(value);
+    }
+  };
+
+  if (key.uChar.UnicodeChar != L'\0') {
+    append_repeated(utf8_from_wide_char(key.uChar.UnicodeChar));
+    return bytes;
+  }
+
+  const bool control_down =
+      (key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+  if (control_down && key.wVirtualKeyCode >= 'A' && key.wVirtualKeyCode <= 'Z') {
+    const char control = static_cast<char>(key.wVirtualKeyCode - 'A' + 1);
+    append_repeated(std::string_view{&control, 1});
+    return bytes;
+  }
+
+  switch (key.wVirtualKeyCode) {
+    case VK_UP:
+      append_repeated("\x1b[A");
+      break;
+    case VK_DOWN:
+      append_repeated("\x1b[B");
+      break;
+    case VK_RIGHT:
+      append_repeated("\x1b[C");
+      break;
+    case VK_LEFT:
+      append_repeated("\x1b[D");
+      break;
+    case VK_PRIOR:
+      append_repeated("\x1b[5~");
+      break;
+    case VK_NEXT:
+      append_repeated("\x1b[6~");
+      break;
+    case VK_HOME:
+      append_repeated("\x1b[H");
+      break;
+    case VK_END:
+      append_repeated("\x1b[F");
+      break;
+    case VK_DELETE:
+      append_repeated("\x1b[3~");
+      break;
+    default:
+      break;
+  }
+
+  return bytes;
+}
+
+bool read_console_input_bytes(HANDLE input, std::string& bytes) {
+  bytes.clear();
+
+  DWORD pending_records = 0;
+  if (!GetNumberOfConsoleInputEvents(input, &pending_records) || pending_records == 0) {
+    return true;
+  }
+
+  const DWORD records_to_read = std::min<DWORD>(pending_records, 64);
+  std::vector<INPUT_RECORD> records(records_to_read);
+  DWORD records_read = 0;
+  if (!ReadConsoleInputW(input, records.data(), records_to_read, &records_read)) {
+    return false;
+  }
+
+  for (DWORD index = 0; index < records_read; ++index) {
+    const auto& record = records[static_cast<std::size_t>(index)];
+    if (record.EventType != KEY_EVENT) {
+      continue;
+    }
+
+    bytes += key_event_bytes(record.Event.KeyEvent);
+  }
+
+  return true;
+}
 
 std::optional<CopyModeKeyAction> copy_mode_sequence(std::string_view bytes) {
   if (bytes.empty()) {
@@ -907,7 +1012,7 @@ int run_attach_client(const CommandLine& command) {
   const char prefix_byte = control_prefix_byte(response->prefix);
   bool prefix_pending = false;
   bool copy_mode_active = false;
-  char buffer[512];
+  std::string input_bytes;
   while (!stop_requested) {
     HANDLE handles[] = {input, stop_event.get()};
     const DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, 100);
@@ -932,16 +1037,17 @@ int run_attach_client(const CommandLine& command) {
       break;
     }
 
-    DWORD bytes_read = 0;
-    const BOOL ok = ReadFile(input, buffer, static_cast<DWORD>(sizeof(buffer)), &bytes_read, nullptr);
-    if (!ok || bytes_read == 0) {
+    if (!read_console_input_bytes(input, input_bytes)) {
       stop_requested = true;
       break;
+    }
+    if (input_bytes.empty()) {
+      continue;
     }
 
     if (!send_processed_input(
             pipe.get(),
-            std::string_view{buffer, bytes_read},
+            input_bytes,
             command_prompt,
             pending_mouse_sequence,
             response->mouse_enabled,
