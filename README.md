@@ -71,6 +71,158 @@ See:
 - [Stability Testing](docs/stability-testing.md)
 - [Release Gate](docs/release-gate.md)
 
+## Installation
+
+wmux is currently built from source. It targets native Windows APIs including
+ConPTY and named pipes, so the runtime and integration tests should be run from
+Windows, not WSL.
+
+### Prerequisites
+
+- Windows 10 version 1809 or newer, or Windows 11
+- Git
+- CMake 3.24 or newer
+- Visual Studio 2022 Build Tools with the C++ workload
+- vcpkg, or CMake dependency fetching enabled
+
+Install the core toolchain with `winget`:
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Kitware.CMake -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+After installing the Visual Studio Build Tools, open a new PowerShell window so
+the updated environment is visible to CMake.
+
+### Dependencies
+
+The recommended dependency manager is vcpkg:
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\dev\vcpkg
+C:\dev\vcpkg\bootstrap-vcpkg.bat
+C:\dev\vcpkg\vcpkg.exe install cli11 spdlog --triplet x64-windows
+```
+
+If you keep vcpkg somewhere else, replace `C:\dev\vcpkg` in the configure
+command below with your local path.
+
+### Build From Source
+
+Clone the repository:
+
+```powershell
+git clone https://github.com/shreshthkapai/wmux.git
+cd wmux
+```
+
+Configure and build with vcpkg:
+
+```powershell
+cmake -S . -B build-vs -DCMAKE_TOOLCHAIN_FILE=C:\dev\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake --build build-vs --config Debug
+```
+
+Run the unit tests:
+
+```powershell
+ctest --test-dir build-vs -C Debug --output-on-failure
+```
+
+If vcpkg is not available, CMake can fetch the current third-party dependencies
+during configure:
+
+```powershell
+cmake -S . -B build-vs -DWMUX_FETCH_DEPS=ON
+cmake --build build-vs --config Debug
+```
+
+### First Run
+
+Start a session and attach to it:
+
+```powershell
+.\build-vs\Debug\wmux.exe new -s main
+.\build-vs\Debug\wmux.exe attach -t main
+```
+
+Detach from the session with:
+
+```text
+Ctrl+b d
+```
+
+Reattach later:
+
+```powershell
+.\build-vs\Debug\wmux.exe attach -t main
+```
+
+List and stop sessions:
+
+```powershell
+.\build-vs\Debug\wmux.exe ls
+.\build-vs\Debug\wmux.exe kill-session -t main
+```
+
+Stop the daemon after all sessions are closed:
+
+```powershell
+.\build-vs\Debug\wmux.exe server stop
+```
+
+`wmux server stop` refuses to terminate live sessions. Use `--force` only when
+you intentionally want to terminate active panes and their shell processes:
+
+```powershell
+.\build-vs\Debug\wmux.exe server stop --force
+```
+
+### Key Bindings
+
+```text
+Ctrl+b d       detach
+Ctrl+b c       new window
+Ctrl+b n       next window
+Ctrl+b p       previous window
+Ctrl+b %       split horizontal
+Ctrl+b "       split vertical
+Ctrl+b arrows  switch pane
+Ctrl+b [       copy mode
+Ctrl+b ]       paste buffer
+Ctrl+b :       command mode
+```
+
+### Validation
+
+Run the quick release gate before testing locally:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-release-gate.ps1 -Wmux .\build-vs\Debug\wmux.exe -Quick
+```
+
+Run the full release gate before calling a build stable:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-release-gate.ps1 -Wmux .\build-vs\Debug\wmux.exe
+```
+
+### Troubleshooting
+
+If CMake cannot find a compiler, install the Visual Studio Build Tools C++
+workload and open a fresh PowerShell window.
+
+If CMake cannot find vcpkg packages, check that
+`CMAKE_TOOLCHAIN_FILE` points to your actual vcpkg checkout.
+
+If a rebuild fails because `wmux.exe` is still running, stop the daemon:
+
+```powershell
+.\build-vs\Debug\wmux.exe server stop --force
+```
+
 ## Build And Validate
 
 The current skeleton builds a small `wmux` executable with the Phase 11D
