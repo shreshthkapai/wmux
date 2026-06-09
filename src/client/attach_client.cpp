@@ -9,16 +9,17 @@
 #include "wmux/terminal_control.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <vector>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -499,113 +500,6 @@ struct CopyModeKeyAction {
   std::size_t bytes_consumed{1};
 };
 
-std::string utf8_from_wide_char(wchar_t ch) {
-  if (ch == L'\0') {
-    return {};
-  }
-
-  char buffer[8]{};
-  const int bytes = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, buffer, sizeof(buffer), nullptr, nullptr);
-  if (bytes <= 0) {
-    return {};
-  }
-
-  return std::string{buffer, static_cast<std::size_t>(bytes)};
-}
-
-std::string key_event_bytes(const KEY_EVENT_RECORD& key) {
-  if (!key.bKeyDown) {
-    return {};
-  }
-
-  std::string bytes;
-  const auto repeat_count = std::max<WORD>(1, key.wRepeatCount);
-  const auto append_repeated = [&](std::string_view value) {
-    for (WORD repeat = 0; repeat < repeat_count; ++repeat) {
-      bytes.append(value);
-    }
-  };
-
-  if (key.uChar.UnicodeChar != L'\0') {
-    append_repeated(utf8_from_wide_char(key.uChar.UnicodeChar));
-    return bytes;
-  }
-
-  const bool control_down =
-      (key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-  if (control_down && key.wVirtualKeyCode >= 'A' && key.wVirtualKeyCode <= 'Z') {
-    const char control = static_cast<char>(key.wVirtualKeyCode - 'A' + 1);
-    append_repeated(std::string_view{&control, 1});
-    return bytes;
-  }
-
-  if (key.wVirtualKeyCode == VK_ESCAPE) {
-    append_repeated("\x1b");
-    return bytes;
-  }
-
-  switch (key.wVirtualKeyCode) {
-    case VK_UP:
-      append_repeated("\x1b[A");
-      break;
-    case VK_DOWN:
-      append_repeated("\x1b[B");
-      break;
-    case VK_RIGHT:
-      append_repeated("\x1b[C");
-      break;
-    case VK_LEFT:
-      append_repeated("\x1b[D");
-      break;
-    case VK_PRIOR:
-      append_repeated("\x1b[5~");
-      break;
-    case VK_NEXT:
-      append_repeated("\x1b[6~");
-      break;
-    case VK_HOME:
-      append_repeated("\x1b[H");
-      break;
-    case VK_END:
-      append_repeated("\x1b[F");
-      break;
-    case VK_DELETE:
-      append_repeated("\x1b[3~");
-      break;
-    default:
-      break;
-  }
-
-  return bytes;
-}
-
-bool read_console_input_bytes(HANDLE input, std::string& bytes) {
-  bytes.clear();
-
-  DWORD pending_records = 0;
-  if (!GetNumberOfConsoleInputEvents(input, &pending_records) || pending_records == 0) {
-    return true;
-  }
-
-  const DWORD records_to_read = std::min<DWORD>(pending_records, 64);
-  std::vector<INPUT_RECORD> records(records_to_read);
-  DWORD records_read = 0;
-  if (!ReadConsoleInputW(input, records.data(), records_to_read, &records_read)) {
-    return false;
-  }
-
-  for (DWORD index = 0; index < records_read; ++index) {
-    const auto& record = records[static_cast<std::size_t>(index)];
-    if (record.EventType != KEY_EVENT) {
-      continue;
-    }
-
-    bytes += key_event_bytes(record.Event.KeyEvent);
-  }
-
-  return true;
-}
-
 std::optional<CopyModeKeyAction> copy_mode_sequence(std::string_view bytes) {
   if (bytes.empty()) {
     return std::nullopt;
@@ -877,6 +771,48 @@ void stream_output(HANDLE pipe, HANDLE output, std::atomic_bool& stop_requested,
   SetEvent(stop_event);
 }
 
+void stream_input(
+    HANDLE input,
+    HANDLE pipe,
+    std::mutex& pipe_write_mutex,
+    bool mouse_enabled,
+    char prefix_byte,
+    std::atomic_bool& stop_requested,
+    HANDLE stop_event) {
+  CommandPromptState command_prompt;
+  std::string pending_mouse_sequence;
+  bool prefix_pending = false;
+  bool copy_mode_active = false;
+
+  std::array<char, 4096> buffer{};
+  while (!stop_requested) {
+    DWORD bytes_read = 0;
+    const BOOL ok =
+        ReadFile(input, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr);
+    if (!ok || bytes_read == 0) {
+      break;
+    }
+
+    std::lock_guard lock(pipe_write_mutex);
+    if (!send_processed_input(
+            pipe,
+            std::string_view{buffer.data(), bytes_read},
+            command_prompt,
+            pending_mouse_sequence,
+            mouse_enabled,
+            prefix_byte,
+            prefix_pending,
+            copy_mode_active,
+            stop_requested,
+            stop_event)) {
+      break;
+    }
+  }
+
+  stop_requested = true;
+  SetEvent(stop_event);
+}
+
 #endif
 
 }  // namespace
@@ -981,7 +917,7 @@ int run_attach_client(const CommandLine& command) {
     mode &= ~ENABLE_LINE_INPUT;
     mode &= ~ENABLE_PROCESSED_INPUT;
     mode &= ~ENABLE_QUICK_EDIT_MODE;
-    mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
+    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
     mode |= ENABLE_EXTENDED_FLAGS;
     if (!input_guard.set_mode(mode)) {
       std::cerr << "wmux: failed to enter raw input mode\n";
@@ -1008,21 +944,28 @@ int run_attach_client(const CommandLine& command) {
   }
 
   std::atomic_bool stop_requested{false};
+  std::mutex pipe_write_mutex;
   std::thread output_thread{
       [&] { stream_output(pipe.get(), output, stop_requested, stop_event.get()); }};
+  const char prefix_byte = control_prefix_byte(response->prefix);
+  std::thread input_thread{[&] {
+    stream_input(
+        input,
+        pipe.get(),
+        pipe_write_mutex,
+        response->mouse_enabled,
+        prefix_byte,
+        stop_requested,
+        stop_event.get());
+  }};
 
   TerminalSize last_size = size;
-  CommandPromptState command_prompt;
-  std::string pending_mouse_sequence;
-  const char prefix_byte = control_prefix_byte(response->prefix);
-  bool prefix_pending = false;
-  bool copy_mode_active = false;
-  std::string input_bytes;
   while (!stop_requested) {
-    const DWORD wait_result = WaitForSingleObject(stop_event.get(), 10);
+    const DWORD wait_result = WaitForSingleObject(stop_event.get(), 100);
     const auto latest_size = current_terminal_size(output);
     if (!same_terminal_size(latest_size, last_size) && latest_size.columns > 0 &&
         latest_size.rows > 0) {
+      std::lock_guard lock(pipe_write_mutex);
       if (!send_attach_resize(pipe.get(), latest_size)) {
         stop_requested = true;
         break;
@@ -1037,37 +980,20 @@ int run_attach_client(const CommandLine& command) {
       stop_requested = true;
       break;
     }
-
-    if (!read_console_input_bytes(input, input_bytes)) {
-      stop_requested = true;
-      break;
-    }
-    if (input_bytes.empty()) {
-      continue;
-    }
-
-    if (!send_processed_input(
-            pipe.get(),
-            input_bytes,
-            command_prompt,
-            pending_mouse_sequence,
-            response->mouse_enabled,
-            prefix_byte,
-            prefix_pending,
-            copy_mode_active,
-            stop_requested,
-            stop_event.get())) {
-      stop_requested = true;
-      break;
-    }
   }
 
   stop_requested = true;
   SetEvent(stop_event.get());
+  if (input_thread.joinable()) {
+    CancelSynchronousIo(input_thread.native_handle());
+  }
   if (output_thread.joinable()) {
     CancelSynchronousIo(output_thread.native_handle());
   }
   pipe.reset();
+  if (input_thread.joinable()) {
+    input_thread.join();
+  }
   if (output_thread.joinable()) {
     output_thread.join();
   }
