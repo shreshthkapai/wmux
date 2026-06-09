@@ -539,6 +539,11 @@ std::string key_event_bytes(const KEY_EVENT_RECORD& key) {
     return bytes;
   }
 
+  if (key.wVirtualKeyCode == VK_ESCAPE) {
+    append_repeated("\x1b");
+    return bytes;
+  }
+
   switch (key.wVirtualKeyCode) {
     case VK_UP:
       append_repeated("\x1b[A");
@@ -976,8 +981,8 @@ int run_attach_client(const CommandLine& command) {
     mode &= ~ENABLE_LINE_INPUT;
     mode &= ~ENABLE_PROCESSED_INPUT;
     mode &= ~ENABLE_QUICK_EDIT_MODE;
+    mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
     mode |= ENABLE_EXTENDED_FLAGS;
-    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
     if (!input_guard.set_mode(mode)) {
       std::cerr << "wmux: failed to enter raw input mode\n";
       return 1;
@@ -1014,8 +1019,7 @@ int run_attach_client(const CommandLine& command) {
   bool copy_mode_active = false;
   std::string input_bytes;
   while (!stop_requested) {
-    HANDLE handles[] = {input, stop_event.get()};
-    const DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, 100);
+    const DWORD wait_result = WaitForSingleObject(stop_event.get(), 10);
     const auto latest_size = current_terminal_size(output);
     if (!same_terminal_size(latest_size, last_size) && latest_size.columns > 0 &&
         latest_size.rows > 0) {
@@ -1026,13 +1030,10 @@ int run_attach_client(const CommandLine& command) {
       last_size = latest_size;
     }
 
-    if (wait_result == WAIT_TIMEOUT) {
-      continue;
-    }
-    if (wait_result == WAIT_OBJECT_0 + 1 || stop_requested) {
+    if (wait_result == WAIT_OBJECT_0 || stop_requested) {
       break;
     }
-    if (wait_result != WAIT_OBJECT_0) {
+    if (wait_result != WAIT_TIMEOUT) {
       stop_requested = true;
       break;
     }
