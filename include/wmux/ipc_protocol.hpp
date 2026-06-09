@@ -1,6 +1,7 @@
 #pragma once
 
 #include "wmux/commands.hpp"
+#include "wmux/resource_limits.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -45,6 +46,8 @@ enum class AttachFrameType : std::uint8_t {
   CopyMode = 10,
   Paste = 11,
 };
+
+std::string_view attach_frame_type_name(AttachFrameType type);
 
 struct AttachFrameHeader {
   AttachFrameType type{AttachFrameType::Input};
@@ -103,8 +106,6 @@ struct AttachMouseEventPayload {
 };
 
 constexpr std::size_t kAttachFrameHeaderSize = 7;
-constexpr std::uint32_t kMaxAttachFramePayloadSize = 1024 * 1024;
-
 std::string make_ping_request_json();
 std::string make_command_request_json(const CommandLine& command);
 std::string make_attach_request_json(

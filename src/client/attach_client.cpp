@@ -5,6 +5,7 @@
 #include "wmux/ipc_transport.hpp"
 #include "wmux/logging.hpp"
 #include "wmux/mouse_input.hpp"
+#include "wmux/resource_limits.hpp"
 #include "wmux/terminal_control.hpp"
 
 #include <algorithm>
@@ -254,7 +255,15 @@ std::uint16_t clamp_terminal_dimension(int value) {
   if (value <= 0) {
     return 0;
   }
-  return static_cast<std::uint16_t>(std::min(value, 32767));
+  return static_cast<std::uint16_t>(
+      std::min(value, static_cast<int>(kMaxAttachTerminalColumns)));
+}
+
+std::uint16_t clamp_terminal_rows(int value) {
+  if (value <= 0) {
+    return 0;
+  }
+  return static_cast<std::uint16_t>(std::min(value, static_cast<int>(kMaxAttachTerminalRows)));
 }
 
 TerminalSize current_terminal_size(HANDLE output) {
@@ -265,7 +274,7 @@ TerminalSize current_terminal_size(HANDLE output) {
 
   const int columns = info.srWindow.Right - info.srWindow.Left + 1;
   const int rows = info.srWindow.Bottom - info.srWindow.Top + 1;
-  return {clamp_terminal_dimension(columns), clamp_terminal_dimension(rows)};
+  return {clamp_terminal_dimension(columns), clamp_terminal_rows(rows)};
 }
 
 std::wstring widen(std::string_view value) {
@@ -331,11 +340,15 @@ bool write_attach_frame(HANDLE pipe, std::string_view frame) {
 }
 
 bool send_attach_input(HANDLE pipe, std::string_view bytes) {
-  if (bytes.empty()) {
-    return true;
+  while (!bytes.empty()) {
+    const auto chunk_size = std::min<std::size_t>(bytes.size(), kMaxAttachInputPayloadBytes);
+    if (!write_attach_frame(pipe, make_attach_input_frame(bytes.substr(0, chunk_size)))) {
+      return false;
+    }
+    bytes.remove_prefix(chunk_size);
   }
 
-  return write_attach_frame(pipe, make_attach_input_frame(bytes));
+  return true;
 }
 
 bool send_attach_detach(HANDLE pipe) {
@@ -343,10 +356,16 @@ bool send_attach_detach(HANDLE pipe) {
 }
 
 bool send_attach_command(HANDLE pipe, std::string_view command) {
+  if (command.size() > kMaxAttachCommandPayloadBytes) {
+    return false;
+  }
   return write_attach_frame(pipe, make_attach_command_frame(command));
 }
 
 bool send_attach_command_mode(HANDLE pipe, std::string_view command) {
+  if (command.size() > kMaxAttachCommandPayloadBytes) {
+    return false;
+  }
   return write_attach_frame(pipe, make_attach_command_mode_frame(command));
 }
 
@@ -359,6 +378,9 @@ bool send_attach_resize(HANDLE pipe, TerminalSize size) {
 }
 
 bool send_attach_status(HANDLE pipe, std::string_view status) {
+  if (status.size() > kMaxAttachCommandPayloadBytes) {
+    status = status.substr(0, kMaxAttachCommandPayloadBytes);
+  }
   return write_attach_frame(pipe, make_attach_status_frame(status));
 }
 
@@ -480,6 +502,7 @@ std::optional<CopyModeKeyAction> copy_mode_sequence(std::string_view bytes) {
   }
 
   if (bytes[0] == 'q' || bytes[0] == '\x1b') {
+    // q exits immediately; Escape exits unless it starts a recognized copy-mode key sequence.
     if (bytes.rfind("\x1b[A", 0) == 0) {
       return CopyModeKeyAction{AttachCopyModeAction::CursorUp, 3};
     }
@@ -777,28 +800,60 @@ int run_attach_client(const CommandLine& command) {
 
   UniqueHandle pipe;
   if (!connect_pipe(pipe)) {
-    std::cerr << "wmux: daemon attach endpoint is not running\n";
+    const auto ping = send_ipc_request(make_ping_request_json());
+    log_event(
+        ping.ok ? LogLevel::Warn : LogLevel::Error,
+        "client.attach",
+        "connect_failed",
+        {{"daemon_ping", ping.ok ? "ok" : "failed"}, {"message", ping.message}});
+    if (ping.ok) {
+      std::cerr << "wmux: daemon attach endpoint is unavailable; try again or run "
+                   "'wmux server stop --force' if this persists\n";
+    } else {
+      std::cerr << "wmux: daemon stopped before attach could start\n";
+    }
     return 1;
   }
 
   if (!write_all(pipe.get(), make_attach_request_json(command, size.columns, size.rows))) {
+    log_event(
+        LogLevel::Error,
+        "client.attach",
+        "request_write_failed",
+        {{"session_name", command.session_name}});
     std::cerr << "wmux: failed to send attach request\n";
     return 1;
   }
 
   std::string raw_response;
   if (!read_response_line(pipe.get(), raw_response)) {
+    const auto ping = send_ipc_request(make_ping_request_json());
+    log_event(
+        LogLevel::Error,
+        "client.attach",
+        "response_read_failed",
+        {{"session_name", command.session_name}, {"daemon_ping", ping.ok ? "ok" : "failed"}});
     std::cerr << "wmux: daemon returned an invalid attach response\n";
     return 1;
   }
 
   const auto response = parse_response_json(raw_response);
   if (!response) {
+    log_event(
+        LogLevel::Error,
+        "client.attach",
+        "response_parse_failed",
+        {{"session_name", command.session_name}});
     std::cerr << "wmux: daemon returned an invalid attach response\n";
     return 1;
   }
 
   if (!response->ok) {
+    log_event(
+        LogLevel::Warn,
+        "client.attach",
+        "rejected",
+        {{"session_name", command.session_name}, {"message", response->message}});
     std::cerr << response->message;
     return 1;
   }

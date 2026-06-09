@@ -23,6 +23,7 @@ compile_commands.json
 
 # Logs
 *.log
+artifacts/
 
 # Accidental Node/npm installs; wmux is a C++ project.
 node_modules/

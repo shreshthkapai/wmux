@@ -1,5 +1,7 @@
 #include "wmux/config.hpp"
 
+#include "wmux/resource_limits.hpp"
+
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -188,6 +190,16 @@ ConfigParseResult parse_config_text(std::string_view text) {
     auto line = text.substr(line_start, line_end - line_start);
     if (!line.empty() && line.back() == '\r') {
       line.remove_suffix(1);
+    }
+
+    if (line.size() > kMaxConfigLineBytes) {
+      result.errors.push_back({line_number, "config line is too long"});
+      if (line_end == text.size()) {
+        break;
+      }
+      line_start = line_end + 1;
+      ++line_number;
+      continue;
     }
 
     auto tokens = tokenize_config_line(line, line_number, result.errors);

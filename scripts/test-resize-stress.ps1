@@ -2,8 +2,11 @@
 param(
   [string]$Wmux = (Join-Path $PSScriptRoot "..\build-vs\Debug\wmux.exe"),
 
-  [ValidateRange(1, 60)]
-  [int]$TimeoutSeconds = 10
+  [ValidateRange(1, 120)]
+  [int]$TimeoutSeconds = 20,
+
+  [ValidateRange(1, 500)]
+  [int]$Iterations = 80
 )
 
 Set-StrictMode -Version Latest
@@ -17,8 +20,15 @@ function Invoke-Wmux {
     [switch]$AllowFailure
   )
 
-  $output = & $script:WmuxPath @Arguments 2>&1
-  $exitCode = $LASTEXITCODE
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $output = & $script:WmuxPath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
   $text = ($output | Out-String).TrimEnd()
 
   if (-not $AllowFailure -and $exitCode -ne 0) {
@@ -33,7 +43,7 @@ function Invoke-Wmux {
 
 function New-AttachFrame {
   param(
-    [ValidateSet("Input", "Detach", "Command", "Resize", "MouseFocus")]
+    [ValidateSet("Input", "Detach", "Command", "Resize")]
     [string]$Type,
 
     [byte[]]$Payload = @()
@@ -44,7 +54,6 @@ function New-AttachFrame {
     "Detach" { 2 }
     "Command" { 3 }
     "Resize" { 4 }
-    "MouseFocus" { 7 }
   }
 
   $length = [uint32]$Payload.Length
@@ -105,27 +114,27 @@ function Write-AttachCommand {
   )
 }
 
-function Write-AttachMouseFocus {
+function Write-AttachResize {
   param(
     [Parameter(Mandatory = $true)]
     [System.IO.Stream]$Pipe,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 32767)]
-    [int]$Column,
+    [ValidateRange(1, 512)]
+    [int]$Columns,
 
     [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 32767)]
-    [int]$Row
+    [ValidateRange(1, 256)]
+    [int]$Rows
   )
 
   $payload = [byte[]]::new(4)
-  $payload[0] = [byte]($Column -band 0xff)
-  $payload[1] = [byte](($Column -shr 8) -band 0xff)
-  $payload[2] = [byte]($Row -band 0xff)
-  $payload[3] = [byte](($Row -shr 8) -band 0xff)
+  $payload[0] = [byte]($Columns -band 0xff)
+  $payload[1] = [byte](($Columns -shr 8) -band 0xff)
+  $payload[2] = [byte]($Rows -band 0xff)
+  $payload[3] = [byte](($Rows -shr 8) -band 0xff)
 
-  Write-PipeBytes -Pipe $Pipe -Bytes (New-AttachFrame -Type MouseFocus -Payload $payload)
+  Write-PipeBytes -Pipe $Pipe -Bytes (New-AttachFrame -Type Resize -Payload $payload)
 }
 
 function Write-AttachDetach {
@@ -185,7 +194,7 @@ function Open-Attach {
   )
 
   $pipe = Connect-AttachPipe
-  $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":90,"terminal_rows":20}}' -f $SessionName
+  $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":120,"terminal_rows":30}}' -f $SessionName
   Write-PipeBytes -Pipe $pipe -Bytes ([Text.Encoding]::UTF8.GetBytes($request + "`n"))
 
   $response = Read-ResponseLine -Pipe $pipe | ConvertFrom-Json
@@ -210,7 +219,7 @@ function Read-UntilMarker {
   )
 
   $output = ""
-  $buffer = [byte[]]::new(4096)
+  $buffer = [byte[]]::new(8192)
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
   while ([DateTime]::UtcNow -lt $deadline) {
@@ -234,6 +243,27 @@ function Read-UntilMarker {
   throw "timed out waiting for $Description`nCaptured output:`n$output"
 }
 
+function Drain-AttachOutput {
+  param(
+    [Parameter(Mandatory = $true)]
+    [System.IO.Stream]$Pipe,
+
+    [int]$Milliseconds = 100
+  )
+
+  $buffer = [byte[]]::new(8192)
+  $deadline = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $readTask = $Pipe.ReadAsync($buffer, 0, $buffer.Length)
+    if (-not $readTask.Wait(20)) {
+      break
+    }
+    if ($readTask.Result -le 0) {
+      break
+    }
+  }
+}
+
 function Get-SessionCount {
   param(
     [Parameter(Mandatory = $true)]
@@ -247,9 +277,61 @@ function Get-SessionCount {
   throw "could not parse session count from server status`n$StatusOutput"
 }
 
+function Get-StatusField {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$StatusOutput,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  $pattern = "(?m)^$([regex]::Escape($Name)):\s+(.+?)\s*$"
+  if ($StatusOutput -match $pattern) {
+    return $Matches[1]
+  }
+
+  throw "could not parse '${Name}' from server status`n$StatusOutput"
+}
+
+function Read-LogTailSince {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [long]$Offset
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return ""
+  }
+
+  $stream = [System.IO.File]::Open(
+    $Path,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::ReadWrite)
+  try {
+    if ($Offset -gt 0 -and $Offset -lt $stream.Length) {
+      [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+    }
+    $reader = [System.IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
+    try {
+      return $reader.ReadToEnd()
+    }
+    finally {
+      $reader.Dispose()
+    }
+  }
+  finally {
+    $stream.Dispose()
+  }
+}
+
 $script:WmuxPath = (Resolve-Path -LiteralPath $Wmux).Path
-$sessionName = "wmux_phase11b_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-$marker = "WMUX_PHASE11B_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$sessionName = "wmux_resize_stress_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$marker = "WMUX_RESIZE_STRESS_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $previousDefaultShell = $env:WMUX_DEFAULT_SHELL
 $attach = $null
 
@@ -260,11 +342,17 @@ $env:WMUX_DEFAULT_SHELL = "cmd.exe /D /Q"
 $status = Invoke-Wmux -Arguments @("server", "status")
 $sessionCount = Get-SessionCount -StatusOutput $status.Output
 if ($sessionCount -ne 0) {
-  throw "mouse-focus test requires an empty daemon because it restarts wmux with WMUX_DEFAULT_SHELL=cmd.exe /D /Q"
+  throw "resize-stress test requires an empty daemon because it restarts wmux with WMUX_DEFAULT_SHELL=cmd.exe /D /Q"
 }
 
 [void](Invoke-Wmux -Arguments @("server", "stop"))
 [void](Invoke-Wmux -Arguments @("server", "status"))
+$status = Invoke-Wmux -Arguments @("server", "status")
+$daemonLog = Get-StatusField -StatusOutput $status.Output -Name "daemon log"
+$logOffset = 0
+if (Test-Path -LiteralPath $daemonLog) {
+  $logOffset = (Get-Item -LiteralPath $daemonLog).Length
+}
 
 try {
   [void](Invoke-Wmux -Arguments @("new", "-s", $sessionName))
@@ -272,33 +360,51 @@ try {
   $attach = Open-Attach -SessionName $sessionName
   [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "initial cmd prompt")
 
-  Write-Host "pane 1: set identity"
-  Write-AttachInput -Pipe $attach -Text "set WMUX_CLICK=P1`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 1 prompt")
-
-  Write-Host "split horizontally"
+  Write-Host "create nested panes"
   Write-AttachCommand -Pipe $attach -Command "split-horizontal"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 2 prompt")
+  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "second pane prompt")
+  Write-AttachCommand -Pipe $attach -Command "split-vertical"
+  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "third pane prompt")
 
-  Write-Host "pane 2: set identity"
-  Write-AttachInput -Pipe $attach -Text "set WMUX_CLICK=P2`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 2 prompt after identity")
+  Write-Host "start heavy output"
+  Write-AttachInput -Pipe $attach -Text "for /L %i in (1,1,300) do @echo $($marker)_%i`r"
 
-  Write-Host "mouse click: focus pane 1"
-  Write-AttachMouseFocus -Pipe $attach -Column 2 -Row 2
-  Write-AttachInput -Pipe $attach -Text "echo %WMUX_CLICK%_$marker`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("P1_$marker")) -Description "pane 1 click-routed input")
+  Write-Host "send rapid resize frames"
+  $sizes = @(
+    @{ Columns = 120; Rows = 30 },
+    @{ Columns = 90; Rows = 20 },
+    @{ Columns = 132; Rows = 43 },
+    @{ Columns = 60; Rows = 12 },
+    @{ Columns = 160; Rows = 45 },
+    @{ Columns = 40; Rows = 8 },
+    @{ Columns = 100; Rows = 24 }
+  )
 
-  Write-Host "mouse click: focus pane 2"
-  Write-AttachMouseFocus -Pipe $attach -Column 60 -Row 2
-  Write-AttachInput -Pipe $attach -Text "echo %WMUX_CLICK%_$marker`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("P2_$marker")) -Description "pane 2 click-routed input")
+  for ($index = 0; $index -lt $Iterations; $index++) {
+    $size = $sizes[$index % $sizes.Count]
+    Write-AttachResize -Pipe $attach -Columns $size.Columns -Rows $size.Rows
+    if (($index % 8) -eq 0) {
+      Drain-AttachOutput -Pipe $attach -Milliseconds 40
+    }
+  }
+
+  Write-AttachResize -Pipe $attach -Columns 100 -Rows 24
+  $statusCursor = [regex]::Escape("$([char]27)[24;1H")
+  [void](Read-UntilMarker -Pipe $attach -Pattern $statusCursor -Description "final resize redraw")
+  Write-AttachInput -Pipe $attach -Text "echo $($marker)_DONE`r"
+  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("$($marker)_DONE")) -Description "post-resize shell response")
+
+  $logTail = Read-LogTailSince -Path $daemonLog -Offset $logOffset
+  $resizeEvents = ([regex]::Matches($logTail, 'component="pty" event="resize"')).Count
+  if ($resizeEvents -lt 9) {
+    throw "expected repeated per-pane ConPTY resize events, saw $resizeEvents`n$logTail"
+  }
 
   Write-AttachDetach -Pipe $attach
   $attach.Dispose()
   $attach = $null
 
-  Write-Host "ok: mouse click focused panes and input routed to active pane"
+  Write-Host "ok: rapid resize during heavy output completed with per-pane ConPTY resize events"
 }
 finally {
   if ($attach -ne $null) {

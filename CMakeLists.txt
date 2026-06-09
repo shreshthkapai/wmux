@@ -72,6 +72,7 @@ set(WMUX_RUNTIME_SOURCES
   src/daemon/daemon_attach.cpp
   src/daemon/daemon_commands.cpp
   src/daemon/daemon.cpp
+  src/daemon/daemon_render.cpp
   src/daemon/daemon_shell.cpp
   src/daemon/daemon_state.cpp
   src/ipc/transport.cpp
@@ -110,6 +111,7 @@ if(WMUX_BUILD_TESTS)
     tests/command_parser_test.cpp
     tests/config_test.cpp
     tests/copy_selection_test.cpp
+    tests/daemon_render_test.cpp
     tests/ipc_protocol_test.cpp
     tests/mouse_input_test.cpp
     tests/paste_buffer_test.cpp
@@ -117,9 +119,10 @@ if(WMUX_BUILD_TESTS)
     tests/terminal_grid_test.cpp
     tests/windows_clipboard_test.cpp
     ${WMUX_COMMON_SOURCES}
+    src/daemon/daemon_render.cpp
     src/platform/windows_clipboard.cpp
   )
-  target_include_directories(wmux_tests PRIVATE include)
+  target_include_directories(wmux_tests PRIVATE include src/daemon)
   target_link_libraries(wmux_tests PRIVATE "${WMUX_CLI11_TARGET}" "${WMUX_SPDLOG_TARGET}")
   target_compile_definitions(wmux_tests PRIVATE
     WMUX_VERSION="${PROJECT_VERSION}"

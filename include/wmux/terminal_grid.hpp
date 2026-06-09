@@ -1,5 +1,7 @@
 #pragma once
 
+#include "wmux/resource_limits.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <deque>
@@ -13,18 +15,21 @@ struct TerminalAttributes {
   bool bold{false};
   bool underline{false};
   bool inverse{false};
-  std::int16_t foreground{-1};
-  std::int16_t background{-1};
+  std::int32_t foreground{-1};
+  std::int32_t background{-1};
 };
 
 struct TerminalCell {
-  char glyph{' '};
+  std::string glyph{" "};
   TerminalAttributes attributes;
+  bool wide_continuation{false};
 };
 
 struct TerminalLineSnapshot {
   std::string text;
   bool wrapped{false};
+  std::vector<TerminalAttributes> attributes;
+  std::vector<std::string> cells;
 };
 
 struct TerminalScreenSnapshot {
@@ -79,18 +84,29 @@ class TerminalGrid final {
   std::string row_text(const std::vector<TerminalCell>& cells) const;
 
   void put_printable(char glyph);
+  void put_codepoint(std::uint32_t codepoint);
+  void put_cell(std::string glyph, int width);
   void carriage_return();
   void line_feed();
   void backspace();
   void tab();
   void scroll_up();
-  void append_scrollback_line(std::vector<TerminalCell> line);
+  void scroll_up_region(int top, int bottom, int count);
+  void scroll_down_region(int top, int bottom, int count);
+  void append_scrollback_line(std::vector<TerminalCell> line, bool wrapped);
   void clear_scrollback();
   void clear_all();
   void clear_line(int mode);
   void clear_screen(int mode);
+  void erase_characters(int count);
+  void insert_characters(int count);
+  void delete_characters(int count);
   void move_cursor(int row, int column);
   void move_cursor_relative(int row_delta, int column_delta);
+  void save_cursor();
+  void restore_cursor();
+  void set_scroll_region(int top, int bottom);
+  void reset_scroll_region();
   void apply_csi(char final_byte);
   void apply_sgr(const std::vector<int>& params);
   void set_alternate_screen(bool enabled);
@@ -99,14 +115,20 @@ class TerminalGrid final {
   int rows_{24};
   int cursor_column_{0};
   int cursor_row_{0};
+  int saved_cursor_column_{0};
+  int saved_cursor_row_{0};
+  int scroll_top_{0};
+  int scroll_bottom_{23};
   bool pending_wrap_{false};
   bool alternate_screen_{false};
+  int utf8_remaining_{0};
+  std::uint32_t utf8_codepoint_{0};
   TerminalAttributes current_attributes_;
   std::vector<TerminalCell> normal_buffer_;
   std::vector<TerminalCell> alternate_buffer_;
   std::vector<bool> normal_wrapped_lines_;
   std::vector<bool> alternate_wrapped_lines_;
-  std::size_t scrollback_capacity_{2000};
+  std::size_t scrollback_capacity_{kMaxPaneScrollbackLines};
   std::deque<TerminalLineSnapshot> scrollback_;
   ParserState parser_state_{ParserState::Ground};
   std::string csi_buffer_;

@@ -1,6 +1,7 @@
 #include "wmux/ipc_protocol.hpp"
 
 #include <cassert>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -68,7 +69,7 @@ void expects_attach_request_json_with_terminal_size() {
 
   const auto request = wmux::parse_request_json(wmux::make_attach_request_json(command, 132, 43));
   assert(request);
-  assert(request->type == "AttachSession");
+  assert(request->type == "AttachStart");
   assert(request->session_name == "finance");
   assert(request->terminal_columns == 132);
   assert(request->terminal_rows == 43);
@@ -82,6 +83,21 @@ void expects_json_escaping() {
   const auto request = wmux::parse_request_json(wmux::make_command_request_json(command));
   assert(request);
   assert(request->session_name == "quote\"slash\\line\n");
+}
+
+void ignores_nested_false_positive_json_fields() {
+  const auto request = wmux::parse_request_json(
+      "{\"meta\":{\"type\":\"KillSession\"},\"type\":\"ListSessions\"}\n");
+
+  assert(request);
+  assert(request->type == "ListSessions");
+}
+
+void rejects_json_fields_with_wrong_type() {
+  const auto request = wmux::parse_request_json(
+      "{\"type\":{\"nested\":\"ListSessions\"},\"session_name\":\"finance\"}\n");
+
+  assert(!request);
 }
 
 void expects_response_json() {
@@ -279,9 +295,33 @@ void expects_attach_paste_frame() {
   assert(header->payload_size == 0);
 }
 
+void names_attach_frame_types() {
+  assert(wmux::attach_frame_type_name(wmux::AttachFrameType::Input) == "Input");
+  assert(wmux::attach_frame_type_name(wmux::AttachFrameType::Resize) == "Resize");
+  assert(wmux::attach_frame_type_name(wmux::AttachFrameType::MouseEvent) == "Mouse");
+  assert(wmux::attach_frame_type_name(wmux::AttachFrameType::Detach) == "Detach");
+  assert(wmux::attach_frame_type_name(wmux::AttachFrameType::Paste) == "Paste");
+}
+
 void rejects_bad_attach_resize_payload() {
   assert(!wmux::parse_attach_resize_payload(""));
   assert(!wmux::parse_attach_resize_payload(std::string_view{"\0\0\x18\0", 4}));
+  assert(!wmux::parse_attach_resize_payload(std::string_view{"\x01\x03\x18\0", 4}));
+}
+
+void rejects_oversized_attach_frame_payloads() {
+  std::string header;
+  header.reserve(wmux::kAttachFrameHeaderSize);
+  header.push_back('W');
+  header.push_back('M');
+  header.push_back(static_cast<char>(wmux::AttachFrameType::Input));
+  const auto payload_size = wmux::kMaxAttachInputPayloadBytes + 1;
+  header.push_back(static_cast<char>(payload_size & 0xFF));
+  header.push_back(static_cast<char>((payload_size >> 8) & 0xFF));
+  header.push_back(static_cast<char>((payload_size >> 16) & 0xFF));
+  header.push_back(static_cast<char>((payload_size >> 24) & 0xFF));
+
+  assert(!wmux::parse_attach_frame_header(header));
 }
 
 void rejects_bad_attach_mouse_focus_payload() {
@@ -322,6 +362,8 @@ void run_ipc_protocol_tests() {
   expects_set_option_request_json();
   expects_attach_request_json_with_terminal_size();
   expects_json_escaping();
+  ignores_nested_false_positive_json_fields();
+  rejects_json_fields_with_wrong_type();
   expects_response_json();
   expects_attach_response_json_with_settings();
   expects_attach_input_frame();
@@ -335,7 +377,9 @@ void run_ipc_protocol_tests() {
   expects_attach_scroll_frame();
   expects_attach_copy_mode_frame();
   expects_attach_paste_frame();
+  names_attach_frame_types();
   rejects_bad_attach_resize_payload();
+  rejects_oversized_attach_frame_payloads();
   rejects_bad_attach_mouse_focus_payload();
   rejects_bad_attach_mouse_event_payload();
   rejects_bad_attach_scroll_payload();

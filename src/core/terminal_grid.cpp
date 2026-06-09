@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wmux {
@@ -12,6 +13,7 @@ namespace {
 constexpr int kDefaultColumns = 80;
 constexpr int kDefaultRows = 24;
 constexpr int kTabWidth = 4;
+constexpr std::uint32_t kReplacementCodepoint = 0xfffd;
 
 int clamped_dimension(int value, int fallback) {
   return value > 0 ? value : fallback;
@@ -88,20 +90,65 @@ int param_or_default(const std::vector<int>& params, std::size_t index, int defa
   return params[index];
 }
 
+bool is_combining_codepoint(std::uint32_t codepoint) {
+  return (codepoint >= 0x0300 && codepoint <= 0x036f) ||
+         (codepoint >= 0x1ab0 && codepoint <= 0x1aff) ||
+         (codepoint >= 0x1dc0 && codepoint <= 0x1dff) ||
+         (codepoint >= 0x20d0 && codepoint <= 0x20ff) ||
+         (codepoint >= 0xfe20 && codepoint <= 0xfe2f);
+}
+
+bool is_wide_codepoint(std::uint32_t codepoint) {
+  return (codepoint >= 0x1100 &&
+          (codepoint <= 0x115f || codepoint == 0x2329 || codepoint == 0x232a ||
+           (codepoint >= 0x2e80 && codepoint <= 0xa4cf && codepoint != 0x303f) ||
+           (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+           (codepoint >= 0xf900 && codepoint <= 0xfaff) ||
+           (codepoint >= 0xfe10 && codepoint <= 0xfe19) ||
+           (codepoint >= 0xfe30 && codepoint <= 0xfe6f) ||
+           (codepoint >= 0xff00 && codepoint <= 0xff60) ||
+           (codepoint >= 0xffe0 && codepoint <= 0xffe6) ||
+           (codepoint >= 0x1f300 && codepoint <= 0x1faff)));
+}
+
+std::string utf8_from_codepoint(std::uint32_t codepoint) {
+  std::string out;
+  if (codepoint <= 0x7f) {
+    out.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7ff) {
+    out.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0xffff) {
+    out.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else {
+    out.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  }
+  return out;
+}
+
 }  // namespace
 
 TerminalGrid::TerminalGrid()
     : normal_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
       alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
       normal_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false),
-      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {}
+      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {
+  reset_scroll_region();
+}
 
 TerminalGrid::TerminalGrid(int columns, int rows)
-    : normal_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      normal_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false),
-      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {
-  resize(columns, rows);
+    : columns_(clamped_dimension(columns, kDefaultColumns)),
+      rows_(clamped_dimension(rows, kDefaultRows)),
+      normal_buffer_(static_cast<std::size_t>(columns_ * rows_)),
+      alternate_buffer_(static_cast<std::size_t>(columns_ * rows_)),
+      normal_wrapped_lines_(static_cast<std::size_t>(rows_), false),
+      alternate_wrapped_lines_(static_cast<std::size_t>(rows_), false) {
+  reset_scroll_region();
 }
 
 void TerminalGrid::resize(int columns, int rows) {
@@ -121,6 +168,9 @@ void TerminalGrid::resize(int columns, int rows) {
   rows_ = next_rows;
   cursor_column_ = std::clamp(cursor_column_, 0, columns_ - 1);
   cursor_row_ = std::clamp(cursor_row_, 0, rows_ - 1);
+  saved_cursor_column_ = std::clamp(saved_cursor_column_, 0, columns_ - 1);
+  saved_cursor_row_ = std::clamp(saved_cursor_row_, 0, rows_ - 1);
+  reset_scroll_region();
   pending_wrap_ = false;
 }
 
@@ -128,7 +178,20 @@ void TerminalGrid::feed(std::string_view bytes) {
   for (const unsigned char byte : bytes) {
     switch (parser_state_) {
       case ParserState::Ground:
-        if (byte == 0x1b) {
+        if (utf8_remaining_ > 0) {
+          if ((byte & 0xc0) == 0x80) {
+            utf8_codepoint_ = (utf8_codepoint_ << 6) | (byte & 0x3f);
+            --utf8_remaining_;
+            if (utf8_remaining_ == 0) {
+              put_codepoint(utf8_codepoint_);
+              utf8_codepoint_ = 0;
+            }
+          } else {
+            utf8_remaining_ = 0;
+            utf8_codepoint_ = 0;
+            put_codepoint(kReplacementCodepoint);
+          }
+        } else if (byte == 0x1b) {
           parser_state_ = ParserState::Escape;
         } else if (byte == '\r') {
           carriage_return();
@@ -138,8 +201,19 @@ void TerminalGrid::feed(std::string_view bytes) {
           backspace();
         } else if (byte == '\t') {
           tab();
-        } else if (byte >= 0x20 && byte != 0x7f) {
+        } else if (byte >= 0x20 && byte < 0x80 && byte != 0x7f) {
           put_printable(static_cast<char>(byte));
+        } else if (byte >= 0xc2 && byte <= 0xdf) {
+          utf8_codepoint_ = byte & 0x1f;
+          utf8_remaining_ = 1;
+        } else if (byte >= 0xe0 && byte <= 0xef) {
+          utf8_codepoint_ = byte & 0x0f;
+          utf8_remaining_ = 2;
+        } else if (byte >= 0xf0 && byte <= 0xf4) {
+          utf8_codepoint_ = byte & 0x07;
+          utf8_remaining_ = 3;
+        } else if (byte >= 0x80) {
+          put_codepoint(kReplacementCodepoint);
         }
         break;
 
@@ -149,10 +223,22 @@ void TerminalGrid::feed(std::string_view bytes) {
           parser_state_ = ParserState::Csi;
         } else if (byte == ']') {
           parser_state_ = ParserState::Osc;
+        } else if (byte == '7') {
+          save_cursor();
+          parser_state_ = ParserState::Ground;
+        } else if (byte == '8') {
+          restore_cursor();
+          parser_state_ = ParserState::Ground;
         } else if (byte == 'c') {
+          alternate_screen_ = false;
           clear_all();
           move_cursor(0, 0);
+          saved_cursor_column_ = 0;
+          saved_cursor_row_ = 0;
+          reset_scroll_region();
           current_attributes_ = {};
+          utf8_remaining_ = 0;
+          utf8_codepoint_ = 0;
           parser_state_ = ParserState::Ground;
         } else {
           parser_state_ = ParserState::Ground;
@@ -242,7 +328,7 @@ const std::vector<bool>& TerminalGrid::active_wrapped_lines() const {
 }
 
 TerminalCell TerminalGrid::blank_cell() const {
-  return TerminalCell{' ', current_attributes_};
+  return TerminalCell{" ", current_attributes_};
 }
 
 std::size_t TerminalGrid::offset(int row, int column) const {
@@ -264,16 +350,25 @@ TerminalLineSnapshot TerminalGrid::row_snapshot(
     const std::vector<TerminalCell>& buffer,
     const std::vector<bool>& wrapped_lines,
     int row) const {
-  return TerminalLineSnapshot{
-      row_text(buffer, row),
-      wrapped_lines[static_cast<std::size_t>(row)]};
+  TerminalLineSnapshot snapshot;
+  snapshot.text = row_text(buffer, row);
+  snapshot.wrapped = wrapped_lines[static_cast<std::size_t>(row)];
+  snapshot.attributes.reserve(static_cast<std::size_t>(columns_));
+  snapshot.cells.reserve(static_cast<std::size_t>(columns_));
+  for (int column = 0; column < columns_; ++column) {
+    const auto& cell = buffer[offset(row, column)];
+    snapshot.attributes.push_back(cell.attributes);
+    snapshot.cells.push_back(cell.wide_continuation ? std::string{} : cell.glyph);
+  }
+  return snapshot;
 }
 
 std::string TerminalGrid::row_text(const std::vector<TerminalCell>& buffer, int row) const {
   std::string line;
   line.reserve(static_cast<std::size_t>(columns_));
   for (int column = 0; column < columns_; ++column) {
-    line.push_back(buffer[offset(row, column)].glyph);
+    const auto& cell = buffer[offset(row, column)];
+    line += cell.wide_continuation ? std::string{" "} : cell.glyph;
   }
   return line;
 }
@@ -282,12 +377,47 @@ std::string TerminalGrid::row_text(const std::vector<TerminalCell>& cells) const
   std::string line;
   line.reserve(cells.size());
   for (const auto& cell : cells) {
-    line.push_back(cell.glyph);
+    line += cell.wide_continuation ? std::string{" "} : cell.glyph;
   }
   return line;
 }
 
 void TerminalGrid::put_printable(char glyph) {
+  put_cell(std::string(1, glyph), 1);
+}
+
+void TerminalGrid::put_codepoint(std::uint32_t codepoint) {
+  if (codepoint == 0) {
+    pending_wrap_ = false;
+    return;
+  }
+
+  if (is_combining_codepoint(codepoint)) {
+    pending_wrap_ = false;
+    if (cursor_column_ > 0) {
+      auto& previous = active_buffer()[offset(cursor_row_, cursor_column_ - 1)];
+      if (!previous.wide_continuation) {
+        previous.glyph += utf8_from_codepoint(codepoint);
+      }
+    }
+    return;
+  }
+
+  if (codepoint >= 0x20 && codepoint < 0x7f) {
+    put_cell(std::string(1, static_cast<char>(codepoint)), 1);
+    return;
+  }
+
+  if (codepoint == kReplacementCodepoint) {
+    put_cell("?", 1);
+    return;
+  }
+
+  put_cell(utf8_from_codepoint(codepoint), is_wide_codepoint(codepoint) ? 2 : 1);
+}
+
+void TerminalGrid::put_cell(std::string glyph, int width) {
+  width = std::clamp(width, 1, std::max(1, columns_));
   if (pending_wrap_) {
     active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = true;
     cursor_column_ = 0;
@@ -295,12 +425,26 @@ void TerminalGrid::put_printable(char glyph) {
     pending_wrap_ = false;
   }
 
-  active_buffer()[offset(cursor_row_, cursor_column_)] = TerminalCell{glyph, current_attributes_};
+  if (width > 1 && cursor_column_ + width > columns_) {
+    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = true;
+    cursor_column_ = 0;
+    line_feed();
+    pending_wrap_ = false;
+  }
 
-  if (cursor_column_ == columns_ - 1) {
+  active_buffer()[offset(cursor_row_, cursor_column_)] =
+      TerminalCell{std::move(glyph), current_attributes_, false};
+  for (int column = cursor_column_ + 1;
+       column < std::min(columns_, cursor_column_ + width);
+       ++column) {
+    active_buffer()[offset(cursor_row_, column)] =
+        TerminalCell{"", current_attributes_, true};
+  }
+
+  if (cursor_column_ + width >= columns_) {
     pending_wrap_ = true;
   } else {
-    ++cursor_column_;
+    cursor_column_ += width;
   }
 }
 
@@ -311,10 +455,10 @@ void TerminalGrid::carriage_return() {
 
 void TerminalGrid::line_feed() {
   pending_wrap_ = false;
-  if (cursor_row_ == rows_ - 1) {
-    scroll_up();
+  if (cursor_row_ == scroll_bottom_) {
+    scroll_up_region(scroll_top_, scroll_bottom_, 1);
   } else {
-    ++cursor_row_;
+    cursor_row_ = std::min(rows_ - 1, cursor_row_ + 1);
   }
 }
 
@@ -332,32 +476,94 @@ void TerminalGrid::tab() {
 }
 
 void TerminalGrid::scroll_up() {
-  auto& buffer = active_buffer();
-  auto& wrapped_lines = active_wrapped_lines();
-  if (!alternate_screen_) {
-    append_scrollback_line(row_cells(buffer, 0));
-  }
+  scroll_up_region(0, rows_ - 1, 1);
+}
 
-  if (rows_ <= 1) {
-    std::fill(buffer.begin(), buffer.end(), blank_cell());
-    std::fill(wrapped_lines.begin(), wrapped_lines.end(), false);
+void TerminalGrid::scroll_up_region(int top, int bottom, int count) {
+  if (count <= 0 || top < 0 || bottom >= rows_ || top > bottom) {
     return;
   }
 
+  auto& buffer = active_buffer();
+  auto& wrapped_lines = active_wrapped_lines();
   const auto columns = static_cast<std::size_t>(columns_);
-  std::move(buffer.begin() + columns, buffer.end(), buffer.begin());
-  std::fill(buffer.end() - columns, buffer.end(), blank_cell());
-  std::move(wrapped_lines.begin() + 1, wrapped_lines.end(), wrapped_lines.begin());
-  wrapped_lines.back() = false;
+  for (int step = 0; step < count; ++step) {
+    if (!alternate_screen_ && top == 0 && bottom == rows_ - 1) {
+      const bool wrapped = !wrapped_lines.empty() && wrapped_lines.front();
+      append_scrollback_line(row_cells(buffer, 0), wrapped);
+    }
+
+    if (top == bottom) {
+      std::fill(
+          buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_),
+          buffer.begin() + static_cast<std::ptrdiff_t>((top + 1) * columns_),
+          blank_cell());
+      wrapped_lines[static_cast<std::size_t>(top)] = false;
+      continue;
+    }
+
+    auto first = buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_);
+    auto second = first + static_cast<std::ptrdiff_t>(columns);
+    auto last = buffer.begin() + static_cast<std::ptrdiff_t>((bottom + 1) * columns_);
+    std::move(second, last, first);
+    std::fill(last - static_cast<std::ptrdiff_t>(columns), last, blank_cell());
+
+    std::move(
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top + 1),
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1),
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top));
+    wrapped_lines[static_cast<std::size_t>(bottom)] = false;
+  }
 }
 
-void TerminalGrid::append_scrollback_line(std::vector<TerminalCell> line) {
+void TerminalGrid::scroll_down_region(int top, int bottom, int count) {
+  if (count <= 0 || top < 0 || bottom >= rows_ || top > bottom) {
+    return;
+  }
+
+  auto& buffer = active_buffer();
+  auto& wrapped_lines = active_wrapped_lines();
+  const auto columns = static_cast<std::size_t>(columns_);
+  for (int step = 0; step < count; ++step) {
+    if (top == bottom) {
+      std::fill(
+          buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_),
+          buffer.begin() + static_cast<std::ptrdiff_t>((top + 1) * columns_),
+          blank_cell());
+      wrapped_lines[static_cast<std::size_t>(top)] = false;
+      continue;
+    }
+
+    auto first = buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_);
+    auto last = buffer.begin() + static_cast<std::ptrdiff_t>((bottom + 1) * columns_);
+    std::move_backward(
+        first,
+        last - static_cast<std::ptrdiff_t>(columns),
+        last);
+    std::fill(first, first + static_cast<std::ptrdiff_t>(columns), blank_cell());
+
+    std::move_backward(
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top),
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom),
+        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1));
+    wrapped_lines[static_cast<std::size_t>(top)] = false;
+  }
+}
+
+void TerminalGrid::append_scrollback_line(std::vector<TerminalCell> line, bool wrapped) {
   if (scrollback_capacity_ == 0) {
     return;
   }
 
-  const auto wrapped = normal_wrapped_lines_.empty() ? false : normal_wrapped_lines_.front();
-  scrollback_.push_back(TerminalLineSnapshot{row_text(line), wrapped});
+  TerminalLineSnapshot snapshot;
+  snapshot.text = row_text(line);
+  snapshot.wrapped = wrapped;
+  snapshot.attributes.reserve(line.size());
+  for (const auto& cell : line) {
+    snapshot.attributes.push_back(cell.attributes);
+    snapshot.cells.push_back(cell.wide_continuation ? std::string{} : cell.glyph);
+  }
+  scrollback_.push_back(std::move(snapshot));
   while (scrollback_.size() > scrollback_capacity_) {
     scrollback_.pop_front();
   }
@@ -429,6 +635,42 @@ void TerminalGrid::clear_screen(int mode) {
   }
 }
 
+void TerminalGrid::erase_characters(int count) {
+  count = std::max(1, count);
+  auto& buffer = active_buffer();
+  const int last = std::min(columns_ - 1, cursor_column_ + count - 1);
+  for (int column = cursor_column_; column <= last; ++column) {
+    buffer[offset(cursor_row_, column)] = blank_cell();
+  }
+  if (last == columns_ - 1) {
+    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+  }
+}
+
+void TerminalGrid::insert_characters(int count) {
+  count = std::min(std::max(1, count), columns_ - cursor_column_);
+  auto& buffer = active_buffer();
+  for (int column = columns_ - 1; column >= cursor_column_ + count; --column) {
+    buffer[offset(cursor_row_, column)] = buffer[offset(cursor_row_, column - count)];
+  }
+  for (int column = cursor_column_; column < cursor_column_ + count; ++column) {
+    buffer[offset(cursor_row_, column)] = blank_cell();
+  }
+  active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+}
+
+void TerminalGrid::delete_characters(int count) {
+  count = std::min(std::max(1, count), columns_ - cursor_column_);
+  auto& buffer = active_buffer();
+  for (int column = cursor_column_; column + count < columns_; ++column) {
+    buffer[offset(cursor_row_, column)] = buffer[offset(cursor_row_, column + count)];
+  }
+  for (int column = columns_ - count; column < columns_; ++column) {
+    buffer[offset(cursor_row_, column)] = blank_cell();
+  }
+  active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+}
+
 void TerminalGrid::move_cursor(int row, int column) {
   pending_wrap_ = false;
   cursor_row_ = std::clamp(row, 0, rows_ - 1);
@@ -437,6 +679,31 @@ void TerminalGrid::move_cursor(int row, int column) {
 
 void TerminalGrid::move_cursor_relative(int row_delta, int column_delta) {
   move_cursor(cursor_row_ + row_delta, cursor_column_ + column_delta);
+}
+
+void TerminalGrid::save_cursor() {
+  saved_cursor_row_ = cursor_row_;
+  saved_cursor_column_ = cursor_column_;
+}
+
+void TerminalGrid::restore_cursor() {
+  move_cursor(saved_cursor_row_, saved_cursor_column_);
+}
+
+void TerminalGrid::set_scroll_region(int top, int bottom) {
+  if (top < 0 || bottom >= rows_ || top >= bottom) {
+    reset_scroll_region();
+    return;
+  }
+
+  scroll_top_ = top;
+  scroll_bottom_ = bottom;
+  move_cursor(0, 0);
+}
+
+void TerminalGrid::reset_scroll_region() {
+  scroll_top_ = 0;
+  scroll_bottom_ = std::max(0, rows_ - 1);
 }
 
 void TerminalGrid::apply_csi(char final_byte) {
@@ -455,6 +722,12 @@ void TerminalGrid::apply_csi(char final_byte) {
     case 'D':
       move_cursor_relative(0, -param_or_default(params, 0, 1));
       break;
+    case 'E':
+      move_cursor_relative(param_or_default(params, 0, 1), -cursor_column_);
+      break;
+    case 'F':
+      move_cursor_relative(-param_or_default(params, 0, 1), -cursor_column_);
+      break;
     case 'G':
       move_cursor(cursor_row_, param_or_default(params, 0, 1) - 1);
       break;
@@ -462,14 +735,51 @@ void TerminalGrid::apply_csi(char final_byte) {
     case 'f':
       move_cursor(param_or_default(params, 0, 1) - 1, param_or_default(params, 1, 1) - 1);
       break;
+    case 'I':
+      tab();
+      for (int step = 1; step < param_or_default(params, 0, 1); ++step) {
+        tab();
+      }
+      break;
     case 'J':
       clear_screen(param_or_default(params, 0, 0));
       break;
     case 'K':
       clear_line(param_or_default(params, 0, 0));
       break;
+    case 'L':
+      if (cursor_row_ >= scroll_top_ && cursor_row_ <= scroll_bottom_) {
+        scroll_down_region(cursor_row_, scroll_bottom_, param_or_default(params, 0, 1));
+      }
+      break;
+    case 'M':
+      if (cursor_row_ >= scroll_top_ && cursor_row_ <= scroll_bottom_) {
+        scroll_up_region(cursor_row_, scroll_bottom_, param_or_default(params, 0, 1));
+      }
+      break;
+    case 'P':
+      delete_characters(param_or_default(params, 0, 1));
+      break;
+    case 'S':
+      scroll_up_region(scroll_top_, scroll_bottom_, param_or_default(params, 0, 1));
+      break;
+    case 'T':
+      scroll_down_region(scroll_top_, scroll_bottom_, param_or_default(params, 0, 1));
+      break;
+    case 'X':
+      erase_characters(param_or_default(params, 0, 1));
+      break;
+    case '@':
+      insert_characters(param_or_default(params, 0, 1));
+      break;
+    case 'a':
+      move_cursor_relative(0, param_or_default(params, 0, 1));
+      break;
     case 'd':
       move_cursor(param_or_default(params, 0, 1) - 1, cursor_column_);
+      break;
+    case 'e':
+      move_cursor_relative(param_or_default(params, 0, 1), 0);
       break;
     case 'h':
       if (private_csi_mode(csi_buffer_, 47) || private_csi_mode(csi_buffer_, 1047) ||
@@ -486,6 +796,15 @@ void TerminalGrid::apply_csi(char final_byte) {
     case 'm':
       apply_sgr(params);
       break;
+    case 'r':
+      set_scroll_region(param_or_default(params, 0, 1) - 1, param_or_default(params, 1, rows_) - 1);
+      break;
+    case 's':
+      save_cursor();
+      break;
+    case 'u':
+      restore_cursor();
+      break;
     default:
       break;
   }
@@ -497,7 +816,37 @@ void TerminalGrid::apply_sgr(const std::vector<int>& params) {
     return;
   }
 
-  for (const int param : params) {
+  const auto apply_indexed_or_truecolor = [&](std::size_t& index, bool foreground) {
+    if (index + 2 < params.size() && params[index + 1] == 5) {
+      const auto color = std::clamp(params[index + 2], 0, 255);
+      if (foreground) {
+        current_attributes_.foreground = color;
+      } else {
+        current_attributes_.background = color;
+      }
+      index += 2;
+      return true;
+    }
+
+    if (index + 4 < params.size() && params[index + 1] == 2) {
+      const auto red = std::clamp(params[index + 2], 0, 255);
+      const auto green = std::clamp(params[index + 3], 0, 255);
+      const auto blue = std::clamp(params[index + 4], 0, 255);
+      const auto color = 0x01000000 | (red << 16) | (green << 8) | blue;
+      if (foreground) {
+        current_attributes_.foreground = color;
+      } else {
+        current_attributes_.background = color;
+      }
+      index += 4;
+      return true;
+    }
+
+    return false;
+  };
+
+  for (std::size_t index = 0; index < params.size(); ++index) {
+    const int param = params[index];
     if (param == 0) {
       current_attributes_ = {};
     } else if (param == 1) {
@@ -513,17 +862,21 @@ void TerminalGrid::apply_sgr(const std::vector<int>& params) {
     } else if (param == 27) {
       current_attributes_.inverse = false;
     } else if (param >= 30 && param <= 37) {
-      current_attributes_.foreground = static_cast<std::int16_t>(param - 30);
+      current_attributes_.foreground = param - 30;
     } else if (param == 39) {
       current_attributes_.foreground = -1;
     } else if (param >= 40 && param <= 47) {
-      current_attributes_.background = static_cast<std::int16_t>(param - 40);
+      current_attributes_.background = param - 40;
     } else if (param == 49) {
       current_attributes_.background = -1;
+    } else if (param == 38) {
+      (void)apply_indexed_or_truecolor(index, true);
+    } else if (param == 48) {
+      (void)apply_indexed_or_truecolor(index, false);
     } else if (param >= 90 && param <= 97) {
-      current_attributes_.foreground = static_cast<std::int16_t>(8 + param - 90);
+      current_attributes_.foreground = 8 + param - 90;
     } else if (param >= 100 && param <= 107) {
-      current_attributes_.background = static_cast<std::int16_t>(8 + param - 100);
+      current_attributes_.background = 8 + param - 100;
     }
   }
 }

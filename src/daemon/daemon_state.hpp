@@ -10,9 +10,13 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <deque>
+#include <future>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -81,6 +85,83 @@ struct DaemonState {
   std::unordered_map<ClientId, AttachClientRuntime> attach_clients;
   std::vector<AttachWorkerRuntime> attach_workers;
   ClientId next_client_id{1};
+
+  struct RenderMetrics {
+    std::atomic<std::uint64_t> frames_written{0};
+    std::atomic<std::uint64_t> full_frames_written{0};
+    std::atomic<std::uint64_t> partial_frames_written{0};
+    std::atomic<std::uint64_t> skipped_frames{0};
+    std::atomic<std::uint64_t> dirty_panes_rendered{0};
+    std::atomic<std::uint64_t> bytes_written{0};
+    std::atomic<std::uint64_t> write_failures{0};
+  };
+
+  RenderMetrics render_metrics;
+};
+
+class DaemonEventLoop {
+ public:
+  explicit DaemonEventLoop(DaemonState& state);
+  DaemonEventLoop(const DaemonEventLoop&) = delete;
+  DaemonEventLoop& operator=(const DaemonEventLoop&) = delete;
+  ~DaemonEventLoop();
+
+  void start();
+  void stop();
+  void notify_attach_workers_changed();
+
+  template <typename Fn>
+  auto call(Fn&& fn) -> std::invoke_result_t<Fn, DaemonState&> {
+    using Result = std::invoke_result_t<Fn, DaemonState&>;
+
+    if (on_event_thread()) {
+      if constexpr (std::is_void_v<Result>) {
+        std::forward<Fn>(fn)(state_);
+        return;
+      } else {
+        return std::forward<Fn>(fn)(state_);
+      }
+    }
+
+    auto task = std::make_shared<std::packaged_task<Result()>>(
+        [this, fn = std::forward<Fn>(fn)]() mutable -> Result {
+          if constexpr (std::is_void_v<Result>) {
+            fn(state_);
+            return;
+          } else {
+            return fn(state_);
+          }
+        });
+    auto future = task->get_future();
+    enqueue(Event{[task](DaemonState&) mutable { (*task)(); }});
+
+    if constexpr (std::is_void_v<Result>) {
+      future.get();
+      return;
+    } else {
+      return future.get();
+    }
+  }
+
+  template <typename Fn>
+  void post(Fn&& fn) {
+    enqueue(Event{[fn = std::forward<Fn>(fn)](DaemonState& state) mutable { fn(state); }});
+  }
+
+ private:
+  using Event = std::packaged_task<void(DaemonState&)>;
+
+  bool on_event_thread() const;
+  void enqueue(Event event);
+  void run();
+
+  DaemonState& state_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_changed_;
+  std::deque<Event> queue_;
+  std::thread worker_;
+  std::thread::id worker_id_;
+  bool stopping_{false};
 };
 
 struct DaemonStats {
@@ -91,6 +172,13 @@ struct DaemonStats {
   std::size_t runtime_pane_count{0};
   std::size_t live_shell_count{0};
   std::size_t attach_worker_count{0};
+  std::uint64_t render_frames_written{0};
+  std::uint64_t render_full_frames_written{0};
+  std::uint64_t render_partial_frames_written{0};
+  std::uint64_t render_skipped_frames{0};
+  std::uint64_t render_dirty_panes{0};
+  std::uint64_t render_bytes_written{0};
+  std::uint64_t render_write_failures{0};
   bool mouse_enabled{false};
   DaemonConfigState config;
 };

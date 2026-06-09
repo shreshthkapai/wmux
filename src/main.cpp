@@ -6,18 +6,25 @@
 #include "wmux/logging.hpp"
 #include "wmux/terminal_control.hpp"
 
-#include <spdlog/spdlog.h>
-
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+namespace {
+
+bool recoverable_ipc_failure(std::string_view message) {
+  return message.find("wmux: daemon is not running") != std::string_view::npos ||
+         message.find("wmux: failed to write daemon request") != std::string_view::npos ||
+         message.find("wmux: daemon returned an invalid response") != std::string_view::npos ||
+         message.find("wmux: daemon did not become ready") != std::string_view::npos;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   wmux::initialize_logging(wmux::LogRole::Client);
-  spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-  spdlog::debug("wmux client starting");
   wmux::log_event(wmux::LogLevel::Debug, "client", "start");
 
   std::vector<std::string_view> args;
@@ -58,7 +65,19 @@ int main(int argc, char** argv) {
         return wmux::run_attach_client(command);
       }
 
-      const auto response = wmux::send_ipc_request(wmux::make_command_request_json(command));
+      const auto request_json = wmux::make_command_request_json(command);
+      auto response = wmux::send_ipc_request(request_json);
+      if (!response.ok && recoverable_ipc_failure(response.message)) {
+        wmux::log_event(
+            wmux::LogLevel::Warn,
+            "client.ipc",
+            "recoverable_failure",
+            {{"message", response.message}});
+        std::string retry_error;
+        if (wmux::ensure_daemon_running(std::filesystem::path{executable_name}, retry_error)) {
+          response = wmux::send_ipc_request(request_json);
+        }
+      }
       if (response.ok) {
         std::cout << response.message;
         return 0;

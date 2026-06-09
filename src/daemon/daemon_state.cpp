@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace wmux::daemon_internal {
@@ -85,6 +86,78 @@ std::string pane_error_message(PaneError error) {
   return out.str();
 }
 
+DaemonEventLoop::DaemonEventLoop(DaemonState& state) : state_(state) {}
+
+DaemonEventLoop::~DaemonEventLoop() {
+  stop();
+}
+
+void DaemonEventLoop::start() {
+  std::lock_guard lock(queue_mutex_);
+  if (worker_.joinable()) {
+    return;
+  }
+
+  stopping_ = false;
+  worker_ = std::thread([this] { run(); });
+}
+
+void DaemonEventLoop::stop() {
+  {
+    std::lock_guard lock(queue_mutex_);
+    stopping_ = true;
+  }
+  queue_changed_.notify_all();
+
+  if (worker_.joinable() && !on_event_thread()) {
+    worker_.join();
+  }
+}
+
+void DaemonEventLoop::notify_attach_workers_changed() {
+  state_.attach_workers_changed.notify_all();
+}
+
+bool DaemonEventLoop::on_event_thread() const {
+  return worker_id_ != std::thread::id{} && std::this_thread::get_id() == worker_id_;
+}
+
+void DaemonEventLoop::enqueue(Event event) {
+  {
+    std::lock_guard lock(queue_mutex_);
+    if (stopping_) {
+      throw std::runtime_error{"wmux daemon event loop is stopped"};
+    }
+    queue_.push_back(std::move(event));
+  }
+  queue_changed_.notify_one();
+}
+
+void DaemonEventLoop::run() {
+  worker_id_ = std::this_thread::get_id();
+
+  while (true) {
+    Event event;
+    {
+      std::unique_lock lock(queue_mutex_);
+      queue_changed_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+      if (queue_.empty()) {
+        if (stopping_) {
+          break;
+        }
+        continue;
+      }
+
+      event = std::move(queue_.front());
+      queue_.pop_front();
+    }
+
+    event(state_);
+  }
+
+  worker_id_ = {};
+}
+
 void apply_daemon_config(
     DaemonState& state,
     std::filesystem::path path,
@@ -135,6 +208,13 @@ DaemonStats daemon_stats(DaemonState& state) {
       runtime_pane_count,
       live_shell_count,
       state.attach_workers.size(),
+      state.render_metrics.frames_written.load(std::memory_order_relaxed),
+      state.render_metrics.full_frames_written.load(std::memory_order_relaxed),
+      state.render_metrics.partial_frames_written.load(std::memory_order_relaxed),
+      state.render_metrics.skipped_frames.load(std::memory_order_relaxed),
+      state.render_metrics.dirty_panes_rendered.load(std::memory_order_relaxed),
+      state.render_metrics.bytes_written.load(std::memory_order_relaxed),
+      state.render_metrics.write_failures.load(std::memory_order_relaxed),
       state.mouse_enabled,
       state.config};
 }

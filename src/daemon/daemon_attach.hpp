@@ -32,8 +32,8 @@ bool connect_named_pipe(HANDLE pipe);
 AttachDispatch dispatch_attach_connection(
     HANDLE pipe,
     const IpcRequest& request,
-    DaemonState& state);
-void run_windows_attach_listener(DaemonState& state, std::atomic_bool& should_stop);
+    DaemonEventLoop& events);
+void run_windows_attach_listener(DaemonEventLoop& events, std::atomic_bool& should_stop);
 void wake_attach_listener();
 bool wait_for_no_attach_clients(DaemonState& state, std::chrono::milliseconds timeout);
 void reap_finished_attach_workers(DaemonState& state);

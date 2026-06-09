@@ -1,6 +1,7 @@
 #include "wmux/pty_process.hpp"
 
 #include "wmux/logging.hpp"
+#include "wmux/resource_limits.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,8 +25,6 @@
 
 namespace wmux {
 namespace {
-
-constexpr std::size_t kMaxBufferedOutputBytes = 4 * 1024 * 1024;
 
 #ifdef _WIN32
 
@@ -225,6 +224,7 @@ struct PtyProcess::Impl {
   std::deque<StoredOutputChunk> output_chunks;
   TerminalGrid screen;
   std::uint64_t next_sequence{1};
+  std::uint64_t dropped_raw_chunks{0};
   std::size_t buffered_bytes{0};
   bool reader_done{false};
 
@@ -247,9 +247,10 @@ struct PtyProcess::Impl {
     buffered_bytes += bytes.size();
     output_chunks.push_back(StoredOutputChunk{next_sequence++, std::move(bytes)});
 
-    while (buffered_bytes > kMaxBufferedOutputBytes && !output_chunks.empty()) {
+    while (buffered_bytes > kMaxPaneRawOutputBytes && !output_chunks.empty()) {
       buffered_bytes -= output_chunks.front().bytes.size();
       output_chunks.pop_front();
+      ++dropped_raw_chunks;
     }
 
     output_cv.notify_all();
@@ -267,6 +268,8 @@ struct PtyProcess::Impl {
     PtyOutputSnapshot snapshot;
     snapshot.next_sequence = next_sequence;
     snapshot.alive = !reader_done;
+    snapshot.buffered_raw_bytes = buffered_bytes;
+    snapshot.dropped_raw_chunks = dropped_raw_chunks;
     snapshot.screen = screen.snapshot();
     snapshot.scrollback = screen.scrollback_snapshot();
     snapshot.bytes.reserve(buffered_bytes);
@@ -294,9 +297,15 @@ struct PtyProcess::Impl {
     const auto it = std::ranges::find_if(output_chunks, [&](const auto& chunk) {
       return chunk.sequence >= requested_sequence;
     });
+    if (it != output_chunks.end() && it->sequence > requested_sequence) {
+      output.sequence_compacted = true;
+    }
     if (it != output_chunks.end()) {
-      output.bytes = it->bytes;
-      output.next_sequence = it->sequence + 1;
+      output.bytes.reserve(buffered_bytes);
+      for (auto chunk = it; chunk != output_chunks.end(); ++chunk) {
+        output.bytes += chunk->bytes;
+        output.next_sequence = chunk->sequence + 1;
+      }
     }
 
     return output;

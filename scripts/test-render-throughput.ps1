@@ -2,8 +2,11 @@
 param(
   [string]$Wmux = (Join-Path $PSScriptRoot "..\build-vs\Debug\wmux.exe"),
 
-  [ValidateRange(1, 60)]
-  [int]$TimeoutSeconds = 10
+  [ValidateRange(1, 120)]
+  [int]$TimeoutSeconds = 20,
+
+  [ValidateRange(10, 5000)]
+  [int]$Lines = 800
 )
 
 Set-StrictMode -Version Latest
@@ -17,8 +20,15 @@ function Invoke-Wmux {
     [switch]$AllowFailure
   )
 
-  $output = & $script:WmuxPath @Arguments 2>&1
-  $exitCode = $LASTEXITCODE
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $output = & $script:WmuxPath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
   $text = ($output | Out-String).TrimEnd()
 
   if (-not $AllowFailure -and $exitCode -ne 0) {
@@ -33,7 +43,7 @@ function Invoke-Wmux {
 
 function New-AttachFrame {
   param(
-    [ValidateSet("Input", "Detach", "Command", "Resize", "MouseFocus")]
+    [ValidateSet("Input", "Detach")]
     [string]$Type,
 
     [byte[]]$Payload = @()
@@ -42,9 +52,6 @@ function New-AttachFrame {
   $typeByte = switch ($Type) {
     "Input" { 1 }
     "Detach" { 2 }
-    "Command" { 3 }
-    "Resize" { 4 }
-    "MouseFocus" { 7 }
   }
 
   $length = [uint32]$Payload.Length
@@ -89,43 +96,6 @@ function Write-AttachInput {
   Write-PipeBytes -Pipe $Pipe -Bytes (
     New-AttachFrame -Type Input -Payload ([Text.Encoding]::UTF8.GetBytes($Text))
   )
-}
-
-function Write-AttachCommand {
-  param(
-    [Parameter(Mandatory = $true)]
-    [System.IO.Stream]$Pipe,
-
-    [Parameter(Mandatory = $true)]
-    [string]$Command
-  )
-
-  Write-PipeBytes -Pipe $Pipe -Bytes (
-    New-AttachFrame -Type Command -Payload ([Text.Encoding]::UTF8.GetBytes($Command))
-  )
-}
-
-function Write-AttachMouseFocus {
-  param(
-    [Parameter(Mandatory = $true)]
-    [System.IO.Stream]$Pipe,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 32767)]
-    [int]$Column,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(1, 32767)]
-    [int]$Row
-  )
-
-  $payload = [byte[]]::new(4)
-  $payload[0] = [byte]($Column -band 0xff)
-  $payload[1] = [byte](($Column -shr 8) -band 0xff)
-  $payload[2] = [byte]($Row -band 0xff)
-  $payload[3] = [byte](($Row -shr 8) -band 0xff)
-
-  Write-PipeBytes -Pipe $Pipe -Bytes (New-AttachFrame -Type MouseFocus -Payload $payload)
 }
 
 function Write-AttachDetach {
@@ -185,7 +155,7 @@ function Open-Attach {
   )
 
   $pipe = Connect-AttachPipe
-  $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":90,"terminal_rows":20}}' -f $SessionName
+  $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":120,"terminal_rows":30}}' -f $SessionName
   Write-PipeBytes -Pipe $pipe -Bytes ([Text.Encoding]::UTF8.GetBytes($request + "`n"))
 
   $response = Read-ResponseLine -Pipe $pipe | ConvertFrom-Json
@@ -210,7 +180,7 @@ function Read-UntilMarker {
   )
 
   $output = ""
-  $buffer = [byte[]]::new(4096)
+  $buffer = [byte[]]::new(32768)
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
   while ([DateTime]::UtcNow -lt $deadline) {
@@ -229,27 +199,35 @@ function Read-UntilMarker {
     if ([regex]::IsMatch($output, $Pattern)) {
       return $output
     }
+
+    if ($output.Length -gt 1048576) {
+      $output = $output.Substring($output.Length - 524288)
+    }
   }
 
   throw "timed out waiting for $Description`nCaptured output:`n$output"
 }
 
-function Get-SessionCount {
+function Get-StatusField {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$StatusOutput
+    [string]$StatusOutput,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Name
   )
 
-  if ($StatusOutput -match '(?m)^sessions:\s+(\d+)\s*$') {
-    return [int]$Matches[1]
+  $pattern = "(?m)^$([regex]::Escape($Name)):\s+(.+?)\s*$"
+  if ($StatusOutput -match $pattern) {
+    return $Matches[1]
   }
 
-  throw "could not parse session count from server status`n$StatusOutput"
+  throw "could not parse '${Name}' from server status`n$StatusOutput"
 }
 
 $script:WmuxPath = (Resolve-Path -LiteralPath $Wmux).Path
-$sessionName = "wmux_phase11b_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-$marker = "WMUX_PHASE11B_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$sessionName = "wmux_render_perf_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$marker = "WMUX_RENDER_PERF_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $previousDefaultShell = $env:WMUX_DEFAULT_SHELL
 $attach = $null
 
@@ -258,9 +236,9 @@ Write-Host "session: $sessionName"
 
 $env:WMUX_DEFAULT_SHELL = "cmd.exe /D /Q"
 $status = Invoke-Wmux -Arguments @("server", "status")
-$sessionCount = Get-SessionCount -StatusOutput $status.Output
+$sessionCount = [int](Get-StatusField -StatusOutput $status.Output -Name "sessions")
 if ($sessionCount -ne 0) {
-  throw "mouse-focus test requires an empty daemon because it restarts wmux with WMUX_DEFAULT_SHELL=cmd.exe /D /Q"
+  throw "render-throughput test requires an empty daemon because it restarts wmux with WMUX_DEFAULT_SHELL=cmd.exe /D /Q"
 }
 
 [void](Invoke-Wmux -Arguments @("server", "stop"))
@@ -268,37 +246,32 @@ if ($sessionCount -ne 0) {
 
 try {
   [void](Invoke-Wmux -Arguments @("new", "-s", $sessionName))
-
   $attach = Open-Attach -SessionName $sessionName
   [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "initial cmd prompt")
 
-  Write-Host "pane 1: set identity"
-  Write-AttachInput -Pipe $attach -Text "set WMUX_CLICK=P1`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 1 prompt")
+  $started = [Diagnostics.Stopwatch]::StartNew()
+  Write-AttachInput -Pipe $attach -Text "for /L %i in (1,1,$Lines) do @echo $($marker)_%i`r"
+  Write-AttachInput -Pipe $attach -Text "echo $($marker)_DONE`r"
+  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("$($marker)_DONE")) -Description "high-output completion")
+  $started.Stop()
 
-  Write-Host "split horizontally"
-  Write-AttachCommand -Pipe $attach -Command "split-horizontal"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 2 prompt")
+  $status = Invoke-Wmux -Arguments @("server", "status")
+  $partialFrames = [uint64](Get-StatusField -StatusOutput $status.Output -Name "render partial frames")
+  $fullFrames = [uint64](Get-StatusField -StatusOutput $status.Output -Name "render full frames")
+  $renderBytes = [uint64](Get-StatusField -StatusOutput $status.Output -Name "render bytes")
 
-  Write-Host "pane 2: set identity"
-  Write-AttachInput -Pipe $attach -Text "set WMUX_CLICK=P2`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "pane 2 prompt after identity")
-
-  Write-Host "mouse click: focus pane 1"
-  Write-AttachMouseFocus -Pipe $attach -Column 2 -Row 2
-  Write-AttachInput -Pipe $attach -Text "echo %WMUX_CLICK%_$marker`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("P1_$marker")) -Description "pane 1 click-routed input")
-
-  Write-Host "mouse click: focus pane 2"
-  Write-AttachMouseFocus -Pipe $attach -Column 60 -Row 2
-  Write-AttachInput -Pipe $attach -Text "echo %WMUX_CLICK%_$marker`r"
-  [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("P2_$marker")) -Description "pane 2 click-routed input")
+  if ($partialFrames -eq 0) {
+    throw "expected high-output attach to use partial render frames`n$status"
+  }
+  if ($renderBytes -eq 0) {
+    throw "expected render byte counter to increase`n$status"
+  }
 
   Write-AttachDetach -Pipe $attach
   $attach.Dispose()
   $attach = $null
 
-  Write-Host "ok: mouse click focused panes and input routed to active pane"
+  Write-Host "ok: rendered $Lines lines in $($started.ElapsedMilliseconds) ms; full=$fullFrames partial=$partialFrames bytes=$renderBytes"
 }
 finally {
   if ($attach -ne $null) {

@@ -15,11 +15,10 @@
 #endif
 
 namespace wmux::daemon_internal {
+namespace {
 
-std::string default_shell_command() {
+std::string environment_shell_command() {
 #ifdef _WIN32
-  constexpr std::string_view kFallbackDefaultShell = "powershell.exe -NoLogo -NoProfile";
-
   char configured_shell[32768]{};
   const DWORD size = GetEnvironmentVariableA(
       "WMUX_DEFAULT_SHELL",
@@ -27,6 +26,20 @@ std::string default_shell_command() {
       static_cast<DWORD>(sizeof(configured_shell)));
   if (size > 0 && size < sizeof(configured_shell)) {
     return configured_shell;
+  }
+#endif
+
+  return {};
+}
+
+}  // namespace
+
+std::string default_shell_command() {
+#ifdef _WIN32
+  constexpr std::string_view kFallbackDefaultShell = "powershell.exe -NoLogo -NoProfile";
+
+  if (auto shell = environment_shell_command(); !shell.empty()) {
+    return shell;
   }
 
   return std::string{kFallbackDefaultShell};
@@ -36,6 +49,10 @@ std::string default_shell_command() {
 }
 
 std::string configured_shell_command(DaemonState& state) {
+  if (auto shell = environment_shell_command(); !shell.empty()) {
+    return shell;
+  }
+
   std::lock_guard lock(state.mutex);
   return state.config.values.default_shell.empty()
              ? default_shell_command()

@@ -112,7 +112,7 @@ function Open-Attach {
     [System.IO.Pipes.PipeOptions]::None)
 
   $pipe.Connect($TimeoutSeconds * 1000)
-  $request = '{{"type":"AttachSession","session_name":"{0}","terminal_columns":120,"terminal_rows":30}}' -f $SessionName
+  $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":120,"terminal_rows":30}}' -f $SessionName
   Write-PipeBytes -Pipe $pipe -Bytes ([Text.Encoding]::UTF8.GetBytes($request + "`n"))
 
   $response = Read-ResponseLine -Pipe $pipe | ConvertFrom-Json

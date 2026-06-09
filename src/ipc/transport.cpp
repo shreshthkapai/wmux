@@ -1,7 +1,10 @@
 #include "wmux/ipc_transport.hpp"
 
+#include "wmux/logging.hpp"
+
 #include <chrono>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -136,6 +139,12 @@ IpcResponse send_windows_request(std::string_view request_json) {
   if (const auto response = parse_response_json(raw_response)) {
     return *response;
   }
+  log_event(
+      LogLevel::Error,
+      "client.ipc",
+      "invalid_response",
+      {{"bytes", std::to_string(raw_response.size())},
+       {"sample", raw_response.substr(0, 512)}});
   return transport_error("wmux: daemon returned an invalid response\n");
 }
 
@@ -313,6 +322,16 @@ bool wait_for_daemon() {
   return false;
 }
 
+std::string daemon_not_ready_error(const IpcResponse& last_response) {
+  std::ostringstream out;
+  out << "wmux: daemon did not become ready\n";
+  if (!last_response.message.empty()) {
+    out << last_response.message;
+  }
+  out << "wmux: daemon log: " << log_file_path(LogRole::Daemon).string() << "\n";
+  return out.str();
+}
+
 }  // namespace
 
 std::string command_endpoint_name() {
@@ -344,16 +363,25 @@ bool ensure_daemon_running(const std::filesystem::path& executable_path, std::st
   if (existing.ok) {
     return true;
   }
+  log_event(
+      LogLevel::Debug,
+      "client.daemon",
+      "ping_failed",
+      {{"message", existing.message}});
 
   if (!start_daemon_process(executable_path, error)) {
+    log_event(LogLevel::Error, "client.daemon", "start_failed", {{"error", error}});
     return false;
   }
 
   if (!wait_for_daemon()) {
-    error = "wmux: daemon did not become ready\n";
+    const auto final_probe = send_ipc_request(make_ping_request_json());
+    error = daemon_not_ready_error(final_probe);
+    log_event(LogLevel::Error, "client.daemon", "ready_timeout", {{"error", error}});
     return false;
   }
 
+  log_event(LogLevel::Info, "client.daemon", "started");
   return true;
 }
 

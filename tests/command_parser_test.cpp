@@ -9,6 +9,7 @@ void run_ipc_protocol_tests();
 void run_command_mode_tests();
 void run_config_tests();
 void run_copy_selection_tests();
+void run_daemon_render_tests();
 void run_mouse_input_tests();
 void run_paste_buffer_tests();
 void run_session_manager_tests();
@@ -333,6 +334,7 @@ int main() {
   run_command_mode_tests();
   run_config_tests();
   run_copy_selection_tests();
+  run_daemon_render_tests();
   run_mouse_input_tests();
   run_paste_buffer_tests();
   run_session_manager_tests();

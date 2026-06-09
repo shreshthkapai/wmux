@@ -3,6 +3,7 @@
 #include "daemon_shell.hpp"
 #include "wmux/ipc_protocol.hpp"
 #include "wmux/logging.hpp"
+#include "wmux/resource_limits.hpp"
 
 #include <chrono>
 #include <memory>
@@ -366,7 +367,7 @@ std::string handle_session_request(const IpcRequest& request, DaemonState& state
     return handle_list_sessions(state);
   }
 
-  if (request.type == "AttachSession") {
+  if (request.type == "AttachStart" || request.type == "AttachSession") {
     return make_response_json(false, "wmux: attach requires the streaming client transport\n");
   }
 
@@ -422,6 +423,18 @@ std::string handle_request(
     out << "runtime panes: " << stats.runtime_pane_count << "\n";
     out << "live shells: " << stats.live_shell_count << "\n";
     out << "attach workers: " << stats.attach_worker_count << "\n";
+    out << "render frames: " << stats.render_frames_written << "\n";
+    out << "render full frames: " << stats.render_full_frames_written << "\n";
+    out << "render partial frames: " << stats.render_partial_frames_written << "\n";
+    out << "render skipped frames: " << stats.render_skipped_frames << "\n";
+    out << "render dirty panes: " << stats.render_dirty_panes << "\n";
+    out << "render bytes: " << stats.render_bytes_written << "\n";
+    out << "render write failures: " << stats.render_write_failures << "\n";
+    out << "limit pane raw bytes: " << kMaxPaneRawOutputBytes << "\n";
+    out << "limit pane scrollback lines: " << kMaxPaneScrollbackLines << "\n";
+    out << "limit paste bytes: " << kMaxPasteBufferBytes << "\n";
+    out << "limit attach input bytes: " << kMaxAttachInputPayloadBytes << "\n";
+    out << "limit attach render bytes: " << kMaxAttachRenderFrameBytes << "\n";
     out << "mouse: " << (stats.mouse_enabled ? "on" : "off") << "\n";
     out << "daemon log: " << wmux::log_file_path(LogRole::Daemon).string() << "\n";
     out << "client log: " << wmux::log_file_path(LogRole::Client).string() << "\n";

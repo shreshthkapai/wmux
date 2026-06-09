@@ -1,4 +1,5 @@
 #include "wmux/config.hpp"
+#include "wmux/resource_limits.hpp"
 
 #include <cassert>
 #include <string>
@@ -84,6 +85,19 @@ void rejects_unterminated_quote() {
   assert(result.errors[0].message == "unterminated quoted value");
 }
 
+void rejects_oversized_lines() {
+  std::string text(wmux::kMaxConfigLineBytes + 1, 'x');
+  text += "\nset -g mouse on\n";
+
+  const auto result = wmux::parse_config_text(text);
+
+  assert(!result.ok());
+  assert(result.errors.size() == 1);
+  assert(result.errors[0].line == 1);
+  assert(result.errors[0].message == "config line is too long");
+  assert(result.config.mouse_enabled);
+}
+
 void missing_config_file_uses_defaults() {
   const auto result = wmux::load_config_file("definitely-missing-wmux-test.conf");
 
@@ -102,5 +116,6 @@ void run_config_tests() {
   rejects_bad_prefix_format();
   rejects_wrong_shape();
   rejects_unterminated_quote();
+  rejects_oversized_lines();
   missing_config_file_uses_defaults();
 }

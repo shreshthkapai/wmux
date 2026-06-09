@@ -15,6 +15,19 @@ wmux::PtyOutputSnapshot snapshot_from_lines(
   return snapshot;
 }
 
+wmux::TerminalLineSnapshot line_with_cells(
+    std::initializer_list<std::string> cells,
+    bool wrapped = false) {
+  wmux::TerminalLineSnapshot line;
+  line.wrapped = wrapped;
+  for (const auto& cell : cells) {
+    line.cells.push_back(cell);
+    line.text += cell.empty() ? " " : cell;
+    line.attributes.push_back({});
+  }
+  return line;
+}
+
 wmux::PtyOutputSnapshot snapshot_from_scrollback_and_screen(
     std::initializer_list<wmux::TerminalLineSnapshot> scrollback,
     std::initializer_list<wmux::TerminalLineSnapshot> screen) {
@@ -63,6 +76,27 @@ void joins_wrapped_scrollback_and_visible_screen_lines() {
       5);
 
   assert(copied == "bcdefg");
+}
+
+void selects_across_scrollback_and_live_grid_with_hard_breaks() {
+  const auto snapshot = snapshot_from_scrollback_and_screen(
+      {
+          wmux::TerminalLineSnapshot{"old1 ", false},
+          wmux::TerminalLineSnapshot{"old2 ", false},
+      },
+      {
+          wmux::TerminalLineSnapshot{"new1 ", false},
+          wmux::TerminalLineSnapshot{"new2 ", false},
+      });
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{1, 1},
+          wmux::CopySelectionPoint{2, 3}},
+      5);
+
+  assert(copied == "ld2\r\nnew1");
 }
 
 void uses_crlf_between_hard_lines() {
@@ -181,6 +215,46 @@ void copies_only_alternate_screen_visible_lines() {
   assert(copied == "alt1\r\nalt2");
 }
 
+void ignores_normal_scrollback_while_alternate_screen_is_active() {
+  auto snapshot = snapshot_from_scrollback_and_screen(
+      {
+          wmux::TerminalLineSnapshot{"old1 ", false},
+          wmux::TerminalLineSnapshot{"old2 ", false},
+      },
+      {
+          wmux::TerminalLineSnapshot{"top  ", false},
+      });
+  snapshot.screen.alternate_screen = true;
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{0, 0},
+          wmux::CopySelectionPoint{2, 4}},
+      5);
+
+  assert(copied == "top");
+}
+
+void copies_visible_cleared_screen_blanks_without_erasing_scrollback() {
+  const auto snapshot = snapshot_from_scrollback_and_screen(
+      {
+          wmux::TerminalLineSnapshot{"old  ", false},
+      },
+      {
+          wmux::TerminalLineSnapshot{"     ", false},
+      });
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{0, 0},
+          wmux::CopySelectionPoint{1, 4}},
+      5);
+
+  assert(copied == "old\r\n");
+}
+
 void keeps_complete_utf8_sequences_when_selected() {
   std::string line{"ab", 2};
   line.push_back(static_cast<char>(0xce));
@@ -204,10 +278,46 @@ void keeps_complete_utf8_sequences_when_selected() {
   assert(copied == expected);
 }
 
+void copies_wide_utf8_cells_by_terminal_columns() {
+  const auto snapshot = snapshot_from_lines({
+      line_with_cells({"a", "\xe4\xb8\xad", "", "z", " "}, false),
+  });
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{0, 0},
+          wmux::CopySelectionPoint{0, 3}},
+      5);
+
+  assert(copied == "a\xe4\xb8\xadz");
+}
+
+void copies_wide_utf8_cells_across_wrapped_lines() {
+  const auto snapshot = snapshot_from_scrollback_and_screen(
+      {
+          line_with_cells({"a", "\xe4\xb8\xad", "", " "}, true),
+      },
+      {
+          line_with_cells({"b", " ", " ", " "}, false),
+      });
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{0, 0},
+          wmux::CopySelectionPoint{1, 0}},
+      4);
+
+  std::string expected{"a"};
+  expected += "\xe4\xb8\xad";
+  expected += "b";
+  assert(copied == expected);
+}
+
 void drops_incomplete_utf8_boundary_bytes() {
   std::string line{"ab", 2};
   line.push_back(static_cast<char>(0xce));
-  line.push_back(static_cast<char>(0xbb));
   line.push_back(' ');
 
   const auto snapshot = snapshot_from_lines({
@@ -243,6 +353,7 @@ void falls_back_to_plain_line_text() {
 void run_copy_selection_tests() {
   joins_soft_wrapped_lines_without_newline();
   joins_wrapped_scrollback_and_visible_screen_lines();
+  selects_across_scrollback_and_live_grid_with_hard_breaks();
   uses_crlf_between_hard_lines();
   preserves_empty_hard_lines();
   preserves_hard_break_when_selection_ends_at_line_boundary();
@@ -250,7 +361,11 @@ void run_copy_selection_tests() {
   clamps_out_of_bounds_selection_after_resize();
   clamps_columns_to_current_line_width_after_resize();
   copies_only_alternate_screen_visible_lines();
+  ignores_normal_scrollback_while_alternate_screen_is_active();
+  copies_visible_cleared_screen_blanks_without_erasing_scrollback();
   keeps_complete_utf8_sequences_when_selected();
+  copies_wide_utf8_cells_by_terminal_columns();
+  copies_wide_utf8_cells_across_wrapped_lines();
   drops_incomplete_utf8_boundary_bytes();
   falls_back_to_plain_line_text();
 }

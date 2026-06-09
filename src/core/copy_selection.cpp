@@ -1,7 +1,9 @@
 #include "wmux/copy_selection.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace wmux {
 namespace {
@@ -60,18 +62,104 @@ void trim_trailing_horizontal_space(std::string& value) {
   }
 }
 
-std::string normalized_line_text(TerminalLineSnapshot line, std::size_t width) {
-  if (line.text.size() < width) {
-    line.text.append(width - line.text.size(), ' ');
-  }
-  if (line.text.size() > width) {
-    line.text.resize(width);
-  }
-  return line.text;
-}
-
 bool is_utf8_continuation(unsigned char byte) {
   return (byte & 0xc0) == 0x80;
+}
+
+bool is_combining_codepoint(std::uint32_t codepoint) {
+  return (codepoint >= 0x0300 && codepoint <= 0x036f) ||
+         (codepoint >= 0x1ab0 && codepoint <= 0x1aff) ||
+         (codepoint >= 0x1dc0 && codepoint <= 0x1dff) ||
+         (codepoint >= 0x20d0 && codepoint <= 0x20ff) ||
+         (codepoint >= 0xfe20 && codepoint <= 0xfe2f);
+}
+
+bool is_wide_codepoint(std::uint32_t codepoint) {
+  return (codepoint >= 0x1100 &&
+          (codepoint <= 0x115f || codepoint == 0x2329 || codepoint == 0x232a ||
+           (codepoint >= 0x2e80 && codepoint <= 0xa4cf && codepoint != 0x303f) ||
+           (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+           (codepoint >= 0xf900 && codepoint <= 0xfaff) ||
+           (codepoint >= 0xfe10 && codepoint <= 0xfe19) ||
+           (codepoint >= 0xfe30 && codepoint <= 0xfe6f) ||
+           (codepoint >= 0xff00 && codepoint <= 0xff60) ||
+           (codepoint >= 0xffe0 && codepoint <= 0xffe6) ||
+           (codepoint >= 0x1f300 && codepoint <= 0x1faff)));
+}
+
+std::vector<std::string> cells_from_text(std::string_view value, std::size_t width) {
+  std::vector<std::string> cells;
+  cells.reserve(width);
+
+  for (std::size_t index = 0; index < value.size() && cells.size() < width;) {
+    const auto byte = static_cast<unsigned char>(value[index]);
+    std::size_t length = 1;
+    std::uint32_t codepoint = byte;
+
+    if (byte < 0x80) {
+      length = 1;
+    } else if (byte >= 0xc2 && byte <= 0xdf && index + 1 < value.size() &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 1]))) {
+      length = 2;
+      codepoint = static_cast<std::uint32_t>(
+          ((byte & 0x1f) << 6) |
+          (static_cast<unsigned char>(value[index + 1]) & 0x3f));
+    } else if (byte >= 0xe0 && byte <= 0xef && index + 2 < value.size() &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 1])) &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 2]))) {
+      length = 3;
+      codepoint = static_cast<std::uint32_t>(
+          ((byte & 0x0f) << 12) |
+          ((static_cast<unsigned char>(value[index + 1]) & 0x3f) << 6) |
+          (static_cast<unsigned char>(value[index + 2]) & 0x3f));
+    } else if (byte >= 0xf0 && byte <= 0xf4 && index + 3 < value.size() &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 1])) &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 2])) &&
+               is_utf8_continuation(static_cast<unsigned char>(value[index + 3]))) {
+      length = 4;
+      codepoint = static_cast<std::uint32_t>(
+          ((byte & 0x07) << 18) |
+          ((static_cast<unsigned char>(value[index + 1]) & 0x3f) << 12) |
+          ((static_cast<unsigned char>(value[index + 2]) & 0x3f) << 6) |
+          (static_cast<unsigned char>(value[index + 3]) & 0x3f));
+    } else {
+      ++index;
+      continue;
+    }
+
+    const auto glyph = std::string{value.substr(index, length)};
+    index += length;
+    if (is_combining_codepoint(codepoint)) {
+      if (!cells.empty() && !cells.back().empty()) {
+        cells.back() += glyph;
+      }
+      continue;
+    }
+
+    cells.push_back(glyph);
+    if (is_wide_codepoint(codepoint) && cells.size() < width) {
+      cells.emplace_back();
+    }
+  }
+
+  while (cells.size() < width) {
+    cells.emplace_back(" ");
+  }
+  if (cells.size() > width) {
+    cells.resize(width);
+  }
+  return cells;
+}
+
+std::vector<std::string> normalized_line_cells(const TerminalLineSnapshot& line, std::size_t width) {
+  auto cells = line.cells.empty() ? cells_from_text(line.text, width) : line.cells;
+  if (cells.size() < width) {
+    cells.insert(cells.end(), width - cells.size(), " ");
+  }
+  if (cells.size() > width) {
+    cells.resize(width);
+  }
+  return cells;
 }
 
 std::string sanitize_utf8_boundaries(std::string_view value) {
@@ -149,17 +237,25 @@ std::string extract_copy_selection_text(
 
   for (auto line_index = first.line; line_index <= last.line; ++line_index) {
     const auto line = line_snapshot_at(snapshot, line_index);
-    const auto text = normalized_line_text(line, line_width);
+    const auto cells = normalized_line_cells(line, line_width);
     const auto start_column = line_index == first.line ? first.column : std::size_t{0};
     const auto end_column = line_index == last.line ? last.column : line_width - 1;
-    if (start_column <= end_column && start_column < text.size()) {
-      copied.append(
-          std::string_view{text}.substr(start_column, end_column - start_column + 1));
+    std::string segment;
+    if (start_column <= end_column && start_column < cells.size()) {
+      const auto last_column = std::min(end_column, cells.size() - 1);
+      for (auto column = start_column; column <= last_column; ++column) {
+        segment += cells[column];
+      }
     }
 
-    if (line_index != last.line && !line.wrapped) {
-      trim_trailing_horizontal_space(copied);
-      copied.append("\r\n");
+    if (line_index != last.line) {
+      trim_trailing_horizontal_space(segment);
+      copied += segment;
+      if (!line.wrapped) {
+        copied.append("\r\n");
+      }
+    } else {
+      copied += segment;
     }
   }
 

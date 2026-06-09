@@ -1,5 +1,7 @@
 #include "wmux/paste_buffer.hpp"
 
+#include "wmux/resource_limits.hpp"
+
 namespace wmux {
 
 std::string normalize_paste_text_for_terminal(std::string_view text) {
@@ -25,6 +27,14 @@ std::string normalize_paste_text_for_terminal(std::string_view text) {
   }
 
   return normalized;
+}
+
+std::string bounded_paste_buffer_text(std::string_view text) {
+  if (text.size() <= kMaxPasteBufferBytes) {
+    return std::string{text};
+  }
+
+  return std::string{text.substr(0, kMaxPasteBufferBytes)};
 }
 
 }  // namespace wmux

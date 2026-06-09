@@ -1,6 +1,8 @@
 #include "wmux/ipc_protocol.hpp"
 
+#include <cctype>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <utility>
 
@@ -88,14 +90,22 @@ void append_json_uint(std::ostringstream& out, std::string_view key, std::uint16
   out << ",\"" << key << "\":" << value;
 }
 
-std::optional<std::string> find_json_string(std::string_view json, std::string_view key) {
-  const std::string pattern = "\"" + std::string{key} + "\":\"";
-  const auto start = json.find(pattern);
-  if (start == std::string_view::npos) {
+std::size_t skip_json_ws(std::string_view json, std::size_t index) {
+  while (index < json.size() &&
+         std::isspace(static_cast<unsigned char>(json[index])) != 0) {
+    ++index;
+  }
+  return index;
+}
+
+std::optional<std::pair<std::string, std::size_t>> parse_json_string_at(
+    std::string_view json,
+    std::size_t index) {
+  if (index >= json.size() || json[index] != '"') {
     return std::nullopt;
   }
 
-  const auto value_start = start + pattern.size();
+  const auto value_start = index + 1;
   bool escaping = false;
   for (std::size_t i = value_start; i < json.size(); ++i) {
     const char ch = json[i];
@@ -110,25 +120,132 @@ std::optional<std::string> find_json_string(std::string_view json, std::string_v
     }
 
     if (ch == '"') {
-      return unescape_json_string(json.substr(value_start, i - value_start));
+      return std::pair{unescape_json_string(json.substr(value_start, i - value_start)), i + 1};
     }
   }
 
   return std::nullopt;
 }
 
-std::optional<bool> find_json_bool(std::string_view json, std::string_view key) {
-  const std::string pattern = "\"" + std::string{key} + "\":";
-  const auto start = json.find(pattern);
-  if (start == std::string_view::npos) {
+std::optional<std::size_t> skip_json_value(std::string_view json, std::size_t index) {
+  if (index >= json.size()) {
     return std::nullopt;
   }
 
-  const auto value_start = start + pattern.size();
-  if (json.substr(value_start, 4) == "true") {
+  if (json[index] == '"') {
+    const auto parsed = parse_json_string_at(json, index);
+    if (!parsed) {
+      return std::nullopt;
+    }
+    return parsed->second;
+  }
+
+  if (json[index] == '{' || json[index] == '[') {
+    const char open = json[index];
+    const char close = open == '{' ? '}' : ']';
+    int depth = 1;
+    bool escaping = false;
+    bool in_string = false;
+    for (std::size_t i = index + 1; i < json.size(); ++i) {
+      const char ch = json[i];
+      if (in_string) {
+        if (escaping) {
+          escaping = false;
+        } else if (ch == '\\') {
+          escaping = true;
+        } else if (ch == '"') {
+          in_string = false;
+        }
+        continue;
+      }
+
+      if (ch == '"') {
+        in_string = true;
+      } else if (ch == open) {
+        ++depth;
+      } else if (ch == close) {
+        --depth;
+        if (depth == 0) {
+          return i + 1;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::size_t end = index;
+  while (end < json.size() && json[end] != ',' && json[end] != '}') {
+    ++end;
+  }
+  return end;
+}
+
+std::optional<std::string_view> find_json_value(std::string_view json, std::string_view key) {
+  std::size_t index = skip_json_ws(json, 0);
+  if (index >= json.size() || json[index] != '{') {
+    return std::nullopt;
+  }
+  ++index;
+
+  while (index < json.size()) {
+    index = skip_json_ws(json, index);
+    if (index < json.size() && json[index] == '}') {
+      return std::nullopt;
+    }
+
+    const auto parsed_key = parse_json_string_at(json, index);
+    if (!parsed_key) {
+      return std::nullopt;
+    }
+    index = skip_json_ws(json, parsed_key->second);
+    if (index >= json.size() || json[index] != ':') {
+      return std::nullopt;
+    }
+    const auto value_start = skip_json_ws(json, index + 1);
+    const auto value_end = skip_json_value(json, value_start);
+    if (!value_end) {
+      return std::nullopt;
+    }
+
+    if (parsed_key->first == key) {
+      return json.substr(value_start, *value_end - value_start);
+    }
+
+    index = skip_json_ws(json, *value_end);
+    if (index < json.size() && json[index] == ',') {
+      ++index;
+      continue;
+    }
+    if (index < json.size() && json[index] == '}') {
+      return std::nullopt;
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::optional<std::string> find_json_string(std::string_view json, std::string_view key) {
+  const auto value = find_json_value(json, key);
+  if (!value) {
+    return std::nullopt;
+  }
+  const auto parsed = parse_json_string_at(*value, 0);
+  if (!parsed || parsed->second != value->size()) {
+    return std::nullopt;
+  }
+  return parsed->first;
+}
+
+std::optional<bool> find_json_bool(std::string_view json, std::string_view key) {
+  const auto value = find_json_value(json, key);
+  if (!value) {
+    return std::nullopt;
+  }
+
+  if (*value == "true") {
     return true;
   }
-  if (json.substr(value_start, 5) == "false") {
+  if (*value == "false") {
     return false;
   }
 
@@ -136,19 +253,16 @@ std::optional<bool> find_json_bool(std::string_view json, std::string_view key) 
 }
 
 std::optional<std::uint16_t> find_json_uint(std::string_view json, std::string_view key) {
-  const std::string pattern = "\"" + std::string{key} + "\":";
-  const auto start = json.find(pattern);
-  if (start == std::string_view::npos) {
+  const auto value_text = find_json_value(json, key);
+  if (!value_text) {
     return std::nullopt;
   }
 
-  const auto value_start = start + pattern.size();
   std::uint32_t value = 0;
   bool saw_digit = false;
-  for (std::size_t i = value_start; i < json.size(); ++i) {
-    const char ch = json[i];
+  for (const char ch : *value_text) {
     if (ch < '0' || ch > '9') {
-      break;
+      return std::nullopt;
     }
 
     saw_digit = true;
@@ -221,6 +335,34 @@ std::string make_attach_frame(AttachFrameType type, std::string_view payload) {
   return frame;
 }
 
+std::optional<std::uint32_t> max_payload_size_for_attach_frame(AttachFrameType type) {
+  switch (type) {
+    case AttachFrameType::Input:
+      return kMaxAttachInputPayloadBytes;
+    case AttachFrameType::Detach:
+      return 0;
+    case AttachFrameType::Command:
+    case AttachFrameType::CommandMode:
+      return kMaxAttachCommandPayloadBytes;
+    case AttachFrameType::Resize:
+      return kMaxAttachResizePayloadBytes;
+    case AttachFrameType::Status:
+      return kMaxAttachCommandPayloadBytes;
+    case AttachFrameType::MouseFocus:
+      return 4;
+    case AttachFrameType::MouseEvent:
+      return kMaxAttachMousePayloadBytes;
+    case AttachFrameType::Scroll:
+      return kMaxAttachScrollPayloadBytes;
+    case AttachFrameType::CopyMode:
+      return kMaxAttachCopyModePayloadBytes;
+    case AttachFrameType::Paste:
+      return kMaxAttachPastePayloadBytes;
+  }
+
+  return std::nullopt;
+}
+
 }  // namespace
 
 std::string make_ping_request_json() {
@@ -266,7 +408,7 @@ std::string make_attach_request_json(
     std::uint16_t terminal_columns,
     std::uint16_t terminal_rows) {
   std::ostringstream out;
-  out << "{\"type\":\"AttachSession\"";
+  out << "{\"type\":\"AttachStart\"";
 
   if (!command.session_name.empty()) {
     append_json_field(out, "session_name", command.session_name);
@@ -278,6 +420,35 @@ std::string make_attach_request_json(
 
   out << "}\n";
   return out.str();
+}
+
+std::string_view attach_frame_type_name(AttachFrameType type) {
+  switch (type) {
+    case AttachFrameType::Input:
+      return "Input";
+    case AttachFrameType::Detach:
+      return "Detach";
+    case AttachFrameType::Command:
+      return "Command";
+    case AttachFrameType::Resize:
+      return "Resize";
+    case AttachFrameType::Status:
+      return "Status";
+    case AttachFrameType::CommandMode:
+      return "CommandMode";
+    case AttachFrameType::MouseFocus:
+      return "MouseFocus";
+    case AttachFrameType::MouseEvent:
+      return "Mouse";
+    case AttachFrameType::Scroll:
+      return "Scroll";
+    case AttachFrameType::CopyMode:
+      return "CopyMode";
+    case AttachFrameType::Paste:
+      return "Paste";
+  }
+
+  return "Unknown";
 }
 
 std::optional<IpcRequest> parse_request_json(std::string_view json) {
@@ -493,7 +664,9 @@ std::optional<AttachFrameHeader> parse_attach_frame_header(std::string_view head
       (static_cast<std::uint32_t>(static_cast<unsigned char>(header[4])) << 8) |
       (static_cast<std::uint32_t>(static_cast<unsigned char>(header[5])) << 16) |
       (static_cast<std::uint32_t>(static_cast<unsigned char>(header[6])) << 24);
-  if (parsed.payload_size > kMaxAttachFramePayloadSize) {
+  const auto max_payload_size = max_payload_size_for_attach_frame(parsed.type);
+  if (!max_payload_size || parsed.payload_size > *max_payload_size ||
+      parsed.payload_size > kMaxAttachFramePayloadSize) {
     return std::nullopt;
   }
 
@@ -512,7 +685,8 @@ std::optional<std::pair<std::uint16_t, std::uint16_t>> parse_attach_resize_paylo
   const auto rows =
       static_cast<std::uint16_t>(static_cast<unsigned char>(payload[2])) |
       static_cast<std::uint16_t>(static_cast<unsigned char>(payload[3]) << 8);
-  if (columns == 0 || rows == 0 || columns > 32767 || rows > 32767) {
+  if (columns == 0 || rows == 0 || columns > kMaxAttachTerminalColumns ||
+      rows > kMaxAttachTerminalRows) {
     return std::nullopt;
   }
 
