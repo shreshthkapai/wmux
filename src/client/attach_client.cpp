@@ -755,8 +755,20 @@ bool send_processed_input(
 void stream_output(HANDLE pipe, HANDLE output, std::atomic_bool& stop_requested, HANDLE stop_event) {
   char buffer[4096];
   while (!stop_requested) {
+    DWORD bytes_available = 0;
+    if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytes_available, nullptr)) {
+      break;
+    }
+
+    if (bytes_available == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+      continue;
+    }
+
     DWORD bytes_read = 0;
-    const BOOL ok = ReadFile(pipe, buffer, static_cast<DWORD>(sizeof(buffer)), &bytes_read, nullptr);
+    const auto bytes_to_read =
+        static_cast<DWORD>(std::min<std::size_t>(sizeof(buffer), bytes_available));
+    const BOOL ok = ReadFile(pipe, buffer, bytes_to_read, &bytes_read, nullptr);
     if (!ok || bytes_read == 0) {
       break;
     }
