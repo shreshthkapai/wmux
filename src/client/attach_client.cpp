@@ -331,6 +331,52 @@ std::wstring widen(std::string_view value) {
 }
 
 bool write_all(HANDLE handle, std::string_view bytes) {
+  DWORD console_mode = 0;
+  if (GetConsoleMode(handle, &console_mode) != 0) {
+    if (bytes.empty()) {
+      return true;
+    }
+
+    const int required = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        bytes.data(),
+        static_cast<int>(bytes.size()),
+        nullptr,
+        0);
+    if (required <= 0) {
+      return false;
+    }
+
+    std::wstring wide(static_cast<std::size_t>(required), L'\0');
+    const int converted = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        bytes.data(),
+        static_cast<int>(bytes.size()),
+        wide.data(),
+        required);
+    if (converted != required) {
+      return false;
+    }
+
+    std::wstring_view remaining{wide};
+    while (!remaining.empty()) {
+      const auto chars_to_write =
+          static_cast<DWORD>(std::min<std::size_t>(remaining.size(), 32 * 1024));
+      DWORD chars_written = 0;
+      const BOOL ok =
+          WriteConsoleW(handle, remaining.data(), chars_to_write, &chars_written, nullptr);
+      if (!ok || chars_written == 0) {
+        return false;
+      }
+
+      remaining.remove_prefix(chars_written);
+    }
+
+    return true;
+  }
+
   while (!bytes.empty()) {
     const auto bytes_to_write =
         static_cast<DWORD>(std::min<std::size_t>(bytes.size(), 64 * 1024));
@@ -887,15 +933,13 @@ int run_attach_client(const CommandLine& command) {
     std::cerr << "wmux: attach requires an interactive Windows console\n";
     return 1;
   }
-  if (!output_code_page_guard.active()) {
-    std::cerr << "wmux: failed to enable UTF-8 console output\n";
-    return 1;
-  }
 
   g_attach_original_input_mode.store(input_guard.original_mode());
   g_attach_original_output_mode.store(output_guard.original_mode());
-  g_attach_original_output_code_page.store(output_code_page_guard.original_code_page());
-  g_attach_output_code_page_active.store(true);
+  if (output_code_page_guard.active()) {
+    g_attach_original_output_code_page.store(output_code_page_guard.original_code_page());
+    g_attach_output_code_page_active.store(true);
+  }
 
   const auto size = current_terminal_size(output);
 
