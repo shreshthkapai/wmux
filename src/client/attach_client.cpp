@@ -39,8 +39,10 @@ std::atomic<HANDLE> g_attach_input_handle{nullptr};
 std::atomic<HANDLE> g_attach_output_handle{nullptr};
 std::atomic<DWORD> g_attach_original_input_mode{0};
 std::atomic<DWORD> g_attach_original_output_mode{0};
+std::atomic<UINT> g_attach_original_output_code_page{0};
 std::atomic_bool g_attach_input_mode_active{false};
 std::atomic_bool g_attach_output_mode_active{false};
+std::atomic_bool g_attach_output_code_page_active{false};
 
 bool write_all(HANDLE handle, std::string_view bytes);
 bool valid_handle(HANDLE handle);
@@ -137,6 +139,35 @@ class ConsoleModeGuard {
   bool active_{false};
 };
 
+class ConsoleOutputCodePageGuard {
+ public:
+  ConsoleOutputCodePageGuard() {
+    original_code_page_ = GetConsoleOutputCP();
+    active_ = original_code_page_ != 0 && SetConsoleOutputCP(CP_UTF8) != 0;
+  }
+
+  ConsoleOutputCodePageGuard(const ConsoleOutputCodePageGuard&) = delete;
+  ConsoleOutputCodePageGuard& operator=(const ConsoleOutputCodePageGuard&) = delete;
+
+  ~ConsoleOutputCodePageGuard() {
+    if (active_) {
+      SetConsoleOutputCP(original_code_page_);
+    }
+  }
+
+  bool active() const {
+    return active_;
+  }
+
+  UINT original_code_page() const {
+    return original_code_page_;
+  }
+
+ private:
+  UINT original_code_page_{0};
+  bool active_{false};
+};
+
 class TerminalVisualGuard {
  public:
   explicit TerminalVisualGuard(HANDLE output) : output_(output) {
@@ -200,6 +231,10 @@ void restore_attach_terminal_from_signal() {
   if (valid_handle(output) && g_attach_output_mode_active.load()) {
     SetConsoleMode(output, g_attach_original_output_mode.load());
   }
+
+  if (g_attach_output_code_page_active.load()) {
+    SetConsoleOutputCP(g_attach_original_output_code_page.load());
+  }
 }
 
 BOOL WINAPI attach_console_ctrl_handler(DWORD control_type) {
@@ -245,6 +280,7 @@ class AttachConsoleCtrlGuard {
     g_attach_output_handle.store(nullptr);
     g_attach_input_mode_active.store(false);
     g_attach_output_mode_active.store(false);
+    g_attach_output_code_page_active.store(false);
   }
 
  private:
@@ -846,13 +882,20 @@ int run_attach_client(const CommandLine& command) {
 
   ConsoleModeGuard input_guard{input};
   ConsoleModeGuard output_guard{output};
+  ConsoleOutputCodePageGuard output_code_page_guard;
   if (!input_guard.active() || !output_guard.active()) {
     std::cerr << "wmux: attach requires an interactive Windows console\n";
+    return 1;
+  }
+  if (!output_code_page_guard.active()) {
+    std::cerr << "wmux: failed to enable UTF-8 console output\n";
     return 1;
   }
 
   g_attach_original_input_mode.store(input_guard.original_mode());
   g_attach_original_output_mode.store(output_guard.original_mode());
+  g_attach_original_output_code_page.store(output_code_page_guard.original_code_page());
+  g_attach_output_code_page_active.store(true);
 
   const auto size = current_terminal_size(output);
 
