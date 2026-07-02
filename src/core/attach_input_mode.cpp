@@ -223,6 +223,7 @@ std::vector<AttachInputAction> handle_prefix_event(
       return actions;
     case AttachKeyActionKind::CommandPrompt:
       start_command_prompt(mode.command_prompt);
+      mode.command_prompt.command = action.command;
       enter_mode(mode, AttachClientModeKind::CommandPrompt);
       actions.push_back(status_action(command_prompt_status_text(mode.command_prompt)));
       return actions;

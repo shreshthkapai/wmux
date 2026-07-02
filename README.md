@@ -189,6 +189,8 @@ Ctrl+b c       new window
 Ctrl+b n       next window
 Ctrl+b p       previous window
 Ctrl+b 0..9    select window by index
+Ctrl+b ,       rename window
+Ctrl+b $       rename session
 Ctrl+b %       split horizontal
 Ctrl+b "       split vertical
 Ctrl+b arrows  switch pane

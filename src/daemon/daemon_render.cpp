@@ -598,6 +598,95 @@ void mark_vertical_border(
   }
 }
 
+bool border_cell_has_mask(
+    const std::vector<BorderCell>& cells,
+    int columns,
+    int rows,
+    int column,
+    int row,
+    unsigned char mask) {
+  if (column < 0 || row < 0 || column >= columns || row >= rows) {
+    return false;
+  }
+  const auto& cell = cells[static_cast<std::size_t>(row * columns + column)];
+  return (cell.mask & mask) != 0;
+}
+
+bool border_cell_has_horizontal_axis(
+    const std::vector<BorderCell>& cells,
+    int columns,
+    int rows,
+    int column,
+    int row) {
+  if (column < 0 || row < 0 || column >= columns || row >= rows) {
+    return false;
+  }
+  const auto& cell = cells[static_cast<std::size_t>(row * columns + column)];
+  return (cell.mask & (kBorderLeft | kBorderRight)) != 0;
+}
+
+bool border_cell_has_vertical_axis(
+    const std::vector<BorderCell>& cells,
+    int columns,
+    int rows,
+    int column,
+    int row) {
+  if (column < 0 || row < 0 || column >= columns || row >= rows) {
+    return false;
+  }
+  const auto& cell = cells[static_cast<std::size_t>(row * columns + column)];
+  return (cell.mask & (kBorderUp | kBorderDown)) != 0;
+}
+
+void close_shared_border_connector_gaps(
+    std::vector<BorderCell>& cells,
+    int columns,
+    int rows) {
+  auto closed = cells;
+  for (int row = 0; row < rows; ++row) {
+    for (int column = 0; column < columns; ++column) {
+      auto& cell = closed[static_cast<std::size_t>(row * columns + column)];
+      if (cell.mask == 0) {
+        continue;
+      }
+
+      if ((cell.mask & kBorderLeft) == 0 && (
+              border_cell_has_mask(cells, columns, rows, column - 1, row, kBorderRight) ||
+              ((cell.mask & (kBorderLeft | kBorderRight)) != 0 &&
+               border_cell_has_vertical_axis(cells, columns, rows, column - 1, row)) ||
+              ((cell.mask & (kBorderUp | kBorderDown)) != 0 &&
+               border_cell_has_horizontal_axis(cells, columns, rows, column - 1, row)))) {
+        cell.mask = static_cast<unsigned char>(cell.mask | kBorderLeft);
+      }
+      if ((cell.mask & kBorderRight) == 0 && (
+              border_cell_has_mask(cells, columns, rows, column + 1, row, kBorderLeft) ||
+              ((cell.mask & (kBorderLeft | kBorderRight)) != 0 &&
+               border_cell_has_vertical_axis(cells, columns, rows, column + 1, row)) ||
+              ((cell.mask & (kBorderUp | kBorderDown)) != 0 &&
+               border_cell_has_horizontal_axis(cells, columns, rows, column + 1, row)))) {
+        cell.mask = static_cast<unsigned char>(cell.mask | kBorderRight);
+      }
+      if ((cell.mask & kBorderUp) == 0 && (
+              border_cell_has_mask(cells, columns, rows, column, row - 1, kBorderDown) ||
+              ((cell.mask & (kBorderUp | kBorderDown)) != 0 &&
+               border_cell_has_horizontal_axis(cells, columns, rows, column, row - 1)) ||
+              ((cell.mask & (kBorderLeft | kBorderRight)) != 0 &&
+               border_cell_has_vertical_axis(cells, columns, rows, column, row - 1)))) {
+        cell.mask = static_cast<unsigned char>(cell.mask | kBorderUp);
+      }
+      if ((cell.mask & kBorderDown) == 0 && (
+              border_cell_has_mask(cells, columns, rows, column, row + 1, kBorderUp) ||
+              ((cell.mask & (kBorderUp | kBorderDown)) != 0 &&
+               border_cell_has_horizontal_axis(cells, columns, rows, column, row + 1)) ||
+              ((cell.mask & (kBorderLeft | kBorderRight)) != 0 &&
+               border_cell_has_vertical_axis(cells, columns, rows, column, row + 1)))) {
+        cell.mask = static_cast<unsigned char>(cell.mask | kBorderDown);
+      }
+    }
+  }
+  cells = std::move(closed);
+}
+
 void append_shared_pane_borders(
     std::string& out,
     const ActiveWindowFrame& frame,
@@ -627,6 +716,7 @@ void append_shared_pane_borders(
     }
     mark_vertical_border(cells, frame.columns, frame.rows, right, top, bottom, pane.active);
   }
+  close_shared_border_connector_gaps(cells, frame.columns, frame.rows);
 
   bool active_style = false;
   for (int row = 0; row < frame.rows; ++row) {

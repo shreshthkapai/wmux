@@ -70,12 +70,18 @@ tmux behavior:
 - `Ctrl+b c` creates a new window and switches the attached client to it.
 - `new-window` can also be run as a command.
 - Each window has independent pane state.
+- `Ctrl+b ,` prompts for a new window name.
+- `Ctrl+b $` prompts for a new session name.
 
 wmux intended behavior:
 
 - `Ctrl+b c` creates a new window in the attached session and switches to it.
 - `new-window` without `-n` creates an automatically named window.
 - `wmux new-window -n <name>` creates a named window through control IPC.
+- `Ctrl+b ,` opens command prompt mode prefilled with `rename-window `.
+- `Ctrl+b $` opens command prompt mode prefilled with `rename-session `.
+- `rename-session <new>` works in command mode for the attached session, while
+  `wmux rename-session -t <old> <new>` works through daemon control IPC.
 - The new window starts with one pane and one platform PTY process.
 - Existing windows and panes keep their shell state.
 

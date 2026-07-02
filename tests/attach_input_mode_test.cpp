@@ -169,6 +169,32 @@ void command_prompt_mode_consumes_input() {
   assert(mode.kind == wmux::AttachClientModeKind::Normal);
 }
 
+void tmux_rename_keybinds_prefill_command_prompt() {
+  wmux::AttachClientModeState mode;
+
+  const auto rename_window_prompt = actions_for(mode, "\x02" ",");
+  assert(has_status_text(rename_window_prompt, ":rename-window "));
+  assert(mode.kind == wmux::AttachClientModeKind::CommandPrompt);
+
+  const auto rename_window = actions_for(mode, "logs\r");
+  const auto rename_window_command =
+      find_action(rename_window, wmux::AttachInputActionKind::CommandMode);
+  assert(rename_window_command != nullptr);
+  assert(rename_window_command->text == "rename-window logs");
+  assert(mode.kind == wmux::AttachClientModeKind::Normal);
+
+  const auto rename_session_prompt = actions_for(mode, "\x02" "$");
+  assert(has_status_text(rename_session_prompt, ":rename-session "));
+  assert(mode.kind == wmux::AttachClientModeKind::CommandPrompt);
+
+  const auto rename_session = actions_for(mode, "trading\r");
+  const auto rename_session_command =
+      find_action(rename_session, wmux::AttachInputActionKind::CommandMode);
+  assert(rename_session_command != nullptr);
+  assert(rename_session_command->text == "rename-session trading");
+  assert(mode.kind == wmux::AttachClientModeKind::Normal);
+}
+
 void unknown_prefix_key_passes_prefix_and_key_to_shell() {
   wmux::AttachClientModeState mode;
   const auto actions = actions_for(mode, "\x02" "z");
@@ -227,6 +253,7 @@ void run_attach_input_mode_tests() {
   prefix_pane_bindings_become_commands();
   prefix_copy_and_paste_modes_are_explicit();
   command_prompt_mode_consumes_input();
+  tmux_rename_keybinds_prefill_command_prompt();
   unknown_prefix_key_passes_prefix_and_key_to_shell();
   custom_prefix_bindings_route_to_commands();
   paste_and_mouse_events_route_by_mode();

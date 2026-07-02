@@ -51,9 +51,10 @@ AttachKeyAction none_action(std::size_t bytes_consumed = 1) {
   return action;
 }
 
-AttachKeyAction command_prompt_action() {
+AttachKeyAction command_prompt_action(std::string initial_command = {}) {
   AttachKeyAction action;
   action.kind = AttachKeyActionKind::CommandPrompt;
+  action.command = std::move(initial_command);
   action.bytes_consumed = 1;
   return action;
 }
@@ -232,6 +233,8 @@ AttachKeyBindingTable default_attach_key_bindings() {
   bind_action(table, "g", scroll_action(AttachScrollAction::Bottom, 1));
   bind_action(table, "G", scroll_action(AttachScrollAction::Bottom, 1));
   bind_action(table, ":", command_prompt_action());
+  bind_action(table, ",", command_prompt_action("rename-window "));
+  bind_action(table, "$", command_prompt_action("rename-session "));
   bind_action(table, "[", copy_mode_action());
   bind_action(table, "]", paste_action());
   bind_action(table, "\x1b[5~", scroll_action(AttachScrollAction::PageUp, 4));

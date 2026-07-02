@@ -668,6 +668,42 @@ void renderer_applies_configured_ui_accent_and_tmux_style() {
   assert(ascii.find("\xE2\x94\x8C") == std::string::npos);
 }
 
+void shared_borders_close_nested_split_connector_gaps() {
+  wmux::daemon_internal::ActiveWindowFrame frame;
+  frame.window_id = 1;
+  frame.active_pane_id = 2;
+  frame.session_name = "ui";
+  frame.window_name = "main";
+  frame.columns = 20;
+  frame.rows = 9;
+  frame.status_bar_enabled = false;
+  frame.panes.push_back(wmux::daemon_internal::RenderPane{
+      wmux::PaneLayoutRect{1, 0, 0, 10, 9}, false, {}});
+  frame.panes.push_back(wmux::daemon_internal::RenderPane{
+      wmux::PaneLayoutRect{2, 10, 0, 10, 4}, true, {}});
+  frame.panes.push_back(wmux::daemon_internal::RenderPane{
+      wmux::PaneLayoutRect{3, 10, 4, 10, 5}, false, {}});
+
+  std::unordered_map<wmux::PaneId, wmux::PtyOutputSnapshot> snapshots;
+  snapshots.emplace(1, snapshot_with_text_lines({"left"}, 8));
+  snapshots.emplace(2, snapshot_with_text_lines({"top"}, 8));
+  snapshots.emplace(3, snapshot_with_text_lines({"bottom"}, 8));
+  wmux::daemon_internal::PaneViewportStates viewport_states;
+  wmux::daemon_internal::CopyModeState copy_mode;
+  wmux::daemon_internal::RenderStatus status;
+
+  const auto rendered = wmux::daemon_internal::render_frame_update(
+      frame,
+      snapshots,
+      viewport_states,
+      copy_mode,
+      status,
+      wmux::daemon_internal::RenderFrameOptions{});
+
+  assert(rendered.find("\xE2\x94\x9C") != std::string::npos);  // ├
+  assert(rendered.find("\xE2\x94\xA4") != std::string::npos);  // ┤
+}
+
 void entering_copy_mode_starts_at_live_pane_cursor() {
   const auto frame = single_pane_frame(20, 6, wmux::PaneLayoutRect{1, 0, 0, 20, 5});
   std::unordered_map<wmux::PaneId, wmux::PtyOutputSnapshot> snapshots;
@@ -715,5 +751,6 @@ void run_daemon_render_tests() {
   dirty_region_diff_renders_only_changed_cells();
   renders_active_pane_cursor_after_frame();
   renderer_applies_configured_ui_accent_and_tmux_style();
+  shared_borders_close_nested_split_connector_gaps();
   entering_copy_mode_starts_at_live_pane_cursor();
 }

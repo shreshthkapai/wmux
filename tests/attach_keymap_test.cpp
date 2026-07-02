@@ -46,6 +46,14 @@ void maps_window_keybinds() {
   const auto select_two = wmux::prefixed_attach_key_action("2", prefix);
   assert(select_two.kind == wmux::AttachKeyActionKind::Command);
   assert(select_two.command == "select-window-2");
+
+  const auto rename_window = wmux::prefixed_attach_key_action(",", prefix);
+  assert(rename_window.kind == wmux::AttachKeyActionKind::CommandPrompt);
+  assert(rename_window.command == "rename-window ");
+
+  const auto rename_session = wmux::prefixed_attach_key_action("$", prefix);
+  assert(rename_session.kind == wmux::AttachKeyActionKind::CommandPrompt);
+  assert(rename_session.command == "rename-session ");
 }
 
 void maps_existing_pane_keybinds() {
