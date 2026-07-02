@@ -8,6 +8,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -73,8 +74,7 @@ function Write-PipeBytes {
     [byte[]]$Bytes
   )
 
-  $Pipe.Write($Bytes, 0, $Bytes.Length)
-  $Pipe.Flush()
+  Write-WmuxScriptPipeBytes -Pipe $Pipe -Bytes $Bytes
 }
 
 function Write-AttachInput {
@@ -140,9 +140,9 @@ function Write-AttachDetach {
 function Connect-AttachPipe {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None)
+    [System.IO.Pipes.PipeOptions]::Asynchronous)
 
   $pipe.Connect($TimeoutSeconds * 1000)
   $pipe
@@ -154,28 +154,7 @@ function Read-ResponseLine {
     [System.IO.Stream]$Pipe
   )
 
-  $bytes = [System.Collections.Generic.List[byte]]::new()
-  $buffer = [byte[]]::new(1)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, 1)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    if ($readTask.Result -le 0) {
-      break
-    }
-
-    $bytes.Add($buffer[0])
-    if ($buffer[0] -eq [byte][char]"`n") {
-      return [Text.Encoding]::UTF8.GetString($bytes.ToArray())
-    }
-  }
-
-  throw "timed out waiting for attach response"
+  Read-WmuxScriptResponseLine -Pipe $Pipe -TimeoutSeconds $TimeoutSeconds
 }
 
 function Open-Attach {
@@ -210,24 +189,17 @@ function Read-UntilMarker {
   )
 
   $output = ""
-  $buffer = [byte[]]::new(4096)
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
   while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, $buffer.Length)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    $count = $readTask.Result
-    if ($count -le 0) {
-      break
-    }
-
-    $output += [Text.Encoding]::UTF8.GetString($buffer, 0, $count)
+    $remainingSeconds = [int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+    $output += Read-WmuxAttachOutputText -Pipe $Pipe -TimeoutSeconds $remainingSeconds
     if ([regex]::IsMatch($output, $Pattern)) {
       return $output
+    }
+
+    if ($output.Length -gt 1048576) {
+      $output = $output.Substring($output.Length - 524288)
     }
   }
 

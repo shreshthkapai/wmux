@@ -47,7 +47,8 @@ The gate currently runs:
 - attach lifecycle checks
 - detach/reattach persistence checks
 - daemon recovery checks
-- process cleanup and orphan-shell checks
+- process cleanup and orphan-shell checks, including create/kill-session,
+  interactive pane kill, interactive window kill, and `server stop --force`
 - resize stress
 - render throughput pressure
 - bounded stress suite
@@ -80,6 +81,11 @@ count, attach worker count, render frame count, render byte count, and dropped
 output count. Monotonic growth in memory, handles, threads, child processes, or
 live workers is a release blocker.
 
+Cleanup evidence must include both daemon counters and OS process checks. A path
+is not considered clean if `wmux server status` reports zero live shells but the
+old daemon process still has descendant `cmd.exe`, `powershell.exe`, `pwsh.exe`,
+or ConPTY support processes.
+
 ## Known Limitations
 
 Current hardening work is good enough for controlled testing, not for claiming
@@ -89,12 +95,14 @@ tmux-level maturity yet. The known limitations are:
   multiplexers. The grid handles core cursor, erase, wrapping, scroll-region,
   color, alternate-screen, UTF-8, wide-cell, and combining-cell behavior, but it
   still needs broader xterm compatibility tests.
-- Unicode width handling is defensive, not fully equivalent to a dedicated
-  wcwidth/grapheme implementation.
+- Unicode width handling covers wide cells, combining marks, emoji modifiers,
+  ZWJ emoji sequences, and regional-indicator flag pairs defensively, but it is
+  not full Unicode-property database parity yet.
 - Integration scripts share the singleton daemon namespace. Run attach-heavy
   scripts sequentially unless isolated daemon namespacing is added.
-- Render optimization has partial-frame support and throttling, but it is not
-  yet a full dirty-region renderer.
+- Render optimization has throttling, pane-level partial frames, bounded client
+  output queues, and slow-client accounting, but it is not yet a full
+  dirty-region renderer.
 - Copy mode handles scrollback/live-grid selection and wrapped-line extraction,
   but more real TUI/editor/pager scenarios need golden tests.
 - Stress and soak scripts prove bounded behavior for their configured load.

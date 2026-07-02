@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -43,7 +44,7 @@ function Invoke-Wmux {
 
 function New-AttachFrame {
   param(
-    [ValidateSet("Input", "Detach", "Command", "Resize")]
+    [ValidateSet("Input", "Detach", "Command", "Resize", "CopyMode")]
     [string]$Type,
 
     [byte[]]$Payload = @()
@@ -54,6 +55,7 @@ function New-AttachFrame {
     "Detach" { 2 }
     "Command" { 3 }
     "Resize" { 4 }
+    "CopyMode" { 10 }
   }
 
   $length = [uint32]$Payload.Length
@@ -82,8 +84,7 @@ function Write-PipeBytes {
     [byte[]]$Bytes
   )
 
-  $Pipe.Write($Bytes, 0, $Bytes.Length)
-  $Pipe.Flush()
+  Write-WmuxScriptPipeBytes -Pipe $Pipe -Bytes $Bytes
 }
 
 function Write-AttachInput {
@@ -137,6 +138,33 @@ function Write-AttachResize {
   Write-PipeBytes -Pipe $Pipe -Bytes (New-AttachFrame -Type Resize -Payload $payload)
 }
 
+function Write-AttachCopyMode {
+  param(
+    [Parameter(Mandatory = $true)]
+    [System.IO.Stream]$Pipe,
+
+    [ValidateSet("Enter", "Exit", "CursorUp", "CursorDown", "CursorLeft", "CursorRight", "PageUp", "PageDown", "StartSelection", "CopySelection")]
+    [string]$Action
+  )
+
+  $actionByte = switch ($Action) {
+    "Enter" { 0 }
+    "Exit" { 1 }
+    "CursorUp" { 2 }
+    "CursorDown" { 3 }
+    "CursorLeft" { 4 }
+    "CursorRight" { 5 }
+    "PageUp" { 6 }
+    "PageDown" { 7 }
+    "StartSelection" { 8 }
+    "CopySelection" { 9 }
+  }
+
+  Write-PipeBytes -Pipe $Pipe -Bytes (
+    New-AttachFrame -Type CopyMode -Payload ([byte[]]@([byte]$actionByte))
+  )
+}
+
 function Write-AttachDetach {
   param(
     [Parameter(Mandatory = $true)]
@@ -149,9 +177,9 @@ function Write-AttachDetach {
 function Connect-AttachPipe {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None)
+    [System.IO.Pipes.PipeOptions]::Asynchronous)
 
   $pipe.Connect($TimeoutSeconds * 1000)
   $pipe
@@ -163,28 +191,7 @@ function Read-ResponseLine {
     [System.IO.Stream]$Pipe
   )
 
-  $bytes = [System.Collections.Generic.List[byte]]::new()
-  $buffer = [byte[]]::new(1)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, 1)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    if ($readTask.Result -le 0) {
-      break
-    }
-
-    $bytes.Add($buffer[0])
-    if ($buffer[0] -eq [byte][char]"`n") {
-      return [Text.Encoding]::UTF8.GetString($bytes.ToArray())
-    }
-  }
-
-  throw "timed out waiting for attach response"
+  Read-WmuxScriptResponseLine -Pipe $Pipe -TimeoutSeconds $TimeoutSeconds
 }
 
 function Open-Attach {
@@ -219,24 +226,17 @@ function Read-UntilMarker {
   )
 
   $output = ""
-  $buffer = [byte[]]::new(8192)
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
   while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, $buffer.Length)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    $count = $readTask.Result
-    if ($count -le 0) {
-      break
-    }
-
-    $output += [Text.Encoding]::UTF8.GetString($buffer, 0, $count)
+    $remainingSeconds = [int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+    $output += Read-WmuxAttachOutputText -Pipe $Pipe -TimeoutSeconds $remainingSeconds
     if ([regex]::IsMatch($output, $Pattern)) {
       return $output
+    }
+
+    if ($output.Length -gt 1048576) {
+      $output = $output.Substring($output.Length - 524288)
     }
   }
 
@@ -251,17 +251,8 @@ function Drain-AttachOutput {
     [int]$Milliseconds = 100
   )
 
-  $buffer = [byte[]]::new(8192)
-  $deadline = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, $buffer.Length)
-    if (-not $readTask.Wait(20)) {
-      break
-    }
-    if ($readTask.Result -le 0) {
-      break
-    }
-  }
+  [void]$Pipe
+  Start-Sleep -Milliseconds $Milliseconds
 }
 
 function Get-SessionCount {
@@ -366,6 +357,15 @@ try {
   Write-AttachCommand -Pipe $attach -Command "split-vertical"
   [void](Read-UntilMarker -Pipe $attach -Pattern ">" -Description "third pane prompt")
 
+  Write-Host "resize while copy mode is active"
+  Write-AttachCopyMode -Pipe $attach -Action Enter
+  [void](Read-UntilMarker -Pipe $attach -Pattern "copy-mode" -Description "copy mode status")
+  Write-AttachResize -Pipe $attach -Columns 30 -Rows 6
+  Drain-AttachOutput -Pipe $attach -Milliseconds 60
+  Write-AttachCopyMode -Pipe $attach -Action Exit
+  Write-AttachResize -Pipe $attach -Columns 100 -Rows 24
+  Drain-AttachOutput -Pipe $attach -Milliseconds 60
+
   Write-Host "start heavy output"
   Write-AttachInput -Pipe $attach -Text "for /L %i in (1,1,300) do @echo $($marker)_%i`r"
 
@@ -375,6 +375,8 @@ try {
     @{ Columns = 90; Rows = 20 },
     @{ Columns = 132; Rows = 43 },
     @{ Columns = 60; Rows = 12 },
+    @{ Columns = 12; Rows = 3 },
+    @{ Columns = 2; Rows = 1 },
     @{ Columns = 160; Rows = 45 },
     @{ Columns = 40; Rows = 8 },
     @{ Columns = 100; Rows = 24 }
@@ -389,10 +391,21 @@ try {
   }
 
   Write-AttachResize -Pipe $attach -Columns 100 -Rows 24
+  Write-AttachResize -Pipe $attach -Columns 100 -Rows 24
   $statusCursor = [regex]::Escape("$([char]27)[24;1H")
   [void](Read-UntilMarker -Pipe $attach -Pattern $statusCursor -Description "final resize redraw")
   Write-AttachInput -Pipe $attach -Text "echo $($marker)_DONE`r"
   [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("$($marker)_DONE")) -Description "post-resize shell response")
+
+  Write-Host "resize around equalize and kill"
+  Write-AttachCommand -Pipe $attach -Command "equalize-panes"
+  [void](Read-UntilMarker -Pipe $attach -Pattern "spread|already evenly spread" -Description "equalize status")
+  Write-AttachResize -Pipe $attach -Columns 72 -Rows 18
+  Drain-AttachOutput -Pipe $attach -Milliseconds 60
+  Write-AttachCommand -Pipe $attach -Command "kill-pane"
+  [void](Read-UntilMarker -Pipe $attach -Pattern "killed pane|killed window|cannot kill" -Description "kill-pane status")
+  Write-AttachResize -Pipe $attach -Columns 100 -Rows 24
+  [void](Read-UntilMarker -Pipe $attach -Pattern $statusCursor -Description "post-kill resize redraw")
 
   $logTail = Read-LogTailSince -Path $daemonLog -Offset $logOffset
   $resizeEvents = ([regex]::Matches($logTail, 'component="pty" event="resize"')).Count

@@ -1,23 +1,16 @@
 #include "wmux/client.hpp"
 #include "wmux/commands.hpp"
 #include "wmux/daemon.hpp"
+#include "wmux/doctor.hpp"
 #include "wmux/ipc_protocol.hpp"
-#include "wmux/ipc_transport.hpp"
 #include "wmux/logging.hpp"
-#include "wmux/terminal_control.hpp"
+#include "wmux/platform/services.hpp"
 
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace {
 
@@ -28,27 +21,12 @@ bool recoverable_ipc_failure(std::string_view message) {
          message.find("wmux: daemon did not become ready") != std::string_view::npos;
 }
 
-bool running_in_interactive_console() {
-#ifdef _WIN32
-  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-  if (input == nullptr || input == INVALID_HANDLE_VALUE || output == nullptr ||
-      output == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-
-  DWORD mode = 0;
-  return GetConsoleMode(input, &mode) != 0 && GetConsoleMode(output, &mode) != 0;
-#else
-  return false;
-#endif
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
   wmux::initialize_logging(wmux::LogRole::Client);
   wmux::log_event(wmux::LogLevel::Debug, "client", "start");
+  const auto& platform = wmux::platform_services();
 
   std::vector<std::string_view> args;
   args.reserve(static_cast<std::size_t>(argc > 0 ? argc - 1 : 0));
@@ -76,10 +54,15 @@ int main(int argc, char** argv) {
     case wmux::CommandKind::RenameWindow:
     case wmux::CommandKind::SplitWindow:
     case wmux::CommandKind::SetOption:
+    case wmux::CommandKind::BindKey:
+    case wmux::CommandKind::UnbindKey:
     case wmux::CommandKind::ServerStatus:
-    case wmux::CommandKind::ServerStop: {
+    case wmux::CommandKind::ServerStop:
+    case wmux::CommandKind::DumpState:
+    case wmux::CommandKind::DumpLayout:
+    case wmux::CommandKind::DumpEvents: {
       std::string error;
-      if (!wmux::ensure_daemon_running(std::filesystem::path{executable_name}, error)) {
+      if (!platform.ipc().ensure_daemon_running(std::filesystem::path{executable_name}, error)) {
         std::cerr << error;
         return 1;
       }
@@ -89,7 +72,7 @@ int main(int argc, char** argv) {
       }
 
       const auto request_json = wmux::make_command_request_json(command);
-      auto response = wmux::send_ipc_request(request_json);
+      auto response = platform.ipc().send_request(request_json);
       if (!response.ok && recoverable_ipc_failure(response.message)) {
         wmux::log_event(
             wmux::LogLevel::Warn,
@@ -97,12 +80,14 @@ int main(int argc, char** argv) {
             "recoverable_failure",
             {{"message", response.message}});
         std::string retry_error;
-        if (wmux::ensure_daemon_running(std::filesystem::path{executable_name}, retry_error)) {
-          response = wmux::send_ipc_request(request_json);
+        if (platform.ipc().ensure_daemon_running(
+                std::filesystem::path{executable_name}, retry_error)) {
+          response = platform.ipc().send_request(request_json);
         }
       }
       if (response.ok) {
-        if (command.kind == wmux::CommandKind::NewSession && running_in_interactive_console()) {
+        if (command.kind == wmux::CommandKind::NewSession &&
+            platform.terminal().has_interactive_console()) {
           return wmux::run_attach_client(command);
         }
         std::cout << response.message;
@@ -122,7 +107,14 @@ int main(int argc, char** argv) {
       return 0;
 
     case wmux::CommandKind::ResetTerminal:
-      return wmux::reset_terminal();
+      return platform.terminal().reset_terminal();
+
+    case wmux::CommandKind::Doctor:
+      std::cout << wmux::render_doctor_report(command.json);
+      return 0;
+
+    case wmux::CommandKind::DebugKeys:
+      return wmux::run_debug_keys();
 
     case wmux::CommandKind::Unknown:
       std::cerr << "wmux: " << command.error << "\n\n";

@@ -1,5 +1,7 @@
 #include "wmux/logging.hpp"
 
+#include "wmux/resource_limits.hpp"
+
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +19,7 @@ std::mutex g_log_mutex;
 std::ofstream g_log_file;
 LogRole g_role = LogRole::Client;
 bool g_initialized = false;
+std::size_t g_max_file_bytes = kMaxLogFileBytes;
 
 std::string role_name(LogRole role) {
   switch (role) {
@@ -122,6 +125,40 @@ void open_log_file_locked(LogRole role) {
   g_log_file.open(log_file_path(role), std::ios::app);
 }
 
+std::uintmax_t file_size_or_zero(const std::filesystem::path& path) {
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  return ec ? 0 : size;
+}
+
+void rotate_log_file_locked(LogRole role, std::size_t pending_bytes) {
+  if (g_max_file_bytes == 0) {
+    return;
+  }
+
+  const auto active_path = log_file_path(role);
+  const auto current_size = file_size_or_zero(active_path);
+  if (current_size + pending_bytes <= g_max_file_bytes) {
+    return;
+  }
+
+  if (g_log_file.is_open()) {
+    g_log_file.flush();
+    g_log_file.close();
+  }
+
+  std::error_code ec;
+  const auto rotated_path = rotated_log_file_path(role);
+  std::filesystem::remove(rotated_path, ec);
+  ec.clear();
+  if (std::filesystem::exists(active_path, ec)) {
+    ec.clear();
+    std::filesystem::rename(active_path, rotated_path, ec);
+  }
+
+  open_log_file_locked(role);
+}
+
 }  // namespace
 
 void initialize_logging(LogRole role) {
@@ -142,6 +179,14 @@ void shutdown_logging() {
   g_initialized = false;
 }
 
+void configure_logging(std::size_t max_file_bytes) {
+  std::lock_guard lock(g_log_mutex);
+  g_max_file_bytes = max_file_bytes;
+  if (g_initialized) {
+    rotate_log_file_locked(g_role, 0);
+  }
+}
+
 std::filesystem::path log_directory() {
 #ifdef _WIN32
   const auto local_app_data = environment_variable("LOCALAPPDATA");
@@ -155,6 +200,10 @@ std::filesystem::path log_directory() {
 
 std::filesystem::path log_file_path(LogRole role) {
   return log_directory() / ("wmux-" + role_name(role) + ".log");
+}
+
+std::filesystem::path rotated_log_file_path(LogRole role) {
+  return log_file_path(role).string() + ".1";
 }
 
 void log_event(
@@ -172,17 +221,25 @@ void log_event(
     return;
   }
 
-  g_log_file << "ts=\"" << timestamp() << "\""
-             << " level=\"" << level_name(level) << "\""
-             << " role=\"" << role_name(g_role) << "\""
-             << " component=\"" << escaped(component) << "\""
-             << " event=\"" << escaped(event) << "\"";
+  std::ostringstream line;
+  line << "ts=\"" << timestamp() << "\""
+       << " level=\"" << level_name(level) << "\""
+       << " role=\"" << role_name(g_role) << "\""
+       << " component=\"" << escaped(component) << "\""
+       << " event=\"" << escaped(event) << "\"";
 
   for (const auto& field : fields) {
-    g_log_file << ' ' << field.key << "=\"" << escaped(field.value) << "\"";
+    line << ' ' << field.key << "=\"" << escaped(field.value) << "\"";
   }
 
-  g_log_file << '\n';
+  line << '\n';
+  const auto text = line.str();
+  rotate_log_file_locked(g_role, text.size());
+  if (!g_log_file.is_open()) {
+    return;
+  }
+
+  g_log_file << text;
   g_log_file.flush();
 }
 

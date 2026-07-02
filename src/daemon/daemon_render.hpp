@@ -1,8 +1,9 @@
 #pragma once
 
 #include "wmux/ipc_protocol.hpp"
-#include "wmux/pty_process.hpp"
+#include "wmux/pty_output.hpp"
 #include "wmux/session_manager.hpp"
+#include "wmux/status_line.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -12,6 +13,10 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+
+namespace wmux {
+class PtyProcess;
+}
 
 namespace wmux::daemon_internal {
 
@@ -26,6 +31,7 @@ struct ActiveWindowFrame {
   PaneId active_pane_id{0};
   std::string session_name;
   std::string window_name;
+  std::size_t window_index{0};
   int columns{120};
   int rows{30};
   bool status_bar_enabled{true};
@@ -44,6 +50,43 @@ struct RenderFrameOptions {
   bool draw_borders{true};
   bool draw_status{true};
   std::unordered_set<PaneId> dirty_panes;
+};
+
+struct RenderDiffCell {
+  std::string text;
+  TerminalCellWidth width{TerminalCellWidth::Narrow};
+  TerminalAttributes attributes;
+  bool inverse{false};
+};
+
+struct RenderDiffRow {
+  int row{0};
+  int column{0};
+  int width{0};
+  std::vector<RenderDiffCell> cells;
+};
+
+struct RenderDiffPane {
+  PaneLayoutRect rect;
+  std::size_t first_visible_line{0};
+  std::size_t viewport_offset{0};
+  std::vector<RenderDiffRow> body_rows;
+};
+
+struct RenderDiffState {
+  int columns{0};
+  int rows{0};
+  bool status_bar_enabled{true};
+  bool initialized{false};
+  std::unordered_map<PaneId, RenderDiffPane> panes;
+  std::string status_line;
+};
+
+struct RenderStatus {
+  StatusState state;
+  StatusLineMode mode{StatusLineMode::Normal};
+  bool mouse_enabled{false};
+  bool mouse_drag_active{false};
 };
 
 struct CopyModePoint {
@@ -70,6 +113,13 @@ std::string render_frame(
     const CopyModeState& copy_mode,
     std::string_view status_override);
 
+std::string render_frame(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status);
+
 std::string render_frame_update(
     const ActiveWindowFrame& frame,
     const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
@@ -77,6 +127,25 @@ std::string render_frame_update(
     const CopyModeState& copy_mode,
     std::string_view status_override,
     const RenderFrameOptions& options);
+
+std::string render_frame_update(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options);
+
+std::string render_frame_update(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options,
+    RenderDiffState& diff_state);
+
+void reset_render_diff_state(RenderDiffState& diff_state);
 
 void update_viewport_states(
     const ActiveWindowFrame& frame,

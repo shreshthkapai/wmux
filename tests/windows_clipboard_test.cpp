@@ -1,4 +1,4 @@
-#include "wmux/windows_clipboard.hpp"
+#include "wmux/platform/services.hpp"
 
 #include <cassert>
 #include <optional>
@@ -91,11 +91,11 @@ void optionally_round_trips_windows_clipboard_text() {
 
   const auto previous = read_clipboard_text();
   const std::string probe{"wmux clipboard smoke\r\nlambda \xce\xbb"};
-  const auto result = wmux::write_windows_clipboard_text(probe);
+  const auto result = wmux::platform_services().clipboard().write_text(probe);
   const auto actual = read_clipboard_text();
 
   if (previous) {
-    (void)wmux::write_windows_clipboard_text(utf8_from_wide(*previous));
+    (void)wmux::platform_services().clipboard().write_text(utf8_from_wide(*previous));
   }
 
   assert(result.ok);

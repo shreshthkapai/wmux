@@ -6,14 +6,25 @@
 #include <vector>
 
 void run_ipc_protocol_tests();
+void run_attach_input_mode_tests();
+void run_attach_keymap_tests();
 void run_command_mode_tests();
+void run_command_engine_tests();
 void run_config_tests();
 void run_copy_selection_tests();
+void run_daemon_event_tests();
 void run_daemon_render_tests();
 void run_mouse_input_tests();
 void run_paste_buffer_tests();
+void run_platform_boundary_tests();
+void run_platform_info_tests();
 void run_session_manager_tests();
+void run_status_line_tests();
+void run_terminal_capabilities_tests();
+void run_terminal_control_tests();
+void run_terminal_input_tests();
 void run_terminal_grid_tests();
+void run_terminal_vt_tests();
 void run_windows_clipboard_tests();
 
 namespace {
@@ -170,6 +181,32 @@ void expects_set_mouse_off_command() {
   assert(result.error.empty());
 }
 
+void expects_bind_key_command() {
+  const std::vector<std::string_view> args{"bind-key", "z", "new-window"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::BindKey);
+  assert(result.key_name == "z");
+  assert(result.key_action == "new-window");
+  assert(result.error.empty());
+}
+
+void expects_bind_key_command_with_multi_token_action() {
+  const std::vector<std::string_view> args{"bind-key", "E", "select-layout", "-E"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::BindKey);
+  assert(result.key_name == "E");
+  assert(result.key_action == "select-layout -E");
+  assert(result.error.empty());
+}
+
+void expects_unbind_key_command() {
+  const std::vector<std::string_view> args{"unbind-key", "e"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::UnbindKey);
+  assert(result.key_name == "e");
+  assert(result.error.empty());
+}
+
 void expects_server_status_command() {
   const std::vector<std::string_view> args{"server", "status"};
   const auto result = wmux::parse_command_line(args);
@@ -177,10 +214,54 @@ void expects_server_status_command() {
   assert(result.error.empty());
 }
 
+void expects_dump_state_command() {
+  const std::vector<std::string_view> args{"dump-state"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::DumpState);
+  assert(result.error.empty());
+}
+
+void expects_dump_layout_command() {
+  const std::vector<std::string_view> args{"dump-layout"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::DumpLayout);
+  assert(result.error.empty());
+}
+
+void expects_dump_events_command() {
+  const std::vector<std::string_view> args{"dump-events"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::DumpEvents);
+  assert(result.error.empty());
+}
+
 void expects_reset_terminal_command() {
   const std::vector<std::string_view> args{"reset-terminal"};
   const auto result = wmux::parse_command_line(args);
   assert(result.kind == wmux::CommandKind::ResetTerminal);
+  assert(result.error.empty());
+}
+
+void expects_doctor_command() {
+  const std::vector<std::string_view> args{"doctor"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Doctor);
+  assert(!result.json);
+  assert(result.error.empty());
+}
+
+void expects_doctor_json_command() {
+  const std::vector<std::string_view> args{"doctor", "--json"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Doctor);
+  assert(result.json);
+  assert(result.error.empty());
+}
+
+void expects_debug_keys_command() {
+  const std::vector<std::string_view> args{"debug-keys"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::DebugKeys);
   assert(result.error.empty());
 }
 
@@ -249,18 +330,36 @@ void expects_bad_set_argument_error() {
   assert(result.error == "set requires -g <option> <value>");
 }
 
+void expects_bad_bind_key_argument_error() {
+  const std::vector<std::string_view> args{"bind-key", "z"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "bind-key requires <key> <action>");
+}
+
+void expects_bad_unbind_key_argument_error() {
+  const std::vector<std::string_view> args{"unbind-key"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "unbind-key requires <key>");
+}
+
 void expects_bad_set_mouse_value_error() {
   const std::vector<std::string_view> args{"set", "-g", "mouse", "yes"};
   const auto result = wmux::parse_command_line(args);
-  assert(result.kind == wmux::CommandKind::Unknown);
-  assert(result.error == "set -g mouse requires on or off");
+  assert(result.kind == wmux::CommandKind::SetOption);
+  assert(result.option_name == "mouse");
+  assert(result.option_value == "yes");
+  assert(result.error.empty());
 }
 
-void expects_unsupported_set_option_error() {
+void expects_status_set_option_command() {
   const std::vector<std::string_view> args{"set", "-g", "status", "on"};
   const auto result = wmux::parse_command_line(args);
-  assert(result.kind == wmux::CommandKind::Unknown);
-  assert(result.error == "unsupported global option 'status'");
+  assert(result.kind == wmux::CommandKind::SetOption);
+  assert(result.option_name == "status");
+  assert(result.option_value == "on");
+  assert(result.error.empty());
 }
 
 void expects_server_subcommand_error() {
@@ -275,6 +374,27 @@ void expects_server_stop_argument_error() {
   const auto result = wmux::parse_command_line(args);
   assert(result.kind == wmux::CommandKind::Unknown);
   assert(result.error == "server stop accepts only optional --force");
+}
+
+void expects_bad_dump_state_argument_error() {
+  const std::vector<std::string_view> args{"dump-state", "--json"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "dump-state does not accept arguments: '--json'");
+}
+
+void expects_bad_doctor_argument_error() {
+  const std::vector<std::string_view> args{"doctor", "--verbose"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "doctor accepts only optional --json");
+}
+
+void expects_bad_debug_keys_argument_error() {
+  const std::vector<std::string_view> args{"debug-keys", "--json"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::Unknown);
+  assert(result.error == "debug-keys does not accept arguments: '--json'");
 }
 
 void expects_placeholder_response() {
@@ -313,8 +433,17 @@ int main() {
   expects_split_window_vertical_command();
   expects_set_mouse_on_command();
   expects_set_mouse_off_command();
+  expects_bind_key_command();
+  expects_bind_key_command_with_multi_token_action();
+  expects_unbind_key_command();
   expects_server_status_command();
+  expects_dump_state_command();
+  expects_dump_layout_command();
+  expects_dump_events_command();
   expects_reset_terminal_command();
+  expects_doctor_command();
+  expects_doctor_json_command();
+  expects_debug_keys_command();
   expects_server_stop_command();
   expects_forced_server_stop_command();
   expects_missing_session_name_error();
@@ -324,20 +453,36 @@ int main() {
   expects_missing_split_direction_error();
   expects_duplicate_split_direction_error();
   expects_bad_set_argument_error();
+  expects_bad_bind_key_argument_error();
+  expects_bad_unbind_key_argument_error();
   expects_bad_set_mouse_value_error();
-  expects_unsupported_set_option_error();
+  expects_status_set_option_command();
   expects_server_subcommand_error();
   expects_server_stop_argument_error();
+  expects_bad_dump_state_argument_error();
+  expects_bad_doctor_argument_error();
+  expects_bad_debug_keys_argument_error();
   expects_placeholder_response();
   expects_unknown_command_error();
   run_ipc_protocol_tests();
+  run_attach_input_mode_tests();
+  run_attach_keymap_tests();
   run_command_mode_tests();
+  run_command_engine_tests();
   run_config_tests();
   run_copy_selection_tests();
+  run_daemon_event_tests();
   run_daemon_render_tests();
   run_mouse_input_tests();
   run_paste_buffer_tests();
+  run_platform_boundary_tests();
+  run_platform_info_tests();
   run_session_manager_tests();
+  run_status_line_tests();
+  run_terminal_capabilities_tests();
+  run_terminal_control_tests();
+  run_terminal_input_tests();
   run_terminal_grid_tests();
+  run_terminal_vt_tests();
   run_windows_clipboard_tests();
 }

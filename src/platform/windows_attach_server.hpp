@@ -1,19 +1,18 @@
 #pragma once
 
-#include "daemon_state.hpp"
 #include "wmux/ipc_protocol.hpp"
+#include "wmux/platform/pipe_handle.hpp"
+
+#include "daemon_state.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
 namespace wmux::daemon_internal {
 
 enum class AttachDispatch {
@@ -23,15 +22,20 @@ enum class AttachDispatch {
 };
 
 std::wstring widen(std::string_view value);
-bool read_request(HANDLE pipe, std::string& request);
-bool write_all(HANDLE pipe, std::string_view bytes);
-void close_pipe(HANDLE pipe);
-void close_attach_pipe(HANDLE pipe);
-HANDLE create_server_pipe(const std::wstring& endpoint, DWORD open_mode_flags);
-bool connect_named_pipe(HANDLE pipe);
+bool write_all(PlatformPipeHandle pipe, std::string_view bytes);
+void close_pipe(PlatformPipeHandle pipe);
+void close_attach_pipe(PlatformPipeHandle pipe);
+PlatformPipeHandle create_server_pipe(
+    const std::wstring& endpoint,
+    std::uint32_t open_mode_flags);
+bool connect_named_pipe(PlatformPipeHandle pipe);
+std::optional<DaemonEventResult> handle_attach_daemon_event(
+    DaemonState& state,
+    const DaemonEvent& event);
 AttachDispatch dispatch_attach_connection(
-    HANDLE pipe,
+    PlatformPipeHandle pipe,
     const IpcRequest& request,
+    RequestId request_id,
     DaemonEventLoop& events);
 void run_windows_attach_listener(DaemonEventLoop& events, std::atomic_bool& should_stop);
 void wake_attach_listener();

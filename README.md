@@ -68,6 +68,7 @@ See:
 - [Product Overview](docs/product-overview.md)
 - [Technical Roadmap](docs/technical-roadmap.md)
 - [Engineering Principles](docs/engineering-principles.md)
+- [Testing Strategy](docs/testing-strategy.md)
 - [Stability Testing](docs/stability-testing.md)
 - [Release Gate](docs/release-gate.md)
 
@@ -190,10 +191,106 @@ Ctrl+b p       previous window
 Ctrl+b %       split horizontal
 Ctrl+b "       split vertical
 Ctrl+b arrows  switch pane
+Ctrl+b x       kill pane
+Ctrl+b E       equalize panes
 Ctrl+b [       copy mode
 Ctrl+b ]       paste buffer
 Ctrl+b :       command mode
 ```
+
+### Configuration
+
+wmux reads `%USERPROFILE%\.wmux.conf` on daemon startup. The file uses
+tmux-style global settings:
+
+```text
+set -g prefix C-b
+set -g mouse on
+set -g default-shell pwsh.exe
+set -g status on
+set -g escape-time-ms 50
+set -g scrollback-max-lines 10000
+set -g paste-buffer-max-bytes 1048576
+set -g max-sessions 64
+set -g max-windows-per-session 64
+set -g max-panes-per-window 64
+set -g client-output-queue-max-bytes 8388608
+set -g client-output-queue-max-frames 8
+bind-key z new-window
+bind-key C kill-pane
+bind-key Up select-pane-up
+unbind-key e
+```
+
+If `default-shell` is omitted, wmux resolves the shell in this order:
+PowerShell 7 (`pwsh`), Windows PowerShell, then `cmd.exe`. `WMUX_DEFAULT_SHELL`
+is treated as a temporary environment override only when no config shell is set.
+Explicit `default-shell` paths are validated when the config is parsed; plain
+commands such as `pwsh.exe -NoLogo` are resolved through the normal Windows
+process search path when panes are spawned.
+
+Resource limits are part of the config contract. The daemon enforces configured
+limits for session/window/pane creation, pane raw-output retention, scrollback,
+paste buffers, attach render frame size, and attach client output queues. IPC
+frame hard caps remain compiled protocol limits because clients must validate
+frames before daemon config is known. `log-max-bytes` rotates the active
+client/daemon log to `.1` before appending once the configured byte cap would be
+exceeded.
+
+Runtime `wmux set -g ...` uses the same validation path as config loading.
+Already-attached clients receive live updates for prefix, mouse reporting,
+escape timing, status visibility, and attach backpressure/render limits.
+
+Prefix key bindings can be customized with tmux-style `bind-key` lines. The key
+is the key pressed after the wmux prefix. Supported named keys include `Up`,
+`Down`, `Left`, `Right`, `PageUp`, `PageDown`, `Space`, `Tab`, `Enter`,
+`Escape`, `Backspace`, and `C-<key>` control-key notation. Supported actions
+are the current attach commands:
+
+```text
+bind-key z new-window
+bind-key C kill-pane
+bind-key "prefix x" split-horizontal
+bind-key Up select-pane-up
+bind-key E equalize-panes
+bind-key d detach
+bind-key '[' copy-mode
+bind-key ']' paste-buffer
+bind-key ':' command-prompt
+unbind-key e
+```
+
+Custom key bindings are validated when the daemon reads the config and are sent
+to attach clients through the framed settings path. Runtime commands use the
+same validation and update already-attached clients:
+
+```powershell
+.\build-vs\Debug\wmux.exe bind-key z new-window
+.\build-vs\Debug\wmux.exe bind-key E select-layout -E
+.\build-vs\Debug\wmux.exe unbind-key e
+```
+
+The same commands also work from command mode, for example
+`Ctrl+b : bind-key z new-window`. Runtime option changes update daemon memory;
+they do not rewrite `%USERPROFILE%\.wmux.conf`, so daemon restart reloads the
+file-backed configuration.
+
+Terminal capability detection can also be overridden when a host terminal has a
+known quirk or wmux guesses incorrectly:
+
+```text
+set -g terminal-host windows-terminal
+set -g terminal-truecolor on
+set -g terminal-mouse on
+set -g terminal-bracketed-paste on
+set -g terminal-extended-keys on
+set -g terminal-osc52-clipboard off
+set -g terminal-quirk-no-osc52-clipboard on
+```
+
+Run `wmux doctor` to see both detected and effective terminal capabilities.
+Run `wmux debug-keys` from an interactive Windows terminal to inspect decoded
+key, mouse, and paste events without printing pasted text.
 
 ### Validation
 
@@ -225,17 +322,19 @@ If a rebuild fails because `wmux.exe` is still running, stop the daemon:
 
 ## Build And Validate
 
-The current skeleton builds a small `wmux` executable with the Phase 11D
-daemon-owned ConPTY shell, raw detach/reattach path, window commands, and
-basic pane rendering plus live attach resize, rendering hardening, and an
-initial command prompt dispatch plus mouse input, click-to-focus, and border
-drag resize with an explicit daemon-owned mouse setting:
+The current skeleton builds a small `wmux` executable with a daemon-owned
+ConPTY shell model, explicit detach/reattach, window and pane commands, basic
+pane rendering, live attach resize, rendering hardening, command prompt
+dispatch, mouse input, click-to-focus, border drag resize, and an explicit
+daemon-owned mouse setting:
 
 ```bash
 cmake -S . -B build
 cmake --build build
 ./build/wmux --help
 ./build/wmux version
+./build/wmux doctor
+./build/wmux doctor --json
 ./build/wmux server status
 ./build/wmux new -s finance
 ./build/wmux ls
@@ -246,7 +345,8 @@ cmake --build build
 ./build/wmux split-window -h
 ./build/wmux split-window -v
 ./build/wmux set -g mouse on
-./build/wmux set -g mouse off
+./build/wmux set -g status off
+./build/wmux set -g scrollback-max-lines 10000
 ./build/wmux rename-session -t finance trading
 ./build/wmux kill-session -t trading
 ./build/wmux server stop
@@ -257,12 +357,15 @@ ctest --test-dir build --output-on-failure
 On Windows, CMake will produce `wmux.exe`.
 
 The daemon uses separate Windows named-pipe endpoints for command
-request/response traffic and long-lived attach streaming. It keeps session
-state, window state, ConPTY handles, shell processes, and a bounded recent
-output buffer in the daemon process. `wmux new -s <name>` starts a daemon-owned
-`powershell.exe -NoLogo -NoProfile` shell for the session's initial window, and
-`wmux attach -t <name>` opens a streaming attach connection to the session's
-active window.
+request/response traffic and long-lived attach streaming. Both endpoints use
+the versioned `WMUX` frame header with request IDs and bounded payloads:
+command IPC uses Control/Error frames, attach input uses AttachInput frames,
+and rendered attach output uses AttachOutput frames. The daemon keeps session
+state, window state, ConPTY handles, shell processes, and bounded screen and
+scrollback state in the daemon process. `wmux new -s <name>` starts a
+daemon-owned shell for the session's initial window using the configured shell
+or the default Windows shell resolution order, and `wmux attach -t <name>` opens
+a streaming attach connection to the session's active window.
 
 Window commands currently operate on the only live session when exactly one
 session exists. They also accept `-t <session>` for explicit daemon commands:
@@ -277,20 +380,24 @@ session exists. They also accept `-t <session>` for explicit daemon commands:
 
 `split-window` updates daemon-owned pane state for the active window, spawns a
 new ConPTY shell for the created pane, and marks the new pane active.
-Interactive attach also supports `Ctrl+b %`, `Ctrl+b "`, and `Ctrl+b` arrow
-keys. Input is routed only to the active pane. Attached windows now render all
-visible panes with ASCII borders, an active-pane highlight, clipped pane text,
-and a status line. The current renderer avoids drawing pane text over
-tiny-pane borders, coalesces continuous output redraws, and has layout tests
-for nested geometry, clamped split ratios, and tiny terminal dimensions. Pane
-text now comes from a daemon-owned virtual terminal grid that is updated by the
-PTY reader thread, not from ad hoc raw-byte sanitization during every redraw.
+Interactive attach also supports `Ctrl+b %`, `Ctrl+b "`, `Ctrl+b x`,
+`Ctrl+b E`, and `Ctrl+b` arrow keys. Input is routed only to the active pane.
+Attached windows now render all visible panes with ASCII borders, an active-pane highlight,
+clipped pane text, and a status line. The current renderer avoids drawing pane
+text over tiny-pane borders, coalesces continuous output redraws, and has
+layout tests for nested geometry, clamped split ratios, and tiny terminal
+dimensions. Interactive splits refuse to shrink the active pane below a small
+TUI-safe floor; this avoids creating pane sizes that commonly destabilize
+full-screen terminal applications. Pane text now comes from a daemon-owned
+virtual terminal grid that is updated by the PTY reader thread, not from ad hoc
+raw-byte sanitization during every redraw.
 
 `wmux server stop` refuses to stop while live sessions exist. Use
 `wmux server stop --force` only when you explicitly want the daemon to terminate
 active session runtimes.
 
-Mouse mode is opt-in through daemon runtime state:
+Mouse mode is enabled by default for alpha testing and can be changed through
+daemon runtime state:
 
 ```bash
 ./build/wmux set -g mouse on
@@ -330,8 +437,8 @@ output was captured while detached, then verifies an explicit detach still
 leaves the session attachable.
 
 Interactive attach now uses daemon-rendered basic pane frames rather than direct
-active-shell passthrough. Client input uses small length-prefixed attach frames
-so `Ctrl+b d` is an explicit detach event instead of an accidental pipe close.
+active-shell passthrough. Client input uses framed AttachInput messages, so
+`Ctrl+b d` is an explicit detach event instead of an accidental pipe close.
 `Ctrl+b c` creates a new window, while `Ctrl+b n` and `Ctrl+b p` switch the
 attached session between independent window shells. The client also sends its
 initial terminal size on attach and sends resize frames while attached, so the

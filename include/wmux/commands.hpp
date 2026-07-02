@@ -21,9 +21,16 @@ enum class CommandKind {
   RenameWindow,
   SplitWindow,
   SetOption,
+  BindKey,
+  UnbindKey,
   ServerStatus,
   ServerStop,
+  DumpState,
+  DumpLayout,
+  DumpEvents,
   ResetTerminal,
+  Doctor,
+  DebugKeys,
   Unknown,
 };
 
@@ -37,7 +44,10 @@ struct CommandLine {
   std::string split_direction;
   std::string option_name;
   std::string option_value;
+  std::string key_name;
+  std::string key_action;
   bool force{false};
+  bool json{false};
 };
 
 CommandLine parse_command_line(const std::vector<std::string_view>& args);

@@ -156,16 +156,16 @@ Phase 2 command IPC is intentionally small and conservative:
 - Use one request per connection for the initial daemon skeleton.
 - Treat daemon startup and shutdown as explicit lifecycle paths.
 - Do not let stale development sockets replace or disturb a live daemon.
-- Keep JSON on command traffic only; do not use per-keystroke JSON for attach
-  streaming.
+- Keep JSON inside validated command frames only; do not use per-keystroke JSON
+  for attach streaming.
 
 ## Attach Streaming IPC
 
 Attach streaming must keep shell data and lifecycle/control data separate.
 
 - Use a dedicated attach transport endpoint for long-lived interactive streams.
-- Use bounded framed messages for client input, detach, resize, mouse, and
-  future render events.
+- Use bounded framed messages for client input, detach, resize, mouse, render
+  output, and stream errors.
 - Treat intentional detach differently from broken pipe, malformed protocol,
   session kill, and server shutdown.
 - Track active clients by stable client ID so cleanup paths can disconnect them
@@ -190,6 +190,9 @@ include:
 - many panes do not cause visible input lag
 
 ## Testing Strategy
+
+The detailed testing contract lives in [Testing Strategy](testing-strategy.md).
+This section summarizes the engineering intent.
 
 Use fast unit tests for pure logic:
 

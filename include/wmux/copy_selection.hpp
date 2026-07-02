@@ -1,6 +1,6 @@
 #pragma once
 
-#include "wmux/pty_process.hpp"
+#include "wmux/pty_output.hpp"
 
 #include <cstddef>
 #include <string>

@@ -8,6 +8,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -71,8 +72,7 @@ function Write-PipeBytes {
     [byte[]]$Bytes
   )
 
-  $Pipe.Write($Bytes, 0, $Bytes.Length)
-  $Pipe.Flush()
+  Write-WmuxScriptPipeBytes -Pipe $Pipe -Bytes $Bytes
 }
 
 function Write-AttachInput {
@@ -115,9 +115,9 @@ function Write-AttachDetach {
 function Connect-AttachPipe {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None)
+    [System.IO.Pipes.PipeOptions]::Asynchronous)
 
   $pipe.Connect($TimeoutSeconds * 1000)
   $pipe
@@ -129,28 +129,7 @@ function Read-ResponseLine {
     [System.IO.Stream]$Pipe
   )
 
-  $bytes = [System.Collections.Generic.List[byte]]::new()
-  $buffer = [byte[]]::new(1)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, 1)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    if ($readTask.Result -le 0) {
-      break
-    }
-
-    $bytes.Add($buffer[0])
-    if ($buffer[0] -eq [byte][char]"`n") {
-      return [Text.Encoding]::UTF8.GetString($bytes.ToArray())
-    }
-  }
-
-  throw "timed out waiting for attach response"
+  Read-WmuxScriptResponseLine -Pipe $Pipe -TimeoutSeconds $TimeoutSeconds
 }
 
 function Open-Attach {
@@ -185,24 +164,17 @@ function Read-UntilMarker {
   )
 
   $output = ""
-  $buffer = [byte[]]::new(4096)
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
   while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, $buffer.Length)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    $count = $readTask.Result
-    if ($count -le 0) {
-      break
-    }
-
-    $output += [Text.Encoding]::UTF8.GetString($buffer, 0, $count)
+    $remainingSeconds = [int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+    $output += Read-WmuxAttachOutputText -Pipe $Pipe -TimeoutSeconds $remainingSeconds
     if ([regex]::IsMatch($output, $Pattern)) {
       return $output
+    }
+
+    if ($output.Length -gt 1048576) {
+      $output = $output.Substring($output.Length - 524288)
     }
   }
 
@@ -280,9 +252,9 @@ try {
   Write-AttachInput -Pipe $attach -Text "echo $marker`_P1`r"
   [void](Read-UntilMarker -Pipe $attach -Pattern ([regex]::Escape("$marker`_P1")) -Description "active pane after kill-pane")
 
-  Write-Host "command mode: refuse last-pane kill"
+  Write-Host "command mode: last-pane kill removes non-last window"
   Write-CommandMode -Pipe $attach -Command "kill-pane"
-  [void](Read-UntilMarker -Pipe $attach -Pattern "wmux: cannot kill the last pane in a window" -Description "last-pane refusal")
+  [void](Read-UntilMarker -Pipe $attach -Pattern "wmux: killed window" -Description "last-pane window kill")
 
   Write-Host "command mode: kill-window"
   Write-CommandMode -Pipe $attach -Command "new-window -n scratch"
@@ -293,10 +265,6 @@ try {
   if ($windows.Output -match "(?m): scratch") {
     throw "expected scratch window to be removed after command-mode kill-window`n$($windows.Output)"
   }
-
-  Write-Host "command mode: kill remaining non-last window"
-  Write-CommandMode -Pipe $attach -Command "kill-window"
-  [void](Read-UntilMarker -Pipe $attach -Pattern "wmux: killed window" -Description "second kill-window status")
 
   Write-Host "command mode: refuse last-window kill"
   Write-CommandMode -Pipe $attach -Command "kill-window"

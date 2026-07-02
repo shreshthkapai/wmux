@@ -8,6 +8,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -17,9 +18,16 @@ function Invoke-Wmux {
     [switch]$AllowFailure
   )
 
-  $output = & $script:WmuxPath @Arguments 2>&1
-  $exitCode = $LASTEXITCODE
-  $text = ($output | Out-String).TrimEnd()
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $output = & $script:WmuxPath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    $text = ($output | Out-String).TrimEnd()
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
 
   if (-not $AllowFailure -and $exitCode -ne 0) {
     throw "wmux $($Arguments -join ' ') failed with exit code $exitCode`n$text"
@@ -61,16 +69,15 @@ function Write-PipeBytes {
     [byte[]]$Bytes
   )
 
-  $Pipe.Write($Bytes, 0, $Bytes.Length)
-  $Pipe.Flush()
+  Write-WmuxScriptPipeBytes -Pipe $Pipe -Bytes $Bytes
 }
 
 function Connect-AttachPipe {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None)
+    [System.IO.Pipes.PipeOptions]::Asynchronous)
 
   $pipe.Connect($TimeoutSeconds * 1000)
   $pipe
@@ -82,28 +89,7 @@ function Read-ResponseLine {
     [System.IO.Stream]$Pipe
   )
 
-  $bytes = [System.Collections.Generic.List[byte]]::new()
-  $buffer = [byte[]]::new(1)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, 1)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    if ($readTask.Result -le 0) {
-      break
-    }
-
-    $bytes.Add($buffer[0])
-    if ($buffer[0] -eq [byte][char]"`n") {
-      return [Text.Encoding]::UTF8.GetString($bytes.ToArray())
-    }
-  }
-
-  throw "timed out waiting for attach response"
+  Read-WmuxScriptResponseLine -Pipe $Pipe -TimeoutSeconds $TimeoutSeconds
 }
 
 function Open-AttachResponse {
@@ -160,6 +146,15 @@ function Get-MouseSetting {
   throw "could not parse mouse setting from server status`n$StatusOutput"
 }
 
+function Get-EffectiveMouseSupport {
+  $doctor = Invoke-Wmux -Arguments @("doctor", "--json")
+  $json = $doctor.Output | ConvertFrom-Json
+  if (-not ($json.PSObject.Properties.Name -contains "terminal_capabilities")) {
+    throw "doctor JSON did not include terminal_capabilities"
+  }
+  return [bool]$json.terminal_capabilities.supports_sgr_mouse
+}
+
 $script:WmuxPath = (Resolve-Path -LiteralPath $Wmux).Path
 $sessionName = "wmux_phase11d_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $previousDefaultShell = $env:WMUX_DEFAULT_SHELL
@@ -178,9 +173,17 @@ if ($sessionCount -ne 0) {
 [void](Invoke-Wmux -Arguments @("server", "status"))
 
 try {
+  $expectedMouseWhenOn = Get-EffectiveMouseSupport
+
+  [void](Invoke-Wmux -Arguments @("set", "-g", "mouse", "off"))
   $status = Invoke-Wmux -Arguments @("server", "status")
   if ((Get-MouseSetting -StatusOutput $status.Output) -ne "off") {
-    throw "expected default mouse setting to be off`n$($status.Output)"
+    throw "expected mouse setting to be off`n$($status.Output)"
+  }
+
+  [void](Invoke-Wmux -Arguments @("new", "-s", $sessionName))
+  if (Open-AttachResponse -SessionName $sessionName) {
+    throw "expected attach response mouse_enabled=false when daemon mouse is off"
   }
 
   [void](Invoke-Wmux -Arguments @("set", "-g", "mouse", "on"))
@@ -189,9 +192,9 @@ try {
     throw "expected mouse setting to be on`n$($status.Output)"
   }
 
-  [void](Invoke-Wmux -Arguments @("new", "-s", $sessionName))
-  if (-not (Open-AttachResponse -SessionName $sessionName)) {
-    throw "expected attach response mouse_enabled=true"
+  $attachMouseWhenOn = Open-AttachResponse -SessionName $sessionName
+  if ($attachMouseWhenOn -ne $expectedMouseWhenOn) {
+    throw "expected attach response mouse_enabled=$expectedMouseWhenOn when daemon mouse is on, got $attachMouseWhenOn"
   }
 
   [void](Invoke-Wmux -Arguments @("set", "-g", "mouse", "off"))

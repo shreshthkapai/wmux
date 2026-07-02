@@ -20,6 +20,8 @@ struct IpcRequest {
   std::string split_direction;
   std::string option_name;
   std::string option_value;
+  std::string key_name;
+  std::string key_action;
   std::uint16_t terminal_columns{0};
   std::uint16_t terminal_rows{0};
   bool force{false};
@@ -31,7 +33,54 @@ struct IpcResponse {
   bool mouse_enabled{false};
   std::string prefix{"C-b"};
   bool status_bar_enabled{true};
+  std::uint16_t escape_time_ms{50};
+  std::string key_bindings;
 };
+
+enum class IpcFrameKind : std::uint8_t {
+  Control = 1,
+  AttachInput = 2,
+  AttachOutput = 3,
+  Event = 4,
+  Error = 5,
+};
+
+enum class IpcFrameError {
+  None,
+  PartialHeader,
+  BadMagic,
+  UnsupportedVersion,
+  UnknownKind,
+  OversizedPayload,
+  TruncatedPayload,
+};
+
+struct IpcFrameHeader {
+  IpcFrameKind kind{IpcFrameKind::Control};
+  std::uint16_t version{1};
+  std::uint64_t request_id{0};
+  std::uint32_t payload_size{0};
+};
+
+struct IpcFrameParseResult {
+  bool ok{false};
+  IpcFrameHeader header;
+  std::string payload;
+  IpcFrameError error{IpcFrameError::None};
+  std::string message;
+};
+
+constexpr std::uint16_t kIpcProtocolVersion = 1;
+constexpr std::size_t kIpcFrameHeaderSize = 19;
+
+std::string_view ipc_frame_kind_name(IpcFrameKind kind);
+std::string_view ipc_frame_error_name(IpcFrameError error);
+std::string make_ipc_frame(
+    IpcFrameKind kind,
+    std::uint64_t request_id,
+    std::string_view payload);
+IpcFrameParseResult parse_ipc_frame_header(std::string_view header);
+IpcFrameParseResult parse_ipc_frame(std::string_view bytes);
 
 enum class AttachFrameType : std::uint8_t {
   Input = 1,
@@ -90,6 +139,8 @@ enum class AttachCopyModeAction : std::uint8_t {
   PageDown = 7,
   StartSelection = 8,
   CopySelection = 9,
+  Home = 10,
+  End = 11,
 };
 
 struct AttachMouseFocusPayload {
@@ -120,7 +171,9 @@ std::string make_response_json(
     std::string_view message,
     bool mouse_enabled,
     std::string_view prefix,
-    bool status_bar_enabled);
+    bool status_bar_enabled,
+    std::uint16_t escape_time_ms,
+    std::string_view key_bindings = {});
 std::optional<IpcResponse> parse_response_json(std::string_view json);
 std::string make_attach_input_frame(std::string_view bytes);
 std::string make_attach_detach_frame();

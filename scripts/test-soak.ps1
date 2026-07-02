@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [string]$Wmux = (Join-Path $PSScriptRoot "..\build-vs\Debug\wmux.exe"),
+  [string]$Wmux = "",
 
   [ValidateRange(10, 604800)]
   [int]$DurationSeconds = 1800,
@@ -26,11 +26,40 @@ param(
   [ValidateRange(1, 100)]
   [int]$CopyPasteLoops = 3,
 
+  [ValidateRange(1, 100)]
+  [int]$WindowIterations = 4,
+
+  [ValidateRange(1, 5000)]
+  [int]$MouseEventIterations = 50,
+
+  [ValidateRange(10, 10000)]
+  [int]$UnicodeLines = 100,
+
+  [ValidateRange(1, 100)]
+  [int]$ShellSpawnFailureLoops = 1,
+
   [string]$OutputDirectory = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$script:ScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($script:ScriptRoot)) {
+  $scriptPath = $MyInvocation.MyCommand.Path
+  if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    $scriptPath = Get-Variable -Name PSCommandPath -ValueOnly -ErrorAction SilentlyContinue
+  }
+  if (-not [string]::IsNullOrWhiteSpace($scriptPath)) {
+    $script:ScriptRoot = Split-Path -Parent $scriptPath
+  }
+}
+if ([string]::IsNullOrWhiteSpace($script:ScriptRoot)) {
+  throw "Unable to resolve script root for test-soak.ps1"
+}
+if ([string]::IsNullOrWhiteSpace($Wmux)) {
+  $Wmux = Join-Path $script:ScriptRoot "..\build-vs\Debug\wmux.exe"
+}
 
 function Invoke-Wmux {
   param(
@@ -167,17 +196,38 @@ function Write-ResourceSample {
   $sample | Export-Csv -LiteralPath $Path -Append -NoTypeInformation
 }
 
+function Write-SoakSummary {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RunDirectory
+  )
+
+  $summaryScript = Join-Path $script:ScriptRoot "summarize-soak-run.ps1"
+  if (-not (Test-Path -LiteralPath $summaryScript)) {
+    Write-Warning "soak summary script not found: $summaryScript"
+    return
+  }
+
+  try {
+    & $summaryScript -RunDirectory $RunDirectory
+  }
+  catch {
+    Write-Warning "failed to write soak summary: $($_.Exception.Message)"
+  }
+}
+
 $script:WmuxPath = (Resolve-Path -LiteralPath $Wmux).Path
-$stressScript = Join-Path $PSScriptRoot "test-stress-suite.ps1"
+$stressScript = Join-Path $script:ScriptRoot "test-stress-suite.ps1"
 $resolvedOutputDirectory =
   if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    Join-Path $PSScriptRoot "..\artifacts\soak"
+    Join-Path $script:ScriptRoot "..\artifacts\soak"
   } else {
     $OutputDirectory
   }
 $runId = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
 $runDirectory = Join-Path $resolvedOutputDirectory $runId
 $samplesPath = Join-Path $runDirectory "resource-samples.csv"
+$previousDefaultShell = $env:WMUX_DEFAULT_SHELL
 
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 
@@ -186,6 +236,7 @@ Write-Host "soak run: $runId"
 Write-Host "output: $runDirectory"
 
 [void](Invoke-Wmux -Arguments @("server", "stop", "--force") -AllowFailure)
+$env:WMUX_DEFAULT_SHELL = "cmd.exe /D /Q"
 $deadline = [DateTime]::UtcNow.AddSeconds($DurationSeconds)
 $cycle = 0
 
@@ -198,6 +249,7 @@ try {
     Write-Host "soak: cycle $cycle"
     Write-ResourceSample -Path $samplesPath -Cycle $cycle -Phase "pre-cycle"
 
+    $output = @()
     try {
       $output = & $stressScript `
         -Wmux $script:WmuxPath `
@@ -208,12 +260,27 @@ try {
         -AttachLoops $AttachLoops `
         -HighOutputLines $HighOutputLines `
         -ResizeIterations $ResizeIterations `
-        -CopyPasteLoops $CopyPasteLoops 2>&1
+        -CopyPasteLoops $CopyPasteLoops `
+        -WindowIterations $WindowIterations `
+        -MouseEventIterations $MouseEventIterations `
+        -UnicodeLines $UnicodeLines `
+        -ShellSpawnFailureLoops $ShellSpawnFailureLoops *>&1
       $output | Set-Content -LiteralPath $cycleLog -Encoding UTF8
     }
     catch {
-      $_ | Out-String | Set-Content -LiteralPath $cycleLog -Encoding UTF8
+      $failure = $_ | Out-String
+      $logLines = [System.Collections.Generic.List[string]]::new()
+      foreach ($line in $output) {
+        $logLines.Add([string]$line)
+      }
+      if ($logLines.Count -gt 0) {
+        $logLines.Add("")
+      }
+      $logLines.Add("SOAK CYCLE FAILURE:")
+      $logLines.Add($failure.TrimEnd())
+      $logLines | Set-Content -LiteralPath $cycleLog -Encoding UTF8
       Write-ResourceSample -Path $samplesPath -Cycle $cycle -Phase "failed-cycle"
+      Write-SoakSummary -RunDirectory $runDirectory
       throw "soak cycle $cycle failed; see $cycleLog"
     }
 
@@ -221,8 +288,14 @@ try {
   }
 
   Write-ResourceSample -Path $samplesPath -Cycle $cycle -Phase "after"
+  Write-SoakSummary -RunDirectory $runDirectory
   Write-Host "ok: soak completed $cycle cycles; samples: $samplesPath"
 }
 finally {
   [void](Invoke-Wmux -Arguments @("server", "stop", "--force") -AllowFailure)
+  if ($null -eq $previousDefaultShell) {
+    Remove-Item Env:WMUX_DEFAULT_SHELL -ErrorAction SilentlyContinue
+  } else {
+    $env:WMUX_DEFAULT_SHELL = $previousDefaultShell
+  }
 }

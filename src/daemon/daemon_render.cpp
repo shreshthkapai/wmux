@@ -1,13 +1,16 @@
 #include "daemon_render.hpp"
 
 #include "wmux/copy_selection.hpp"
+#include "wmux/unicode_width.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace wmux::daemon_internal {
 namespace {
@@ -35,15 +38,14 @@ void append_clipped_text(std::string& out, std::string_view line, int width) {
     return;
   }
 
-  const auto count = static_cast<std::size_t>(std::min<int>(width, static_cast<int>(line.size())));
-  out.append(line.substr(0, count));
-  if (static_cast<int>(count) < width) {
-    out.append(static_cast<std::size_t>(width) - count, ' ');
+  for (const auto& cell : terminal_text_cells_from_text(line, static_cast<std::size_t>(width))) {
+    out.append(cell.text);
   }
 }
 
 bool attributes_equal(const TerminalAttributes& left, const TerminalAttributes& right) {
-  return left.bold == right.bold && left.underline == right.underline &&
+  return left.bold == right.bold && left.dim == right.dim && left.italic == right.italic &&
+         left.underline == right.underline &&
          left.inverse == right.inverse && left.foreground == right.foreground &&
          left.background == right.background;
 }
@@ -79,7 +81,8 @@ void append_color_sgr(std::string& out, int base, std::int32_t color) {
 }
 
 bool default_attributes(const TerminalAttributes& attributes) {
-  return !attributes.bold && !attributes.underline && !attributes.inverse &&
+  return !attributes.bold && !attributes.dim && !attributes.italic && !attributes.underline &&
+         !attributes.inverse &&
          attributes.foreground == -1 && attributes.background == -1;
 }
 
@@ -95,6 +98,12 @@ void append_sgr_for_attributes(
   out += "\x1b[0";
   if (attributes.bold) {
     out += ";1";
+  }
+  if (attributes.dim) {
+    out += ";2";
+  }
+  if (attributes.italic) {
+    out += ";3";
   }
   if (attributes.underline) {
     out += ";4";
@@ -118,6 +127,175 @@ struct CopyLineOverlay {
   std::optional<std::pair<int, int>> selected_columns;
 };
 
+bool diff_cells_equal(const RenderDiffCell& left, const RenderDiffCell& right) {
+  return left.text == right.text && left.width == right.width &&
+         left.inverse == right.inverse && attributes_equal(left.attributes, right.attributes);
+}
+
+bool pane_rect_equal(const PaneLayoutRect& left, const PaneLayoutRect& right) {
+  return left.pane_id == right.pane_id && left.left == right.left && left.top == right.top &&
+         left.width == right.width && left.height == right.height;
+}
+
+std::vector<TerminalTextCell> line_text_cells_for_width(
+    const TerminalLineSnapshot* line,
+    int width) {
+  if (width <= 0) {
+    return {};
+  }
+  if (line == nullptr || line->cells.empty()) {
+    return terminal_text_cells_from_text(
+        line == nullptr ? std::string_view{} : std::string_view{line->text},
+        static_cast<std::size_t>(width));
+  }
+
+  std::vector<TerminalTextCell> cells;
+  cells.reserve(static_cast<std::size_t>(width));
+  for (std::size_t index = 0;
+       index < line->cells.size() && cells.size() < static_cast<std::size_t>(width);
+       ++index) {
+    TerminalCellWidth cell_width = TerminalCellWidth::Narrow;
+    if (index < line->cell_widths.size()) {
+      cell_width = line->cell_widths[index];
+    } else if (line->cells[index].empty()) {
+      cell_width = TerminalCellWidth::WideContinuation;
+    }
+
+    cells.push_back(TerminalTextCell{
+        cell_width == TerminalCellWidth::WideContinuation ? std::string{} : line->cells[index],
+        cell_width});
+  }
+
+  for (std::size_t index = 0; index + 1 < cells.size(); ++index) {
+    if (cells[index].width == TerminalCellWidth::Narrow &&
+        cells[index + 1].width == TerminalCellWidth::WideContinuation) {
+      cells[index].width = TerminalCellWidth::WideLeading;
+    }
+  }
+
+  while (cells.size() < static_cast<std::size_t>(width)) {
+    cells.push_back(TerminalTextCell{" ", TerminalCellWidth::Narrow});
+  }
+  return cells;
+}
+
+int leading_column_for(const std::vector<TerminalTextCell>& cells, int column);
+
+std::optional<std::pair<int, int>> expanded_selected_columns(
+    const std::vector<TerminalTextCell>& cells,
+    std::optional<std::pair<int, int>> selected);
+
+std::vector<RenderDiffCell> render_cells_for_line(
+    const TerminalLineSnapshot* line,
+    int width,
+    const CopyLineOverlay& overlay) {
+  std::vector<RenderDiffCell> rendered;
+  if (width <= 0) {
+    return rendered;
+  }
+
+  const auto cells = line_text_cells_for_width(line, width);
+  rendered.reserve(cells.size());
+
+  std::optional<int> cursor;
+  if (overlay.cursor_column) {
+    cursor = leading_column_for(cells, *overlay.cursor_column);
+  }
+
+  std::optional<std::pair<int, int>> selected;
+  if (overlay.selected_columns) {
+    const int first = std::clamp(overlay.selected_columns->first, 0, width - 1);
+    const int last = std::clamp(overlay.selected_columns->second, 0, width - 1);
+    selected = expanded_selected_columns(cells, std::pair{std::min(first, last), std::max(first, last)});
+  }
+
+  for (int column = 0; column < width; ++column) {
+    const bool selected_column =
+        selected && column >= selected->first && column <= selected->second;
+    const TerminalAttributes attributes =
+        line != nullptr && column < static_cast<int>(line->attributes.size())
+            ? line->attributes[static_cast<std::size_t>(column)]
+            : TerminalAttributes{};
+    rendered.push_back(RenderDiffCell{
+        cells[static_cast<std::size_t>(column)].text,
+        cells[static_cast<std::size_t>(column)].width,
+        attributes,
+        (cursor && column == *cursor) || selected_column});
+  }
+
+  return rendered;
+}
+
+void append_render_cells(
+    std::string& out,
+    const std::vector<RenderDiffCell>& cells,
+    int first,
+    int last_exclusive) {
+  if (first < 0 || last_exclusive <= first ||
+      first >= static_cast<int>(cells.size())) {
+    return;
+  }
+
+  last_exclusive = std::min(last_exclusive, static_cast<int>(cells.size()));
+  bool inverse = false;
+  TerminalAttributes active_attributes;
+  bool style_active = false;
+  const auto set_style = [&](const TerminalAttributes& attributes, bool enabled_inverse) {
+    if (style_active && attributes_equal(attributes, active_attributes) &&
+        enabled_inverse == inverse) {
+      return;
+    }
+    append_sgr_for_attributes(out, attributes, enabled_inverse);
+    active_attributes = attributes;
+    inverse = enabled_inverse;
+    style_active = true;
+  };
+
+  for (int column = first; column < last_exclusive; ++column) {
+    const auto& cell = cells[static_cast<std::size_t>(column)];
+    set_style(cell.attributes, cell.inverse);
+    out.append(cell.text);
+  }
+
+  if (style_active) {
+    out += "\x1b[0m";
+  }
+}
+
+int leading_column_for(const std::vector<TerminalTextCell>& cells, int column) {
+  if (cells.empty()) {
+    return 0;
+  }
+
+  column = std::clamp(column, 0, static_cast<int>(cells.size() - 1));
+  while (column > 0 &&
+         cells[static_cast<std::size_t>(column)].width ==
+             TerminalCellWidth::WideContinuation) {
+    --column;
+  }
+  return column;
+}
+
+std::optional<std::pair<int, int>> expanded_selected_columns(
+    const std::vector<TerminalTextCell>& cells,
+    std::optional<std::pair<int, int>> selected) {
+  if (!selected || cells.empty()) {
+    return std::nullopt;
+  }
+
+  int first = leading_column_for(cells, selected->first);
+  int last = std::clamp(selected->second, 0, static_cast<int>(cells.size() - 1));
+  if (cells[static_cast<std::size_t>(last)].width == TerminalCellWidth::WideContinuation) {
+    last = leading_column_for(cells, last);
+  }
+  if (cells[static_cast<std::size_t>(last)].width == TerminalCellWidth::WideLeading &&
+      last + 1 < static_cast<int>(cells.size())) {
+    ++last;
+  }
+
+  return std::pair{std::min(first, last), std::max(first, last)};
+}
+
 void append_clipped_text_with_overlay(
     std::string& out,
     const TerminalLineSnapshot* line,
@@ -135,15 +313,16 @@ void append_clipped_text_with_overlay(
     return;
   }
 
+  const auto cells = line_text_cells_for_width(line, width);
   std::optional<int> cursor;
   if (overlay.cursor_column) {
-    cursor = std::clamp(*overlay.cursor_column, 0, width - 1);
+    cursor = leading_column_for(cells, *overlay.cursor_column);
   }
   std::optional<std::pair<int, int>> selected;
   if (overlay.selected_columns) {
     const int first = std::clamp(overlay.selected_columns->first, 0, width - 1);
     const int last = std::clamp(overlay.selected_columns->second, 0, width - 1);
-    selected = std::pair{std::min(first, last), std::max(first, last)};
+    selected = expanded_selected_columns(cells, std::pair{std::min(first, last), std::max(first, last)});
   }
 
   bool inverse = false;
@@ -161,12 +340,7 @@ void append_clipped_text_with_overlay(
   };
 
   for (int column = 0; column < width; ++column) {
-    std::string_view cell_text{" "};
-    if (line != nullptr && column < static_cast<int>(line->cells.size())) {
-      cell_text = line->cells[static_cast<std::size_t>(column)];
-    } else if (column < static_cast<int>(text.size())) {
-      cell_text = std::string_view{text}.substr(static_cast<std::size_t>(column), 1);
-    }
+    const auto& cell = cells[static_cast<std::size_t>(column)];
     const bool selected_column =
         selected && column >= selected->first && column <= selected->second;
     const TerminalAttributes attributes =
@@ -174,7 +348,7 @@ void append_clipped_text_with_overlay(
             ? line->attributes[static_cast<std::size_t>(column)]
             : TerminalAttributes{};
     set_style(attributes, (cursor && column == *cursor) || selected_column);
-    out.append(cell_text);
+    out.append(cell.text);
   }
   if (style_active) {
     out += "\x1b[0m";
@@ -293,6 +467,89 @@ const TerminalLineSnapshot* snapshot_line_snapshot_at(
   return nullptr;
 }
 
+std::size_t normalize_copy_column_for_line(
+    const PtyOutputSnapshot& snapshot,
+    std::size_t line,
+    int width,
+    std::size_t column) {
+  if (width <= 0) {
+    return 0;
+  }
+
+  const auto cells = line_text_cells_for_width(
+      snapshot_line_snapshot_at(snapshot, line),
+      width);
+  return static_cast<std::size_t>(
+      leading_column_for(cells, static_cast<int>(std::min(column, static_cast<std::size_t>(width - 1)))));
+}
+
+std::size_t next_copy_column_for_line(
+    const PtyOutputSnapshot& snapshot,
+    std::size_t line,
+    int width,
+    std::size_t column) {
+  if (width <= 0) {
+    return 0;
+  }
+
+  const auto cells = line_text_cells_for_width(
+      snapshot_line_snapshot_at(snapshot, line),
+      width);
+  const int current = leading_column_for(
+      cells,
+      static_cast<int>(std::min(column, static_cast<std::size_t>(width - 1))));
+  const auto current_width = cells[static_cast<std::size_t>(current)].width;
+  int next = current + (current_width == TerminalCellWidth::WideLeading ? 2 : 1);
+  while (next < width &&
+         cells[static_cast<std::size_t>(next)].width == TerminalCellWidth::WideContinuation) {
+    ++next;
+  }
+  return next >= width ? static_cast<std::size_t>(current) : static_cast<std::size_t>(next);
+}
+
+std::size_t previous_copy_column_for_line(
+    const PtyOutputSnapshot& snapshot,
+    std::size_t line,
+    int width,
+    std::size_t column) {
+  if (width <= 0) {
+    return 0;
+  }
+
+  const auto cells = line_text_cells_for_width(
+      snapshot_line_snapshot_at(snapshot, line),
+      width);
+  int current = leading_column_for(
+      cells,
+      static_cast<int>(std::min(column, static_cast<std::size_t>(width - 1))));
+  if (current == 0) {
+    return 0;
+  }
+  --current;
+  return static_cast<std::size_t>(leading_column_for(cells, current));
+}
+
+std::size_t last_copy_column_for_line(
+    const PtyOutputSnapshot& snapshot,
+    std::size_t line,
+    int width) {
+  if (width <= 0) {
+    return 0;
+  }
+
+  const auto cells = line_text_cells_for_width(
+      snapshot_line_snapshot_at(snapshot, line),
+      width);
+  for (int column = width - 1; column >= 0; --column) {
+    const auto leading = leading_column_for(cells, column);
+    const auto& cell = cells[static_cast<std::size_t>(leading)];
+    if (!cell.text.empty() && cell.text != " ") {
+      return static_cast<std::size_t>(leading);
+    }
+  }
+  return 0;
+}
+
 CopyModePoint copy_mode_cursor_point(
     const CopyModeState& copy_mode,
     const PtyOutputSnapshot& snapshot,
@@ -367,6 +624,318 @@ bool should_render_pane_body(const RenderFrameOptions& options, PaneId pane_id) 
   return options.dirty_panes.empty() || options.dirty_panes.contains(pane_id);
 }
 
+StatusLineMode effective_status_mode(
+    const RenderStatus& status,
+    const CopyModeState& copy_mode) {
+  if (copy_mode.active) {
+    return StatusLineMode::Copy;
+  }
+  if (status.mouse_drag_active) {
+    return StatusLineMode::MouseDrag;
+  }
+  return status.mode;
+}
+
+StatusState render_status_state(
+    const ActiveWindowFrame& frame,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    std::size_t active_viewport_offset) {
+  StatusState state = status.state;
+  const auto mode = effective_status_mode(status, copy_mode);
+
+  std::ostringstream left;
+  if (mode == StatusLineMode::Copy) {
+    left << " copy-mode";
+  } else {
+    left << " wmux";
+  }
+  left << " [" << frame.session_name << "] window ";
+  if (frame.window_index != 0) {
+    left << frame.window_index << ":";
+  }
+  left << frame.window_name << " pane "
+       << (mode == StatusLineMode::Copy ? copy_mode.pane_id : frame.active_pane_id);
+  state.permanent_left.text = left.str();
+
+  std::ostringstream right;
+  right << "mode:" << status_line_mode_name(mode);
+  if (mode == StatusLineMode::Copy) {
+    right << " cursor " << copy_mode.cursor_row + 1 << "," << copy_mode.cursor_column + 1;
+    if (copy_mode.selection_active) {
+      right << " selecting";
+    }
+  }
+  if (active_viewport_offset > 0) {
+    right << " scroll:" << active_viewport_offset;
+  }
+  right << " mouse:" << (status.mouse_enabled ? "on" : "off");
+  state.permanent_right.text = right.str();
+  return state;
+}
+
+RenderStatus render_status_from_override(std::string_view status_override) {
+  RenderStatus status;
+  if (!status_override.empty()) {
+    status_set_temporary(
+        status.state,
+        status_override,
+        std::chrono::steady_clock::now(),
+        kDefaultStatusMessageTtl);
+  }
+  return status;
+}
+
+RenderDiffRow build_body_row(
+    const RenderPane& pane,
+    const PtyOutputSnapshot& snapshot,
+    int row,
+    int width,
+    std::size_t line_index,
+    std::size_t total_lines,
+    std::size_t viewport_offset,
+    const CopyModeState& copy_mode) {
+  std::optional<int> cursor_column;
+  CopyModePoint cursor_point;
+  std::optional<std::pair<int, int>> selected_columns;
+  const int height = body_height(pane.rect);
+  if (copy_mode.active && copy_mode.pane_id == pane.rect.pane_id &&
+      row == static_cast<int>(copy_mode.cursor_row)) {
+    cursor_column = static_cast<int>(copy_mode.cursor_column);
+  }
+  if (copy_mode.active && copy_mode.pane_id == pane.rect.pane_id) {
+    cursor_point = copy_mode_cursor_point(copy_mode, snapshot, height, viewport_offset);
+    selected_columns = selected_columns_for_line(copy_mode, cursor_point, line_index, width);
+  }
+
+  const auto* line = line_index < total_lines ? snapshot_line_snapshot_at(snapshot, line_index)
+                                              : nullptr;
+  return RenderDiffRow{
+      body_top(pane.rect) + row,
+      body_left(pane.rect),
+      width,
+      render_cells_for_line(line, width, CopyLineOverlay{cursor_column, selected_columns})};
+}
+
+RenderDiffPane build_pane_diff_state(
+    const RenderPane& pane,
+    const PtyOutputSnapshot& snapshot,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode) {
+  RenderDiffPane state;
+  state.rect = pane.rect;
+
+  const int width = body_width(pane.rect);
+  const int height = body_height(pane.rect);
+  if (width <= 0 || height <= 0) {
+    return state;
+  }
+
+  const auto viewport = viewport_states.find(pane.rect.pane_id);
+  const auto requested_offset =
+      viewport == viewport_states.end() ? std::size_t{0} : viewport->second.offset;
+  state.viewport_offset = clamped_viewport_offset(snapshot, height, requested_offset);
+  state.first_visible_line = first_visible_line_index(snapshot, height, state.viewport_offset);
+  const auto total_lines = snapshot_line_count(snapshot);
+
+  state.body_rows.reserve(static_cast<std::size_t>(height));
+  for (int row = 0; row < height; ++row) {
+    state.body_rows.push_back(build_body_row(
+        pane,
+        snapshot,
+        row,
+        width,
+        state.first_visible_line + static_cast<std::size_t>(row),
+        total_lines,
+        state.viewport_offset,
+        copy_mode));
+  }
+  return state;
+}
+
+bool render_diff_state_compatible(
+    const RenderDiffState& diff_state,
+    const ActiveWindowFrame& frame) {
+  if (!diff_state.initialized || diff_state.columns != frame.columns ||
+      diff_state.rows != frame.rows ||
+      diff_state.status_bar_enabled != frame.status_bar_enabled) {
+    return false;
+  }
+
+  for (const auto& pane : frame.panes) {
+    const auto cached = diff_state.panes.find(pane.rect.pane_id);
+    if (cached != diff_state.panes.end() &&
+        !pane_rect_equal(cached->second.rect, pane.rect)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void expand_changed_cells_for_wide_glyphs(
+    const std::vector<RenderDiffCell>& cells,
+    std::vector<bool>& changed) {
+  for (std::size_t column = 0; column < cells.size() && column < changed.size(); ++column) {
+    if (!changed[column]) {
+      continue;
+    }
+    if (cells[column].width == TerminalCellWidth::WideLeading &&
+        column + 1 < changed.size()) {
+      changed[column + 1] = true;
+    } else if (cells[column].width == TerminalCellWidth::WideContinuation && column > 0) {
+      changed[column - 1] = true;
+    }
+  }
+}
+
+bool append_changed_row(
+    std::string& out,
+    const RenderDiffRow& next,
+    const RenderDiffRow* previous) {
+  if (next.width <= 0 || next.cells.empty()) {
+    return false;
+  }
+
+  const bool row_changed_shape =
+      previous == nullptr || previous->row != next.row || previous->column != next.column ||
+      previous->width != next.width || previous->cells.size() != next.cells.size();
+  std::vector<bool> changed(next.cells.size(), row_changed_shape);
+  if (!row_changed_shape && previous != nullptr) {
+    for (std::size_t column = 0; column < next.cells.size(); ++column) {
+      changed[column] = !diff_cells_equal(next.cells[column], previous->cells[column]);
+    }
+  }
+
+  expand_changed_cells_for_wide_glyphs(next.cells, changed);
+  if (previous != nullptr) {
+    expand_changed_cells_for_wide_glyphs(previous->cells, changed);
+  }
+
+  bool wrote = false;
+  for (int column = 0; column < static_cast<int>(changed.size());) {
+    if (!changed[static_cast<std::size_t>(column)]) {
+      ++column;
+      continue;
+    }
+
+    int start = column;
+    while (start > 0 &&
+           next.cells[static_cast<std::size_t>(start)].width ==
+               TerminalCellWidth::WideContinuation) {
+      --start;
+    }
+
+    int end = column + 1;
+    while (end < static_cast<int>(changed.size()) &&
+           changed[static_cast<std::size_t>(end)]) {
+      ++end;
+    }
+    if (end < static_cast<int>(next.cells.size()) &&
+        next.cells[static_cast<std::size_t>(end)].width ==
+            TerminalCellWidth::WideContinuation) {
+      ++end;
+    }
+
+    append_cursor_move(out, next.row, next.column + start);
+    append_render_cells(out, next.cells, start, end);
+    wrote = true;
+    column = end;
+  }
+
+  return wrote;
+}
+
+bool append_pane_body_diff(
+    std::string& out,
+    RenderDiffState& diff_state,
+    const RenderPane& pane,
+    const PtyOutputSnapshot& snapshot,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode) {
+  auto next = build_pane_diff_state(pane, snapshot, viewport_states, copy_mode);
+  const auto previous = diff_state.panes.find(pane.rect.pane_id);
+  bool wrote = false;
+
+  for (std::size_t row = 0; row < next.body_rows.size(); ++row) {
+    const RenderDiffRow* previous_row = nullptr;
+    if (previous != diff_state.panes.end() && row < previous->second.body_rows.size()) {
+      previous_row = &previous->second.body_rows[row];
+    }
+    wrote = append_changed_row(out, next.body_rows[row], previous_row) || wrote;
+  }
+
+  diff_state.panes[pane.rect.pane_id] = std::move(next);
+  return wrote;
+}
+
+std::string render_partial_body_diff(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderFrameOptions& options,
+    RenderDiffState& diff_state) {
+  std::string out;
+  for (const auto& pane : frame.panes) {
+    if (!should_render_pane_body(options, pane.rect.pane_id)) {
+      continue;
+    }
+
+    const auto snapshot = snapshots.find(pane.rect.pane_id);
+    if (snapshot == snapshots.end()) {
+      diff_state.panes.erase(pane.rect.pane_id);
+      continue;
+    }
+
+    (void)append_pane_body_diff(
+        out, diff_state, pane, snapshot->second, viewport_states, copy_mode);
+  }
+  return out;
+}
+
+void sync_render_diff_state(
+    RenderDiffState& diff_state,
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status) {
+  RenderDiffState next;
+  next.columns = frame.columns;
+  next.rows = frame.rows;
+  next.status_bar_enabled = frame.status_bar_enabled;
+  next.initialized = true;
+  next.panes.reserve(frame.panes.size());
+
+  std::size_t active_viewport_offset = 0;
+  for (const auto& pane : frame.panes) {
+    const auto snapshot = snapshots.find(pane.rect.pane_id);
+    if (snapshot == snapshots.end()) {
+      continue;
+    }
+
+    auto pane_state =
+        build_pane_diff_state(pane, snapshot->second, viewport_states, copy_mode);
+    if (pane.active) {
+      active_viewport_offset = pane_state.viewport_offset;
+    }
+    next.panes.emplace(pane.rect.pane_id, std::move(pane_state));
+  }
+
+  const bool has_visible_temporary =
+      status_has_visible_temporary(status.state, std::chrono::steady_clock::now());
+  const bool show_status = frame.rows > 1 &&
+                           (frame.status_bar_enabled || has_visible_temporary ||
+                            copy_mode.active);
+  if (show_status) {
+    next.status_line = format_status_line(
+        render_status_state(frame, copy_mode, status, active_viewport_offset),
+        frame.columns);
+  }
+
+  diff_state = std::move(next);
+}
+
 }  // namespace
 
 int body_width(const PaneLayoutRect& rect) {
@@ -383,12 +952,21 @@ std::string render_frame(
     const PaneViewportStates& viewport_states,
     const CopyModeState& copy_mode,
     std::string_view status_override) {
+  return render_frame(frame, snapshots, viewport_states, copy_mode, render_status_from_override(status_override));
+}
+
+std::string render_frame(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status) {
   return render_frame_update(
       frame,
       snapshots,
       viewport_states,
       copy_mode,
-      status_override,
+      status,
       RenderFrameOptions{});
 }
 
@@ -399,6 +977,32 @@ std::string render_frame_update(
     const CopyModeState& copy_mode,
     std::string_view status_override,
     const RenderFrameOptions& options) {
+  return render_frame_update(
+      frame,
+      snapshots,
+      viewport_states,
+      copy_mode,
+      render_status_from_override(status_override),
+      options);
+}
+
+std::string render_frame_update_impl(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options,
+    RenderDiffState* diff_state) {
+  const bool can_use_diff =
+      diff_state != nullptr && !options.clear_terminal && !options.draw_borders &&
+      !options.draw_status && !options.dirty_panes.empty() &&
+      render_diff_state_compatible(*diff_state, frame);
+  if (can_use_diff) {
+    return render_partial_body_diff(
+        frame, snapshots, viewport_states, copy_mode, options, *diff_state);
+  }
+
   std::string out;
   if (options.clear_terminal) {
     out += kClearTerminal;
@@ -465,46 +1069,60 @@ std::string render_frame_update(
     }
   }
 
+  const bool has_visible_temporary =
+      status_has_visible_temporary(status.state, std::chrono::steady_clock::now());
   const bool show_status = frame.rows > 1 &&
                            options.draw_status &&
-                           (frame.status_bar_enabled || !status_override.empty() ||
+                           (frame.status_bar_enabled || has_visible_temporary ||
                             copy_mode.active);
   if (show_status) {
-    std::ostringstream status;
-    if (status_override.empty()) {
-      if (copy_mode.active) {
-        status << " copy-mode [" << frame.session_name << "] window " << frame.window_name
-               << " pane " << copy_mode.pane_id << " "
-               << "cursor " << copy_mode.cursor_row + 1 << ","
-               << copy_mode.cursor_column + 1 << " ";
-        if (copy_mode.selection_active) {
-          status << "selecting ";
-        }
-      } else {
-        status << " wmux [" << frame.session_name << "] window " << frame.window_name
-               << " pane " << frame.active_pane_id << " ";
-      }
-      if (active_viewport_offset > 0) {
-        status << "scroll " << active_viewport_offset << " ";
-      }
-    } else {
-      status << status_override;
-    }
-    std::string status_line = status.str();
-    if (static_cast<int>(status_line.size()) > frame.columns) {
-      status_line.resize(static_cast<std::size_t>(frame.columns));
-    }
-    if (static_cast<int>(status_line.size()) < frame.columns) {
-      status_line.append(static_cast<std::size_t>(frame.columns) - status_line.size(), ' ');
-    }
+    const auto status_model =
+        render_status_state(frame, copy_mode, status, active_viewport_offset);
+    const auto status_line = format_status_line(status_model, frame.columns);
 
     append_cursor_move(out, frame.rows - 1, 0);
     out += "\x1b[7m";
-    out += status_line;
+    append_clipped_text(out, status_line, frame.columns);
     out += "\x1b[0m";
   }
 
+  const bool rendered_complete_frame =
+      options.clear_terminal && options.draw_borders && options.draw_status &&
+      options.dirty_panes.empty();
+  if (diff_state != nullptr && rendered_complete_frame) {
+    sync_render_diff_state(*diff_state, frame, snapshots, viewport_states, copy_mode, status);
+  } else if (diff_state != nullptr) {
+    reset_render_diff_state(*diff_state);
+  }
+
   return out;
+}
+
+std::string render_frame_update(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options) {
+  return render_frame_update_impl(
+      frame, snapshots, viewport_states, copy_mode, status, options, nullptr);
+}
+
+std::string render_frame_update(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options,
+    RenderDiffState& diff_state) {
+  return render_frame_update_impl(
+      frame, snapshots, viewport_states, copy_mode, status, options, &diff_state);
+}
+
+void reset_render_diff_state(RenderDiffState& diff_state) {
+  diff_state = {};
 }
 
 void update_viewport_states(
@@ -686,6 +1304,14 @@ bool apply_copy_mode_action(
   const auto visible_lines =
       snapshot == snapshots.end() ? std::size_t{1}
                                   : visible_copy_line_count(snapshot->second, height);
+  std::size_t viewport_offset = 0;
+  if (snapshot != snapshots.end()) {
+    const auto viewport = viewport_states.find(copy_mode.pane_id);
+    viewport_offset =
+        viewport == viewport_states.end()
+            ? std::size_t{0}
+            : clamped_viewport_offset(snapshot->second, height, viewport->second.offset);
+  }
 
   switch (action) {
     case AttachCopyModeAction::Enter:
@@ -711,12 +1337,28 @@ bool apply_copy_mode_action(
       }
       break;
     case AttachCopyModeAction::CursorLeft:
-      if (copy_mode.cursor_column > 0) {
+      if (snapshot != snapshots.end() && width > 0 && height > 0) {
+        const auto cursor =
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+        copy_mode.cursor_column = previous_copy_column_for_line(
+            snapshot->second,
+            cursor.line,
+            width,
+            copy_mode.cursor_column);
+      } else if (copy_mode.cursor_column > 0) {
         --copy_mode.cursor_column;
       }
       break;
     case AttachCopyModeAction::CursorRight:
-      if (width > 0) {
+      if (snapshot != snapshots.end() && width > 0 && height > 0) {
+        const auto cursor =
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+        copy_mode.cursor_column = next_copy_column_for_line(
+            snapshot->second,
+            cursor.line,
+            width,
+            copy_mode.cursor_column);
+      } else if (width > 0) {
         copy_mode.cursor_column =
             std::min(copy_mode.cursor_column + 1, static_cast<std::size_t>(width - 1));
       }
@@ -729,18 +1371,30 @@ bool apply_copy_mode_action(
       (void)apply_viewport_scroll(
           copy_mode.pane_id, frame, snapshots, viewport_states, AttachScrollAction::PageDown);
       break;
+    case AttachCopyModeAction::Home:
+      copy_mode.cursor_column = 0;
+      break;
+    case AttachCopyModeAction::End:
+      if (snapshot != snapshots.end() && width > 0 && height > 0) {
+        const auto cursor =
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+        copy_mode.cursor_column = last_copy_column_for_line(snapshot->second, cursor.line, width);
+      } else if (width > 0) {
+        copy_mode.cursor_column = static_cast<std::size_t>(width - 1);
+      }
+      break;
     case AttachCopyModeAction::StartSelection:
       copy_mode.selection_active = true;
       if (snapshot == snapshots.end()) {
         copy_mode.selection_anchor = CopyModePoint{copy_mode.cursor_row, copy_mode.cursor_column};
       } else {
         const auto viewport = viewport_states.find(copy_mode.pane_id);
-        const auto viewport_offset =
+        const auto selection_viewport_offset =
             viewport == viewport_states.end()
                 ? std::size_t{0}
                 : clamped_viewport_offset(snapshot->second, height, viewport->second.offset);
         copy_mode.selection_anchor =
-            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, selection_viewport_offset);
       }
       break;
     case AttachCopyModeAction::CopySelection:
@@ -749,12 +1403,12 @@ bool apply_copy_mode_action(
       }
       {
         const auto viewport = viewport_states.find(copy_mode.pane_id);
-        const auto viewport_offset =
+        const auto copy_viewport_offset =
             viewport == viewport_states.end()
                 ? std::size_t{0}
                 : clamped_viewport_offset(snapshot->second, height, viewport->second.offset);
         const auto cursor =
-            copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+            copy_mode_cursor_point(copy_mode, snapshot->second, height, copy_viewport_offset);
         copied_text = extract_copy_selection_text(
             snapshot->second,
             CopySelectionRange{
@@ -770,6 +1424,15 @@ bool apply_copy_mode_action(
   }
 
   clamp_copy_mode_cursor(copy_mode, frame, snapshots);
+  if (copy_mode.active && snapshot != snapshots.end() && width > 0 && height > 0) {
+    const auto cursor =
+        copy_mode_cursor_point(copy_mode, snapshot->second, height, viewport_offset);
+    copy_mode.cursor_column = normalize_copy_column_for_line(
+        snapshot->second,
+        cursor.line,
+        width,
+        copy_mode.cursor_column);
+  }
   return true;
 }
 

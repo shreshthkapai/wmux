@@ -4,6 +4,8 @@ wmux treats stability and predictable performance as release criteria. The scrip
 `scripts/` are intended to catch lifecycle, IPC, rendering, resize, and resource-growth
 regressions before wider testing.
 
+For the full test-tier contract, see [Testing Strategy](testing-strategy.md).
+
 ## Release Gate
 
 The release gate is the required check before calling a build stable:
@@ -29,9 +31,51 @@ Run the bounded stress suite from a Windows PowerShell prompt:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-stress-suite.ps1 -Wmux .\build-vs\Debug\wmux.exe
 ```
 
-The suite exercises repeated session create/kill, attach/detach, pane split/kill, daemon
-stop/restart, malformed IPC, high-output rendering, resize storms, and copy/paste paths.
-It expects to own an empty daemon and uses `cmd.exe /D /Q` as the default shell.
+The default bounded matrix exercises repeated session create/kill, attach/detach,
+window creation/switching, pane split/kill, daemon stop/restart, malformed IPC,
+high-output rendering, resize storms, copy/paste, mouse event pressure, Unicode
+output, and shell-spawn failure handling. It expects to own an empty daemon and
+uses `cmd.exe /D /Q` as the default shell except during the explicit spawn-failure
+section.
+
+Run one matrix section while iterating:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-stress-suite.ps1 `
+  -Wmux .\build-vs\Debug\wmux.exe `
+  -Only MouseFlood
+```
+
+Useful `-Only` values are:
+
+```text
+CreateKill
+AttachDetach
+WindowSwitch
+PaneSplitKill
+OutputResize
+CopyPaste
+MouseFlood
+UnicodeOutput
+ShellSpawnFailure
+DaemonIpc
+```
+
+For a heavier local run, increase the bounded counters explicitly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-stress-suite.ps1 `
+  -Wmux .\build-vs\Debug\wmux.exe `
+  -SessionIterations 100 `
+  -PaneIterations 100 `
+  -AttachLoops 100 `
+  -WindowIterations 25 `
+  -HighOutputLines 10000 `
+  -ResizeIterations 500 `
+  -MouseEventIterations 2000 `
+  -UnicodeLines 5000 `
+  -CopyPasteLoops 25
+```
 
 ## Soak Test
 

@@ -293,6 +293,22 @@ void copies_wide_utf8_cells_by_terminal_columns() {
   assert(copied == "a\xe4\xb8\xadz");
 }
 
+void copies_multi_codepoint_wide_grapheme_once() {
+  const std::string emoji = "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb";
+  const auto snapshot = snapshot_from_lines({
+      line_with_cells({emoji, "", "x", " "}, false),
+  });
+
+  const auto copied = wmux::extract_copy_selection_text(
+      snapshot,
+      wmux::CopySelectionRange{
+          wmux::CopySelectionPoint{0, 0},
+          wmux::CopySelectionPoint{0, 2}},
+      4);
+
+  assert(copied == emoji + "x");
+}
+
 void copies_wide_utf8_cells_across_wrapped_lines() {
   const auto snapshot = snapshot_from_scrollback_and_screen(
       {
@@ -365,6 +381,7 @@ void run_copy_selection_tests() {
   copies_visible_cleared_screen_blanks_without_erasing_scrollback();
   keeps_complete_utf8_sequences_when_selected();
   copies_wide_utf8_cells_by_terminal_columns();
+  copies_multi_codepoint_wide_grapheme_once();
   copies_wide_utf8_cells_across_wrapped_lines();
   drops_incomplete_utf8_boundary_bytes();
   falls_back_to_plain_line_text();

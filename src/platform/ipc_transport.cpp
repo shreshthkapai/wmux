@@ -1,7 +1,10 @@
-#include "wmux/ipc_transport.hpp"
+#include "wmux/platform/ipc_transport.hpp"
 
 #include "wmux/logging.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <sstream>
@@ -9,10 +12,12 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <sddl.h>
 #else
 #include <cerrno>
 #include <cstring>
@@ -30,11 +35,63 @@ constexpr auto kStartupSleep = std::chrono::milliseconds{50};
 constexpr auto kPipeConnectAttempts = 20;
 constexpr auto kPipeConnectSleep = std::chrono::milliseconds{25};
 
+std::uint64_t next_ipc_request_id() {
+  static std::atomic_uint64_t next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 IpcResponse transport_error(std::string message) {
   IpcResponse response;
   response.ok = false;
   response.message = std::move(message);
   return response;
+}
+
+IpcResponse response_from_ipc_frame(
+    const IpcFrameParseResult& header,
+    std::string payload,
+    std::uint64_t request_id) {
+  if (!header.ok) {
+    log_event(
+        LogLevel::Warn,
+        "client.ipc",
+        "invalid_response_frame",
+        {{"error", std::string{ipc_frame_error_name(header.error)}},
+         {"message", header.message}});
+    return transport_error("wmux: daemon returned an invalid IPC frame\n");
+  }
+
+  if (header.header.request_id != request_id) {
+    log_event(
+        LogLevel::Warn,
+        "client.ipc",
+        "response_request_id_mismatch",
+        {{"expected", std::to_string(request_id)},
+         {"actual", std::to_string(header.header.request_id)}});
+    return transport_error("wmux: daemon response request id did not match\n");
+  }
+
+  if (header.header.kind != IpcFrameKind::Control && header.header.kind != IpcFrameKind::Error) {
+    log_event(
+        LogLevel::Warn,
+        "client.ipc",
+        "unexpected_response_kind",
+        {{"kind", std::string{ipc_frame_kind_name(header.header.kind)}}});
+    return transport_error("wmux: daemon returned an unexpected IPC frame\n");
+  }
+
+  if (const auto response = parse_response_json(payload)) {
+    return *response;
+  }
+
+  log_event(
+      LogLevel::Error,
+      "client.ipc",
+      "invalid_response",
+      {{"request_id", std::to_string(request_id)},
+       {"bytes", std::to_string(payload.size())},
+       {"sample", payload.substr(0, 512)}});
+  return transport_error("wmux: daemon returned an invalid response\n");
 }
 
 #ifdef _WIN32
@@ -50,6 +107,72 @@ std::wstring widen(std::string_view value) {
   MultiByteToWideChar(
       CP_UTF8, 0, value.data(), static_cast<int>(value.size()), wide.data(), required);
   return wide;
+}
+
+std::string narrow(const std::wstring& value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  const int required = WideCharToMultiByte(
+      CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  std::string narrow_value(static_cast<std::size_t>(required), '\0');
+  WideCharToMultiByte(
+      CP_UTF8,
+      0,
+      value.data(),
+      static_cast<int>(value.size()),
+      narrow_value.data(),
+      required,
+      nullptr,
+      nullptr);
+  return narrow_value;
+}
+
+std::string sanitize_pipe_component(std::string value) {
+  for (char& ch : value) {
+    const auto byte = static_cast<unsigned char>(ch);
+    if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+        (byte >= '0' && byte <= '9') || ch == '-' || ch == '_' || ch == '.') {
+      continue;
+    }
+    ch = '_';
+  }
+  if (value.empty()) {
+    return "unknown-user";
+  }
+  return value;
+}
+
+std::string current_user_pipe_tag() {
+  HANDLE token = nullptr;
+  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    if (bytes > 0) {
+      std::vector<unsigned char> buffer(bytes);
+      if (GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes)) {
+        const auto* user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+        LPWSTR sid_text = nullptr;
+        if (ConvertSidToStringSidW(user->User.Sid, &sid_text)) {
+          std::wstring sid{sid_text};
+          LocalFree(sid_text);
+          CloseHandle(token);
+          return sanitize_pipe_component(narrow(sid));
+        }
+      }
+    }
+    CloseHandle(token);
+  }
+
+  std::wstring user_name(256, L'\0');
+  DWORD user_name_size = static_cast<DWORD>(user_name.size());
+  if (GetUserNameW(user_name.data(), &user_name_size) && user_name_size > 0) {
+    user_name.resize(user_name_size - 1);
+    return sanitize_pipe_component(narrow(user_name));
+  }
+
+  return "unknown-user";
 }
 
 std::wstring quote_for_command_line(const std::wstring& value) {
@@ -105,6 +228,43 @@ HANDLE connect_windows_pipe(const std::wstring& endpoint) {
   return INVALID_HANDLE_VALUE;
 }
 
+bool write_all_windows(HANDLE pipe, std::string_view value) {
+  while (!value.empty()) {
+    DWORD bytes_written = 0;
+    const auto bytes_to_write =
+        static_cast<DWORD>(std::min<std::size_t>(value.size(), 64 * 1024));
+    const BOOL ok = WriteFile(pipe, value.data(), bytes_to_write, &bytes_written, nullptr);
+    if (!ok || bytes_written == 0) {
+      return false;
+    }
+    value.remove_prefix(bytes_written);
+  }
+
+  return true;
+}
+
+bool read_exact_windows(HANDLE pipe, char* data, std::size_t size) {
+  std::size_t total = 0;
+  while (total < size) {
+    DWORD bytes_read = 0;
+    const auto remaining = static_cast<DWORD>(std::min<std::size_t>(size - total, 64 * 1024));
+    const BOOL ok = ReadFile(pipe, data + total, remaining, &bytes_read, nullptr);
+    if (bytes_read > 0) {
+      total += bytes_read;
+      if (total == size) {
+        return true;
+      }
+    }
+    if (!ok) {
+      return false;
+    }
+    if (bytes_read == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 IpcResponse send_windows_request(std::string_view request_json) {
   const auto endpoint = widen(command_endpoint_name());
   HANDLE pipe = connect_windows_pipe(endpoint);
@@ -112,40 +272,32 @@ IpcResponse send_windows_request(std::string_view request_json) {
     return transport_error("wmux: daemon is not running\n");
   }
 
-  DWORD bytes_written = 0;
-  const BOOL write_ok = WriteFile(
-      pipe,
-      request_json.data(),
-      static_cast<DWORD>(request_json.size()),
-      &bytes_written,
-      nullptr);
-  if (!write_ok || static_cast<std::size_t>(bytes_written) != request_json.size()) {
+  const std::uint64_t request_id = next_ipc_request_id();
+  const auto request_frame = make_ipc_frame(IpcFrameKind::Control, request_id, request_json);
+  if (!write_all_windows(pipe, request_frame)) {
     CloseHandle(pipe);
     return transport_error("wmux: failed to write daemon request\n");
   }
 
-  std::string raw_response;
-  char buffer[512];
-  DWORD bytes_read = 0;
-  while (ReadFile(pipe, buffer, sizeof(buffer), &bytes_read, nullptr) && bytes_read > 0) {
-    raw_response.append(buffer, buffer + bytes_read);
-    if (raw_response.find('\n') != std::string::npos) {
-      break;
+  std::array<char, kIpcFrameHeaderSize> raw_header{};
+  if (!read_exact_windows(pipe, raw_header.data(), raw_header.size())) {
+    CloseHandle(pipe);
+    return transport_error("wmux: failed to read daemon response\n");
+  }
+
+  const auto header =
+      parse_ipc_frame_header(std::string_view{raw_header.data(), raw_header.size()});
+  std::string payload;
+  if (header.ok && header.header.payload_size > 0) {
+    payload.resize(header.header.payload_size);
+    if (!read_exact_windows(pipe, payload.data(), payload.size())) {
+      CloseHandle(pipe);
+      return transport_error("wmux: failed to read daemon response payload\n");
     }
   }
-
   CloseHandle(pipe);
 
-  if (const auto response = parse_response_json(raw_response)) {
-    return *response;
-  }
-  log_event(
-      LogLevel::Error,
-      "client.ipc",
-      "invalid_response",
-      {{"bytes", std::to_string(raw_response.size())},
-       {"sample", raw_response.substr(0, 512)}});
-  return transport_error("wmux: daemon returned an invalid response\n");
+  return response_from_ipc_frame(header, std::move(payload), request_id);
 }
 
 bool start_daemon_process(const std::filesystem::path& executable_path, std::string& error) {
@@ -235,6 +387,18 @@ bool write_all(int fd, std::string_view value) {
   return true;
 }
 
+bool read_exact(int fd, char* data, std::size_t size) {
+  std::size_t total = 0;
+  while (total < size) {
+    const ssize_t count = recv(fd, data + total, size - total, 0);
+    if (count <= 0) {
+      return false;
+    }
+    total += static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
 IpcResponse send_posix_request(std::string_view request_json) {
   Fd client{socket(AF_UNIX, SOCK_STREAM, 0)};
   if (!client) {
@@ -253,31 +417,28 @@ IpcResponse send_posix_request(std::string_view request_json) {
     return transport_error("wmux: daemon is not running\n");
   }
 
-  if (!write_all(client.get(), request_json)) {
+  const std::uint64_t request_id = next_ipc_request_id();
+  const auto request_frame = make_ipc_frame(IpcFrameKind::Control, request_id, request_json);
+  if (!write_all(client.get(), request_frame)) {
     return transport_error("wmux: failed to write daemon request\n");
   }
 
-  std::string raw_response;
-  char buffer[512];
-  while (true) {
-    const ssize_t count = recv(client.get(), buffer, sizeof(buffer), 0);
-    if (count < 0) {
-      return transport_error("wmux: failed to read daemon response\n");
-    }
-    if (count == 0) {
-      break;
-    }
+  std::array<char, kIpcFrameHeaderSize> raw_header{};
+  if (!read_exact(client.get(), raw_header.data(), raw_header.size())) {
+    return transport_error("wmux: failed to read daemon response\n");
+  }
 
-    raw_response.append(buffer, buffer + count);
-    if (raw_response.find('\n') != std::string::npos) {
-      break;
+  const auto header =
+      parse_ipc_frame_header(std::string_view{raw_header.data(), raw_header.size()});
+  std::string payload;
+  if (header.ok && header.header.payload_size > 0) {
+    payload.resize(header.header.payload_size);
+    if (!read_exact(client.get(), payload.data(), payload.size())) {
+      return transport_error("wmux: failed to read daemon response payload\n");
     }
   }
 
-  if (const auto response = parse_response_json(raw_response)) {
-    return *response;
-  }
-  return transport_error("wmux: daemon returned an invalid response\n");
+  return response_from_ipc_frame(header, std::move(payload), request_id);
 }
 
 bool start_daemon_process(const std::filesystem::path& executable_path, std::string& error) {
@@ -336,7 +497,7 @@ std::string daemon_not_ready_error(const IpcResponse& last_response) {
 
 std::string command_endpoint_name() {
 #ifdef _WIN32
-  return R"(\\.\pipe\wmux)";
+  return R"(\\.\pipe\wmux-)" + current_user_pipe_tag();
 #else
   return "/tmp/wmux-" + std::to_string(getuid()) + ".sock";
 #endif
@@ -344,7 +505,7 @@ std::string command_endpoint_name() {
 
 std::string attach_endpoint_name() {
 #ifdef _WIN32
-  return R"(\\.\pipe\wmux-attach)";
+  return R"(\\.\pipe\wmux-)" + current_user_pipe_tag() + "-attach";
 #else
   return "/tmp/wmux-" + std::to_string(getuid()) + "-attach.sock";
 #endif

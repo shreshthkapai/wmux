@@ -52,7 +52,8 @@ attached clients.
 - Build: CMake
 - CLI parsing: CLI11
 - Logging: spdlog
-- Testing: Catch2 or GoogleTest
+- Testing: current assert-based C++ unit harness plus PowerShell integration,
+  stress, and soak scripts; a future Catch2/GoogleTest migration is optional
 - IPC: Windows named pipes
 - PTY: ConPTY
 - Terminal control: Win32 Console APIs and VT escape sequences
@@ -132,7 +133,8 @@ Request/response messages for administrative commands:
 - server status
 - server stop
 
-JSON is acceptable here because command traffic is low volume.
+Command JSON is carried inside the versioned `WMUX` frame so malformed, partial,
+oversized, or incompatible requests are rejected before JSON parsing.
 
 ### Attach Streaming IPC
 
@@ -144,8 +146,9 @@ Bidirectional event stream for interactive sessions:
 - render frames or diffs
 - status updates
 
-This path should use length-prefixed framed messages. It should not depend on
-per-keystroke JSON in the final design.
+This path uses the same `WMUX` frame header with attach-specific frame kinds:
+`AttachInput` for client events, `AttachOutput` for rendered terminal frames,
+and `Error` for stream failures. It must not depend on per-keystroke JSON.
 
 ## Development Phases
 
@@ -186,11 +189,12 @@ Current implementation notes:
 - `wmux --daemon` runs the background command daemon.
 - Native Windows builds use a named pipe endpoint.
 - WSL/Linux development builds use a Unix-domain socket fallback.
-- Command IPC is line-delimited JSON for low-volume request/response commands.
-- Attach now uses a separate Windows named-pipe endpoint from command IPC.
-- The initial attach stream keeps JSON only for attach startup. Client input and
-  detach lifecycle are length-prefixed frames, which keeps shell input separate
-  from control messages.
+- Command IPC is a short-lived `WMUX` Control/Error frame exchange carrying
+  bounded JSON payloads.
+- Attach uses a separate Windows named-pipe endpoint from command IPC.
+- Attach startup uses a `WMUX` Control frame. Interactive client input,
+  detach, resize, mouse, copy/paste, status, and rendered output use framed
+  attach traffic, keeping shell input separate from control messages.
 - Existing Phase 1 commands round-trip through the daemon and still return
   placeholder responses until Phase 3 session state exists.
 
@@ -231,15 +235,17 @@ Current implementation notes:
 - Shell processes are assigned to a kill-on-close job object so session teardown
   and daemon process exit clean up the daemon-owned shell process tree where
   Windows permits it.
-- `wmux new -s <name>` starts `powershell.exe -NoLogo -NoProfile` under the
-  daemon and stores runtime ownership by stable session ID.
-- Windows development builds also honor `WMUX_DEFAULT_SHELL` as a temporary
-  test hook. It is not a replacement for the later configuration system.
+- `wmux new -s <name>` starts a daemon-owned shell and stores runtime ownership
+  by stable session ID.
+- Shell resolution order is: configured `default-shell`, `WMUX_DEFAULT_SHELL`
+  when no config shell is set, PowerShell 7 (`pwsh`), Windows PowerShell, then
+  `cmd.exe`.
+- New panes currently inherit the daemon process working directory. Per-pane
+  current-directory detection is intentionally documented as a later Windows
+  hardening item because it is not reliably available through ConPTY alone.
 - `wmux attach -t <name>` uses a long-lived attach named-pipe connection. The
-  daemon replays recent buffered output and then streams live ConPTY output
-  while forwarding framed client input to the shell.
-- Attach output is still raw byte passthrough. A real Windows terminal emulator
-  is expected to handle ConPTY terminal negotiation for this phase.
+  daemon sends framed rendered output while forwarding framed client input to
+  the active pane shell.
 - Raw PTY byte chunks are only a Phase 4 replay mechanism. Scrollback, copy
   mode, pane rendering, and correct reattach must be built on daemon-owned VT
   state and bounded scrollback rings, not on raw byte replay.
@@ -353,8 +359,8 @@ Current implementation notes:
 
 Current implementation notes:
 
-- Attach input now has a third framed message type for wmux control commands.
-  Normal shell bytes, explicit detach, and window commands are kept separate.
+- Attach input uses typed frames for wmux control commands. Normal shell bytes,
+  explicit detach, and window commands are kept separate.
 - `Ctrl+b c` creates a new daemon-owned window shell in the attached session and
   makes it active.
 - `Ctrl+b n` and `Ctrl+b p` switch the session's active window and replay the
@@ -407,6 +413,8 @@ Current implementation notes:
 
 - Add `Ctrl+b %` and `Ctrl+b "` for splitting
 - Add `Ctrl+b` arrow keys for pane focus
+- Add `Ctrl+b x` for killing the active pane
+- Add `Ctrl+b E` for recursively equalizing pane sizes in the active window
 - Route input only to the focused pane
 - Ensure each pane keeps independent shell state
 
@@ -421,6 +429,11 @@ Current implementation notes:
 - `Ctrl+b` arrow keys select the nearest pane in that direction based on the
   pane tree's current virtual rectangles. This is the same neighbor model the
   later renderer can use, but it does not draw borders yet.
+- `Ctrl+b x` kills the active pane through the same cleanup path as
+  `kill-pane`.
+- `Ctrl+b E` preserves the pane tree shape and recursively redistributes split
+  ratios by leaf count, matching tmux's equalize-current-window behavior more
+  closely than a direction-specific resize.
 - Attach streaming tracks active window and active pane IDs so output from an
   old pane is ignored after focus changes.
 - Input is resolved against the daemon's current active pane on every input
@@ -483,7 +496,7 @@ Current implementation notes:
 
 - The client polls the current console viewport while attached and sends a
   dedicated resize attach frame when the size changes.
-- Attach resize frames are length-prefixed control frames, separate from shell
+- Attach resize messages are framed attach-input events, separate from shell
   input and wmux command frames.
 - The daemon keeps the current dimensions per attach connection, recomputes the
   active window's pane layout on resize, calls `ResizePseudoConsole` for each
@@ -697,9 +710,38 @@ Initial settings:
 ```text
 set -g prefix C-b
 set -g mouse on
-set -g default-shell powershell.exe
+set -g default-shell pwsh.exe
 set -g status on
+set -g escape-time-ms 50
+set -g scrollback-max-lines 10000
+set -g paste-buffer-max-bytes 1048576
+set -g max-sessions 64
+set -g max-windows-per-session 64
+set -g max-panes-per-window 64
+set -g client-output-queue-max-bytes 8388608
+set -g client-output-queue-max-frames 8
+bind-key z new-window
+bind-key Up select-pane-up
+unbind-key e
 ```
+
+The daemon keeps explicit scoped option structures for global, session, window,
+pane, and client settings. The current public config syntax remains tmux-style
+`set -g` plus tmux-style `bind-key` and `unbind-key` lines. Runtime `set -g`
+uses the same validator as config-file loading, and attached clients receive
+live updates for prefix, mouse reporting, escape timing, status visibility, and
+attach backpressure/render limits. Keybinding overrides are validated at daemon
+config load and sent to attach clients through framed settings events. Runtime
+`bind-key` and `unbind-key` use the same validator and live settings path, so
+attached clients receive updated prefix bindings without reattach. Runtime
+option changes are daemon-memory changes; they do not rewrite the config file.
+
+Configured resource limits are enforced for session/window/pane creation,
+pane raw-output retention, pane scrollback, paste buffers, attach render frame
+size, and attach client output queues. IPC frame hard caps remain compiled
+protocol limits because frame validation must happen before daemon config is
+available to clients. `log-max-bytes` rotates the active log to a single `.1`
+retention file before append once the configured byte cap would be exceeded.
 
 ### Phase 16: Hardening for Daily Use
 

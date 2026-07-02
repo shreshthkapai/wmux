@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -85,9 +86,9 @@ set -g status on
 function Open-And-Close-AttachPipe {
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None
+    [System.IO.Pipes.PipeOptions]::Asynchronous
   )
   $pipe.Connect(2000)
   $request = '{"type":"AttachStart","session_name":"missing","terminal_columns":120,"terminal_rows":30}' + "`n"

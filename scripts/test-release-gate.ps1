@@ -211,7 +211,11 @@ if ($Quick) {
     "-AttachLoops", "2",
     "-HighOutputLines", "40",
     "-ResizeIterations", "4",
-    "-CopyPasteLoops", "2"
+    "-CopyPasteLoops", "2",
+    "-WindowIterations", "2",
+    "-MouseEventIterations", "12",
+    "-UnicodeLines", "10",
+    "-ShellSpawnFailureLoops", "1"
   )
   $soakArguments = @(
     "-Wmux", $script:WmuxPath,
@@ -223,6 +227,10 @@ if ($Quick) {
     "-HighOutputLines", "25",
     "-ResizeIterations", "3",
     "-CopyPasteLoops", "1",
+    "-WindowIterations", "1",
+    "-MouseEventIterations", "8",
+    "-UnicodeLines", "10",
+    "-ShellSpawnFailureLoops", "1",
     "-OutputDirectory", (Join-Path $script:ArtifactsRoot "soak")
   )
 }
@@ -271,6 +279,7 @@ try {
   Invoke-Step "process cleanup and orphan shell check" {
     $iterations = if ($Quick) { "5" } else { "50" }
     Invoke-Script -Name "test-process-cleanup.ps1" -Arguments @("-Exe", $script:WmuxPath, "-Iterations", $iterations)
+    Invoke-Script -Name "test-process-lifecycle.ps1" -Arguments @("-Wmux", $script:WmuxPath)
     Assert-NoDaemonChildShells
   }
 

@@ -10,6 +10,6 @@ struct ClipboardWriteResult {
   std::string error;
 };
 
-ClipboardWriteResult write_windows_clipboard_text(std::string_view text);
+ClipboardWriteResult write_clipboard_text(std::string_view text);
 
 }  // namespace wmux

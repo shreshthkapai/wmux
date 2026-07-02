@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\wmux-script-helpers.ps1"
 
 function Invoke-Wmux {
   param(
@@ -56,8 +57,7 @@ function Write-PipeBytes {
     [byte[]]$Bytes
   )
 
-  $Pipe.Write($Bytes, 0, $Bytes.Length)
-  $Pipe.Flush()
+  Write-WmuxScriptPipeBytes -Pipe $Pipe -Bytes $Bytes
 }
 
 function Write-AttachDetach {
@@ -75,28 +75,7 @@ function Read-ResponseLine {
     [System.IO.Stream]$Pipe
   )
 
-  $bytes = [System.Collections.Generic.List[byte]]::new()
-  $buffer = [byte[]]::new(1)
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $readTask = $Pipe.ReadAsync($buffer, 0, 1)
-    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $readTask.Wait($remaining)) {
-      break
-    }
-
-    if ($readTask.Result -le 0) {
-      break
-    }
-
-    $bytes.Add($buffer[0])
-    if ($buffer[0] -eq [byte][char]"`n") {
-      return [Text.Encoding]::UTF8.GetString($bytes.ToArray())
-    }
-  }
-
-  throw "timed out waiting for attach response"
+  Read-WmuxScriptResponseLine -Pipe $Pipe -TimeoutSeconds $TimeoutSeconds
 }
 
 function Open-Attach {
@@ -107,9 +86,9 @@ function Open-Attach {
 
   $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".",
-    "wmux-attach",
+    (Get-WmuxAttachPipeName),
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::None)
+    [System.IO.Pipes.PipeOptions]::Asynchronous)
 
   $pipe.Connect($TimeoutSeconds * 1000)
   $request = '{{"type":"AttachStart","session_name":"{0}","terminal_columns":120,"terminal_rows":30}}' -f $SessionName

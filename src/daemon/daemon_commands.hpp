@@ -3,14 +3,20 @@
 #include "daemon_state.hpp"
 #include "wmux/ipc_protocol.hpp"
 
-#include <atomic>
+#include <optional>
 #include <string>
 
 namespace wmux::daemon_internal {
 
-std::string handle_request(
+struct DaemonCommandResult {
+  std::string response;
+  bool should_stop{false};
+};
+
+DaemonCommandResult handle_request(
     const IpcRequest& request,
-    std::atomic_bool& should_stop,
-    DaemonState& state);
+    DaemonState& state,
+    RequestId request_id = 0,
+    std::optional<ClientId> client_id = std::nullopt);
 
 }  // namespace wmux::daemon_internal

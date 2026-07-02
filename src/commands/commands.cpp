@@ -184,20 +184,50 @@ CommandLine parse_set_option(const std::vector<std::string_view>& args) {
     return invalid("set requires -g <option> <value>");
   }
 
-  if (args[2] != "mouse") {
-    std::ostringstream message;
-    message << "unsupported global option " << quoted(args[2]);
-    return invalid(message.str());
-  }
-
-  if (args[3] != "on" && args[3] != "off") {
-    return invalid("set -g mouse requires on or off");
-  }
-
   CommandLine command;
   command.kind = CommandKind::SetOption;
   command.option_name = std::string{args[2]};
   command.option_value = std::string{args[3]};
+  return command;
+}
+
+std::string join_args(
+    const std::vector<std::string_view>& args,
+    std::size_t first,
+    std::string_view separator = " ") {
+  std::ostringstream out;
+  for (std::size_t index = first; index < args.size(); ++index) {
+    if (index > first) {
+      out << separator;
+    }
+    out << args[index];
+  }
+  return out.str();
+}
+
+CommandLine parse_bind_key(const std::vector<std::string_view>& args) {
+  if (args.size() < 3 || is_empty(args[1])) {
+    return invalid("bind-key requires <key> <action>");
+  }
+
+  CommandLine command;
+  command.kind = CommandKind::BindKey;
+  command.key_name = std::string{args[1]};
+  command.key_action = join_args(args, 2);
+  if (command.key_action.empty()) {
+    return invalid("bind-key requires <key> <action>");
+  }
+  return command;
+}
+
+CommandLine parse_unbind_key(const std::vector<std::string_view>& args) {
+  if (args.size() != 2 || is_empty(args[1])) {
+    return invalid("unbind-key requires <key>");
+  }
+
+  CommandLine command;
+  command.kind = CommandKind::UnbindKey;
+  command.key_name = std::string{args[1]};
   return command;
 }
 
@@ -228,6 +258,22 @@ CommandLine parse_server_command(const std::vector<std::string_view>& args) {
   std::ostringstream message;
   message << "unknown server subcommand " << quoted(args[1]);
   return invalid(message.str());
+}
+
+CommandLine parse_doctor_command(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::Doctor;
+
+  if (args.size() == 1) {
+    return command;
+  }
+
+  if (args.size() == 2 && args[1] == "--json") {
+    command.json = true;
+    return command;
+  }
+
+  return invalid("doctor accepts only optional --json");
 }
 
 }  // namespace
@@ -297,12 +343,40 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_set_option(args);
   }
 
+  if (args[0] == "bind-key") {
+    return parse_bind_key(args);
+  }
+
+  if (args[0] == "unbind-key") {
+    return parse_unbind_key(args);
+  }
+
   if (args[0] == "server") {
     return parse_server_command(args);
   }
 
+  if (args[0] == "dump-state") {
+    return parse_no_args_command(args, CommandKind::DumpState, "dump-state");
+  }
+
+  if (args[0] == "dump-layout") {
+    return parse_no_args_command(args, CommandKind::DumpLayout, "dump-layout");
+  }
+
+  if (args[0] == "dump-events") {
+    return parse_no_args_command(args, CommandKind::DumpEvents, "dump-events");
+  }
+
   if (args[0] == "reset-terminal") {
     return parse_no_args_command(args, CommandKind::ResetTerminal, "reset-terminal");
+  }
+
+  if (args[0] == "doctor") {
+    return parse_doctor_command(args);
+  }
+
+  if (args[0] == "debug-keys") {
+    return parse_no_args_command(args, CommandKind::DebugKeys, "debug-keys");
   }
 
   std::ostringstream message;
@@ -332,10 +406,17 @@ std::string render_help(std::string_view executable_name) {
   out << "                                 Rename the active window\n";
   out << "  split-window [-t <session>] -h|-v\n";
   out << "                                 Split the active pane\n";
-  out << "  set -g mouse on|off           Enable or disable mouse mode\n";
+  out << "  set -g <option> <value>       Set a validated global option\n";
+  out << "  bind-key <key> <action>       Bind a prefix key globally\n";
+  out << "  unbind-key <key>              Disable a prefix key globally\n";
   out << "  server status                  Show daemon status\n";
   out << "  server stop [--force]          Stop daemon\n";
+  out << "  dump-state                     Dump daemon sessions, clients, panes, and metrics\n";
+  out << "  dump-layout                    Dump session/window layout trees and pane rects\n";
+  out << "  dump-events                    Dump bounded recent diagnostic event rings\n";
   out << "  reset-terminal                 Restore terminal cursor/mouse/display state\n";
+  out << "  doctor [--json]                Print environment and runtime diagnostics\n";
+  out << "  debug-keys                     Print decoded input events for diagnostics\n";
   out << "  version                        Print wmux version information\n";
   out << "  help                           Print this help message\n\n";
   out << "Options:\n";
@@ -407,6 +488,13 @@ std::string render_placeholder_response(const CommandLine& command) {
     case CommandKind::SetOption:
       out << "wmux: would set " << command.option_name << " to " << command.option_value << "\n";
       break;
+    case CommandKind::BindKey:
+      out << "wmux: would bind key " << command.key_name << " to "
+          << command.key_action << "\n";
+      break;
+    case CommandKind::UnbindKey:
+      out << "wmux: would unbind key " << command.key_name << "\n";
+      break;
     case CommandKind::ServerStatus:
       out << "wmux: daemon status is not implemented yet\n";
       break;
@@ -417,8 +505,23 @@ std::string render_placeholder_response(const CommandLine& command) {
       }
       out << "\n";
       break;
+    case CommandKind::DumpState:
+      out << "wmux: would dump daemon state\n";
+      break;
+    case CommandKind::DumpLayout:
+      out << "wmux: would dump daemon layout\n";
+      break;
+    case CommandKind::DumpEvents:
+      out << "wmux: would dump daemon events\n";
+      break;
     case CommandKind::ResetTerminal:
       out << "wmux: would reset terminal state\n";
+      break;
+    case CommandKind::Doctor:
+      out << "wmux: would print diagnostics\n";
+      break;
+    case CommandKind::DebugKeys:
+      out << "wmux: would print decoded input events\n";
       break;
     case CommandKind::Help:
     case CommandKind::Version:

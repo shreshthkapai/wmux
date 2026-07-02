@@ -29,6 +29,24 @@ void bounds_paste_buffer_text() {
   assert(wmux::bounded_paste_buffer_text("small") == "small");
 }
 
+void creates_metadata_rich_bounded_buffer() {
+  const std::string large(wmux::kMaxPasteBufferBytes + 32, 'x');
+  const auto buffer =
+      wmux::make_paste_buffer(42, large, wmux::PasteBufferSource::CopyMode);
+  assert(buffer.id == 42);
+  assert(buffer.text.size() == wmux::kMaxPasteBufferBytes);
+  assert(buffer.original_bytes == large.size());
+  assert(buffer.truncated);
+  assert(buffer.source == wmux::PasteBufferSource::CopyMode);
+  assert(wmux::paste_buffer_source_name(buffer.source) == "copy-mode");
+}
+
+void wraps_only_when_bracketed_paste_is_enabled() {
+  assert(wmux::prepare_paste_text_for_terminal("one\ntwo", false) == "one\rtwo");
+  assert(wmux::prepare_paste_text_for_terminal("one\ntwo", true) ==
+         "\x1b[200~one\rtwo\x1b[201~");
+}
+
 }  // namespace
 
 void run_paste_buffer_tests() {
@@ -37,4 +55,6 @@ void run_paste_buffer_tests() {
   converts_crlf_to_single_terminal_enter();
   normalizes_mixed_line_endings();
   bounds_paste_buffer_text();
+  creates_metadata_rich_bounded_buffer();
+  wraps_only_when_bracketed_paste_is_enabled();
 }

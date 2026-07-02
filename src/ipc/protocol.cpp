@@ -303,11 +303,23 @@ std::string request_type_for_command(CommandKind kind) {
       return "SplitWindow";
     case CommandKind::SetOption:
       return "SetOption";
+    case CommandKind::BindKey:
+      return "BindKey";
+    case CommandKind::UnbindKey:
+      return "UnbindKey";
     case CommandKind::ServerStatus:
       return "ServerStatus";
     case CommandKind::ServerStop:
       return "ServerStop";
+    case CommandKind::DumpState:
+      return "DumpState";
+    case CommandKind::DumpLayout:
+      return "DumpLayout";
+    case CommandKind::DumpEvents:
+      return "DumpEvents";
     case CommandKind::ResetTerminal:
+    case CommandKind::Doctor:
+    case CommandKind::DebugKeys:
       return {};
     case CommandKind::Daemon:
     case CommandKind::Help:
@@ -363,7 +375,204 @@ std::optional<std::uint32_t> max_payload_size_for_attach_frame(AttachFrameType t
   return std::nullopt;
 }
 
+std::optional<std::uint32_t> max_payload_size_for_ipc_frame(IpcFrameKind kind) {
+  switch (kind) {
+    case IpcFrameKind::Control:
+      return kMaxControlIpcPayloadBytes;
+    case IpcFrameKind::AttachInput:
+      return kMaxAttachFramePayloadSize;
+    case IpcFrameKind::AttachOutput:
+      return static_cast<std::uint32_t>(kMaxAttachRenderFrameBytes);
+    case IpcFrameKind::Event:
+      return kMaxAttachCommandPayloadBytes;
+    case IpcFrameKind::Error:
+      return kMaxIpcErrorPayloadBytes;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<IpcFrameKind> ipc_frame_kind_from_byte(std::uint8_t value) {
+  switch (value) {
+    case static_cast<std::uint8_t>(IpcFrameKind::Control):
+      return IpcFrameKind::Control;
+    case static_cast<std::uint8_t>(IpcFrameKind::AttachInput):
+      return IpcFrameKind::AttachInput;
+    case static_cast<std::uint8_t>(IpcFrameKind::AttachOutput):
+      return IpcFrameKind::AttachOutput;
+    case static_cast<std::uint8_t>(IpcFrameKind::Event):
+      return IpcFrameKind::Event;
+    case static_cast<std::uint8_t>(IpcFrameKind::Error):
+      return IpcFrameKind::Error;
+    default:
+      return std::nullopt;
+  }
+}
+
+void append_u16_le(std::string& out, std::uint16_t value) {
+  out.push_back(static_cast<char>(value & 0xFF));
+  out.push_back(static_cast<char>((value >> 8) & 0xFF));
+}
+
+void append_u32_le(std::string& out, std::uint32_t value) {
+  out.push_back(static_cast<char>(value & 0xFF));
+  out.push_back(static_cast<char>((value >> 8) & 0xFF));
+  out.push_back(static_cast<char>((value >> 16) & 0xFF));
+  out.push_back(static_cast<char>((value >> 24) & 0xFF));
+}
+
+void append_u64_le(std::string& out, std::uint64_t value) {
+  for (int shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((value >> shift) & 0xFF));
+  }
+}
+
+std::uint16_t read_u16_le(std::string_view bytes, std::size_t offset) {
+  return static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[offset])) |
+         static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[offset + 1]) << 8);
+}
+
+std::uint32_t read_u32_le(std::string_view bytes, std::size_t offset) {
+  return static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset])) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 1])) << 8) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 2])) << 16) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[offset + 3])) << 24);
+}
+
+std::uint64_t read_u64_le(std::string_view bytes, std::size_t offset) {
+  std::uint64_t value = 0;
+  for (int index = 7; index >= 0; --index) {
+    value <<= 8;
+    value |= static_cast<unsigned char>(bytes[offset + static_cast<std::size_t>(index)]);
+  }
+  return value;
+}
+
+IpcFrameParseResult ipc_frame_parse_error(IpcFrameError error, std::string message) {
+  IpcFrameParseResult result;
+  result.error = error;
+  result.message = std::move(message);
+  return result;
+}
+
 }  // namespace
+
+std::string_view ipc_frame_kind_name(IpcFrameKind kind) {
+  switch (kind) {
+    case IpcFrameKind::Control:
+      return "Control";
+    case IpcFrameKind::AttachInput:
+      return "AttachInput";
+    case IpcFrameKind::AttachOutput:
+      return "AttachOutput";
+    case IpcFrameKind::Event:
+      return "Event";
+    case IpcFrameKind::Error:
+      return "Error";
+  }
+
+  return "Unknown";
+}
+
+std::string_view ipc_frame_error_name(IpcFrameError error) {
+  switch (error) {
+    case IpcFrameError::None:
+      return "None";
+    case IpcFrameError::PartialHeader:
+      return "PartialHeader";
+    case IpcFrameError::BadMagic:
+      return "BadMagic";
+    case IpcFrameError::UnsupportedVersion:
+      return "UnsupportedVersion";
+    case IpcFrameError::UnknownKind:
+      return "UnknownKind";
+    case IpcFrameError::OversizedPayload:
+      return "OversizedPayload";
+    case IpcFrameError::TruncatedPayload:
+      return "TruncatedPayload";
+  }
+
+  return "Unknown";
+}
+
+std::string make_ipc_frame(
+    IpcFrameKind kind,
+    std::uint64_t request_id,
+    std::string_view payload) {
+  std::string frame;
+  frame.reserve(kIpcFrameHeaderSize + payload.size());
+  frame.append("WMUX", 4);
+  append_u16_le(frame, kIpcProtocolVersion);
+  frame.push_back(static_cast<char>(kind));
+  append_u64_le(frame, request_id);
+  append_u32_le(frame, static_cast<std::uint32_t>(payload.size()));
+  frame.append(payload);
+  return frame;
+}
+
+IpcFrameParseResult parse_ipc_frame_header(std::string_view header) {
+  if (header.size() != kIpcFrameHeaderSize) {
+    return ipc_frame_parse_error(IpcFrameError::PartialHeader, "wmux: partial IPC frame header");
+  }
+
+  if (header.substr(0, 4) != "WMUX") {
+    return ipc_frame_parse_error(IpcFrameError::BadMagic, "wmux: bad IPC frame magic");
+  }
+
+  IpcFrameParseResult result;
+  result.header.version = read_u16_le(header, 4);
+  const auto kind = ipc_frame_kind_from_byte(static_cast<unsigned char>(header[6]));
+  result.header.request_id = read_u64_le(header, 7);
+  result.header.payload_size = read_u32_le(header, 15);
+
+  if (result.header.version != kIpcProtocolVersion) {
+    result.error = IpcFrameError::UnsupportedVersion;
+    result.message = "wmux: unsupported IPC protocol version";
+    return result;
+  }
+
+  if (!kind) {
+    result.error = IpcFrameError::UnknownKind;
+    result.message = "wmux: unknown IPC frame kind";
+    return result;
+  }
+  result.header.kind = *kind;
+
+  const auto max_payload_size = max_payload_size_for_ipc_frame(result.header.kind);
+  if (!max_payload_size || result.header.payload_size > *max_payload_size ||
+      result.header.payload_size > kMaxIpcFramePayloadBytes) {
+    result.error = IpcFrameError::OversizedPayload;
+    result.message = "wmux: IPC frame payload is too large";
+    return result;
+  }
+
+  result.ok = true;
+  return result;
+}
+
+IpcFrameParseResult parse_ipc_frame(std::string_view bytes) {
+  if (bytes.size() < kIpcFrameHeaderSize) {
+    return ipc_frame_parse_error(IpcFrameError::PartialHeader, "wmux: partial IPC frame header");
+  }
+
+  auto result = parse_ipc_frame_header(bytes.substr(0, kIpcFrameHeaderSize));
+  if (!result.ok) {
+    return result;
+  }
+
+  const auto expected_size = kIpcFrameHeaderSize + result.header.payload_size;
+  if (bytes.size() < expected_size) {
+    result.ok = false;
+    result.error = IpcFrameError::TruncatedPayload;
+    result.message = "wmux: truncated IPC frame payload";
+    return result;
+  }
+
+  result.payload.assign(
+      bytes.data() + kIpcFrameHeaderSize,
+      bytes.data() + kIpcFrameHeaderSize + result.header.payload_size);
+  return result;
+}
 
 std::string make_ping_request_json() {
   return "{\"type\":\"Ping\"}\n";
@@ -394,6 +603,12 @@ std::string make_command_request_json(const CommandLine& command) {
   }
   if (!command.option_value.empty()) {
     append_json_field(out, "option_value", command.option_value);
+  }
+  if (!command.key_name.empty()) {
+    append_json_field(out, "key_name", command.key_name);
+  }
+  if (!command.key_action.empty()) {
+    append_json_field(out, "key_action", command.key_action);
   }
   if (command.force) {
     append_json_bool(out, "force", command.force);
@@ -481,6 +696,12 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   if (const auto option_value = find_json_string(json, "option_value")) {
     request.option_value = *option_value;
   }
+  if (const auto key_name = find_json_string(json, "key_name")) {
+    request.key_name = *key_name;
+  }
+  if (const auto key_action = find_json_string(json, "key_action")) {
+    request.key_action = *key_action;
+  }
   if (const auto force = find_json_bool(json, "force")) {
     request.force = *force;
   }
@@ -516,13 +737,19 @@ std::string make_response_json(
     std::string_view message,
     bool mouse_enabled,
     std::string_view prefix,
-    bool status_bar_enabled) {
+    bool status_bar_enabled,
+    std::uint16_t escape_time_ms,
+    std::string_view key_bindings) {
   std::ostringstream out;
   out << "{\"ok\":" << (ok ? "true" : "false");
   append_json_field(out, "message", message);
   append_json_bool(out, "mouse_enabled", mouse_enabled);
   append_json_field(out, "prefix", prefix);
   append_json_bool(out, "status_bar_enabled", status_bar_enabled);
+  append_json_uint(out, "escape_time_ms", escape_time_ms);
+  if (!key_bindings.empty()) {
+    append_json_field(out, "key_bindings", key_bindings);
+  }
   out << "}\n";
   return out.str();
 }
@@ -545,6 +772,12 @@ std::optional<IpcResponse> parse_response_json(std::string_view json) {
   }
   if (const auto status_bar_enabled = find_json_bool(json, "status_bar_enabled")) {
     response.status_bar_enabled = *status_bar_enabled;
+  }
+  if (const auto escape_time_ms = find_json_uint(json, "escape_time_ms")) {
+    response.escape_time_ms = *escape_time_ms;
+  }
+  if (const auto key_bindings = find_json_string(json, "key_bindings")) {
+    response.key_bindings = *key_bindings;
   }
   return response;
 }
@@ -765,11 +998,23 @@ std::optional<AttachCopyModeAction> parse_attach_copy_mode_payload(std::string_v
   }
 
   const auto action = static_cast<unsigned char>(payload[0]);
-  if (action > static_cast<unsigned char>(AttachCopyModeAction::CopySelection)) {
-    return std::nullopt;
+  switch (action) {
+    case static_cast<unsigned char>(AttachCopyModeAction::Enter):
+    case static_cast<unsigned char>(AttachCopyModeAction::Exit):
+    case static_cast<unsigned char>(AttachCopyModeAction::CursorUp):
+    case static_cast<unsigned char>(AttachCopyModeAction::CursorDown):
+    case static_cast<unsigned char>(AttachCopyModeAction::CursorLeft):
+    case static_cast<unsigned char>(AttachCopyModeAction::CursorRight):
+    case static_cast<unsigned char>(AttachCopyModeAction::PageUp):
+    case static_cast<unsigned char>(AttachCopyModeAction::PageDown):
+    case static_cast<unsigned char>(AttachCopyModeAction::StartSelection):
+    case static_cast<unsigned char>(AttachCopyModeAction::CopySelection):
+    case static_cast<unsigned char>(AttachCopyModeAction::Home):
+    case static_cast<unsigned char>(AttachCopyModeAction::End):
+      return static_cast<AttachCopyModeAction>(action);
+    default:
+      return std::nullopt;
   }
-
-  return static_cast<AttachCopyModeAction>(action);
 }
 
 std::string make_attach_paste_frame() {

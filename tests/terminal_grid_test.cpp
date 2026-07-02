@@ -168,19 +168,26 @@ void csi_3j_in_alternate_screen_does_not_clear_normal_scrollback() {
 }
 
 void tracks_sgr_state_without_rendering_escape_bytes() {
-  wmux::TerminalGrid grid{12, 1};
+  wmux::TerminalGrid grid{14, 1};
 
-  grid.feed("a\x1b[31;1mb\x1b[38;5;202mc\x1b[38;2;1;2;3md\x1b[48;5;17me\x1b[0mf");
+  grid.feed(
+      "a\x1b[31;1mb\x1b[2;3mc\x1b[38;5;202md\x1b[38;2;1;2;3me"
+      "\x1b[48;5;17mf\x1b[22;23mg\x1b[0mh");
 
   const auto screen = grid.snapshot();
-  assert(screen.lines[0] == "abcdef      ");
+  assert(screen.lines[0] == "abcdefgh      ");
   assert(screen.line_snapshots[0].attributes[1].foreground == 1);
   assert(screen.line_snapshots[0].attributes[1].bold);
-  assert(screen.line_snapshots[0].attributes[2].foreground == 202);
-  assert(screen.line_snapshots[0].attributes[3].foreground == 0x01010203);
-  assert(screen.line_snapshots[0].attributes[4].background == 17);
-  assert(screen.line_snapshots[0].attributes[5].foreground == -1);
-  assert(screen.line_snapshots[0].attributes[5].background == -1);
+  assert(screen.line_snapshots[0].attributes[2].dim);
+  assert(screen.line_snapshots[0].attributes[2].italic);
+  assert(screen.line_snapshots[0].attributes[3].foreground == 202);
+  assert(screen.line_snapshots[0].attributes[4].foreground == 0x01010203);
+  assert(screen.line_snapshots[0].attributes[5].background == 17);
+  assert(!screen.line_snapshots[0].attributes[6].bold);
+  assert(!screen.line_snapshots[0].attributes[6].dim);
+  assert(!screen.line_snapshots[0].attributes[6].italic);
+  assert(screen.line_snapshots[0].attributes[7].foreground == -1);
+  assert(screen.line_snapshots[0].attributes[7].background == -1);
 }
 
 void handles_cursor_save_restore_and_line_movement() {
@@ -270,6 +277,18 @@ void reports_active_alternate_screen_without_losing_normal_scrollback() {
   assert(grid.scrollback_snapshot().lines.size() == 1);
 }
 
+void tracks_bracketed_paste_mode() {
+  wmux::TerminalGrid grid{5, 2};
+
+  grid.feed("\x1b[?2004h");
+  auto screen = grid.snapshot();
+  assert(screen.bracketed_paste_mode);
+
+  grid.feed("\x1b[?2004l");
+  screen = grid.snapshot();
+  assert(!screen.bracketed_paste_mode);
+}
+
 void accepts_utf8_bytes_without_overflowing_grid_rows() {
   wmux::TerminalGrid grid{4, 2};
   std::string input{"a", 1};
@@ -306,6 +325,51 @@ void treats_wide_and_combining_utf8_defensively() {
   assert(screen.line_snapshots[0].cells[3] == "e\xcc\x81");
   assert(screen.line_snapshots[0].cells[4] == "z");
   assert(screen.cursor_column == 5);
+}
+
+void groups_zwj_emoji_sequence_as_one_wide_cell() {
+  wmux::TerminalGrid grid{6, 1};
+  const std::string emoji = "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb";
+
+  grid.feed(emoji + "x");
+
+  const auto screen = grid.snapshot();
+  assert(screen.line_snapshots[0].cells[0] == emoji);
+  assert(screen.line_snapshots[0].cells[1].empty());
+  assert(screen.line_snapshots[0].cell_widths[0] == wmux::TerminalCellWidth::WideLeading);
+  assert(screen.line_snapshots[0].cell_widths[1] == wmux::TerminalCellWidth::WideContinuation);
+  assert(screen.line_snapshots[0].cells[2] == "x");
+  assert(screen.cursor_column == 3);
+}
+
+void groups_regional_indicator_flag_pair_as_one_wide_cell() {
+  wmux::TerminalGrid grid{6, 1};
+  const std::string flag = "\xf0\x9f\x87\xba\xf0\x9f\x87\xb8";
+
+  grid.feed(flag + "x");
+
+  const auto screen = grid.snapshot();
+  assert(screen.line_snapshots[0].cells[0] == flag);
+  assert(screen.line_snapshots[0].cells[1].empty());
+  assert(screen.line_snapshots[0].cell_widths[0] == wmux::TerminalCellWidth::WideLeading);
+  assert(screen.line_snapshots[0].cell_widths[1] == wmux::TerminalCellWidth::WideContinuation);
+  assert(screen.line_snapshots[0].cells[2] == "x");
+  assert(screen.cursor_column == 3);
+}
+
+void groups_emoji_modifier_sequence_as_one_wide_cell() {
+  wmux::TerminalGrid grid{6, 1};
+  const std::string emoji = "\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd";
+
+  grid.feed(emoji + "x");
+
+  const auto screen = grid.snapshot();
+  assert(screen.line_snapshots[0].cells[0] == emoji);
+  assert(screen.line_snapshots[0].cells[1].empty());
+  assert(screen.line_snapshots[0].cell_widths[0] == wmux::TerminalCellWidth::WideLeading);
+  assert(screen.line_snapshots[0].cell_widths[1] == wmux::TerminalCellWidth::WideContinuation);
+  assert(screen.line_snapshots[0].cells[2] == "x");
+  assert(screen.cursor_column == 3);
 }
 
 void copies_utf8_cells_into_scrollback_snapshots() {
@@ -352,6 +416,116 @@ void preserves_wrapped_line_metadata_across_resize() {
   assert(!screen.line_snapshots[1].wrapped);
 }
 
+void tracks_terminal_modes_title_and_unknown_sequences() {
+  wmux::TerminalGrid grid{12, 2};
+
+  grid.feed("\x1b]2;wmux test\a\x1b[?25l\x1b[3 q\x1b[?7lABCD");
+  grid.feed("\x1b[9999z");
+
+  const auto screen = grid.snapshot();
+  assert(screen.title == "wmux test");
+  assert(!screen.cursor_visible);
+  assert(screen.cursor_style == 3);
+  assert(!screen.wrap_mode);
+  assert(screen.unknown_sequence_count == 1);
+  assert(screen.lines[0].find("ABCD") == 0);
+}
+
+void honors_origin_mode_inside_scroll_region() {
+  wmux::TerminalGrid grid{8, 4};
+
+  grid.feed("11111111\x1b[2;1H22222222\x1b[3;1H33333333\x1b[4;1H44444444");
+  grid.feed("\x1b[2;3r\x1b[?6h\x1b[1;1HX\x1b[?6l\x1b[1;1HY");
+
+  const auto screen = grid.snapshot();
+  assert(screen.lines[0] == "Y1111111");
+  assert(screen.lines[1] == "X2222222");
+  assert(!screen.origin_mode);
+}
+
+void wrap_mode_can_be_disabled_and_enabled() {
+  wmux::TerminalGrid grid{4, 2};
+
+  grid.feed("\x1b[?7labcde");
+  auto screen = grid.snapshot();
+  assert(screen.lines[0] == "abce");
+  assert(screen.lines[1] == "    ");
+  assert(!screen.wrap_mode);
+
+  grid.feed("\x1b[?7hZ");
+  screen = grid.snapshot();
+  assert(screen.lines[0] == "abcZ");
+  assert(screen.lines[1] == "    ");
+}
+
+void handles_osc_title_with_st_terminator() {
+  wmux::TerminalGrid grid{10, 1};
+
+  grid.feed("\x1b]0;build\x1b\\ready");
+
+  const auto screen = grid.snapshot();
+  assert(screen.title == "build");
+  assert(screen.lines[0] == "ready     ");
+}
+
+void golden_powershell_prompt_snapshot() {
+  wmux::TerminalGrid grid{32, 2};
+
+  grid.feed("PS C:\\Users\\shres\\code\\wmux> ");
+
+  const auto screen = grid.snapshot();
+  const std::string expected = "PS C:\\Users\\shres\\code\\wmux> ";
+  assert(screen.lines[0].rfind(expected, 0) == 0);
+  assert(screen.lines[1] == "                                ");
+}
+
+void golden_cmd_prompt_and_clear_screen_snapshot() {
+  wmux::TerminalGrid grid{24, 3};
+
+  grid.feed("C:\\Users\\shres>dir\r\nfile.txt\r\n\x1b[2J\x1b[Hdone");
+
+  const auto screen = grid.snapshot();
+  assert(screen.lines[0] == "done                    ");
+  assert(screen.lines[1] == "                        ");
+  assert(screen.lines[2] == "                        ");
+}
+
+void golden_git_diff_color_snapshot() {
+  wmux::TerminalGrid grid{16, 2};
+
+  grid.feed("\x1b[31m-deleted\x1b[0m\r\n\x1b[32m+added\x1b[0m");
+
+  const auto screen = grid.snapshot();
+  assert(screen.lines[0] == "-deleted        ");
+  assert(screen.lines[1] == "+added          ");
+  assert(screen.line_snapshots[0].attributes[0].foreground == 1);
+  assert(screen.line_snapshots[1].attributes[0].foreground == 2);
+}
+
+void golden_progress_bar_snapshot() {
+  wmux::TerminalGrid grid{12, 1};
+
+  grid.feed("10%\r20%\r100%");
+
+  const auto screen = grid.snapshot();
+  assert(screen.lines[0] == "100%        ");
+}
+
+void golden_alternate_screen_snapshot() {
+  wmux::TerminalGrid grid{10, 2};
+
+  grid.feed("normal\x1b[?1049hviewer\x1b[2;1Hline2\x1b[?1049l");
+
+  auto screen = grid.snapshot();
+  assert(!screen.alternate_screen);
+  assert(screen.lines[0] == "normal    ");
+
+  grid.feed("\x1b[?1049hviewer");
+  screen = grid.snapshot();
+  assert(screen.alternate_screen);
+  assert(screen.lines[0] == "viewer    ");
+}
+
 }  // namespace
 
 void run_terminal_grid_tests() {
@@ -375,9 +549,22 @@ void run_terminal_grid_tests() {
   resets_scroll_region_when_invalid_or_resized();
   preserves_normal_screen_across_alternate_screen();
   reports_active_alternate_screen_without_losing_normal_scrollback();
+  tracks_bracketed_paste_mode();
   accepts_utf8_bytes_without_overflowing_grid_rows();
   treats_wide_and_combining_utf8_defensively();
+  groups_zwj_emoji_sequence_as_one_wide_cell();
+  groups_regional_indicator_flag_pair_as_one_wide_cell();
+  groups_emoji_modifier_sequence_as_one_wide_cell();
   copies_utf8_cells_into_scrollback_snapshots();
   resizes_while_preserving_visible_cells();
   preserves_wrapped_line_metadata_across_resize();
+  tracks_terminal_modes_title_and_unknown_sequences();
+  honors_origin_mode_inside_scroll_region();
+  wrap_mode_can_be_disabled_and_enabled();
+  handles_osc_title_with_st_terminator();
+  golden_powershell_prompt_snapshot();
+  golden_cmd_prompt_and_clear_screen_snapshot();
+  golden_git_diff_color_snapshot();
+  golden_progress_bar_snapshot();
+  golden_alternate_screen_snapshot();
 }

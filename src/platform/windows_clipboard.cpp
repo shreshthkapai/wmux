@@ -1,4 +1,4 @@
-#include "wmux/windows_clipboard.hpp"
+#include "wmux/platform/clipboard.hpp"
 
 #include <cstring>
 #include <string>
@@ -117,7 +117,7 @@ class MovableGlobalMemory {
 
 }  // namespace
 
-ClipboardWriteResult write_windows_clipboard_text(std::string_view text) {
+ClipboardWriteResult write_clipboard_text(std::string_view text) {
 #ifdef _WIN32
   auto wide = widen_clipboard_text(text);
   wide.push_back(L'\0');

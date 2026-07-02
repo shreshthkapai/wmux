@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <initializer_list>
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -26,8 +27,10 @@ struct LogField {
 
 void initialize_logging(LogRole role);
 void shutdown_logging();
+void configure_logging(std::size_t max_file_bytes);
 std::filesystem::path log_directory();
 std::filesystem::path log_file_path(LogRole role);
+std::filesystem::path rotated_log_file_path(LogRole role);
 void log_event(
     LogLevel level,
     std::string_view component,
