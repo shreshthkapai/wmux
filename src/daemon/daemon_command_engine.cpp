@@ -59,6 +59,22 @@ std::optional<SplitDirection> parse_runtime_split_direction(std::string_view dir
   return std::nullopt;
 }
 
+std::optional<ResizeDirection> parse_runtime_resize_direction(std::string_view direction) {
+  if (direction == "-L") {
+    return ResizeDirection::Left;
+  }
+  if (direction == "-R") {
+    return ResizeDirection::Right;
+  }
+  if (direction == "-U") {
+    return ResizeDirection::Up;
+  }
+  if (direction == "-D") {
+    return ResizeDirection::Down;
+  }
+  return std::nullopt;
+}
+
 std::vector<std::string_view> command_args_as_views(const std::vector<std::string>& args) {
   std::vector<std::string_view> views;
   views.reserve(args.size());
@@ -301,6 +317,33 @@ TargetResolutionResult resolve_named(
     return user_error("wmux: target name cannot be empty");
   }
 
+  const auto session_separator = name.find(':');
+  if (session_separator != std::string_view::npos) {
+    const auto session_name = name.substr(0, session_separator);
+    const auto window_name = name.substr(session_separator + 1);
+    if (session_name.empty() || window_name.empty()) {
+      return user_error("wmux: target must be <session>:<window>");
+    }
+
+    const auto session_id = context.state.sessions.session_id_for_name(session_name);
+    if (!session_id) {
+      return user_error("wmux: target session not found");
+    }
+    const auto session = find_session_by_id(context.state.sessions, *session_id);
+    if (!session) {
+      return user_error("wmux: target session not found");
+    }
+
+    const auto requested_index = parse_index(window_name);
+    for (const auto& window : session->windows) {
+      if (window.name == window_name || (requested_index && window.index == *requested_index)) {
+        return resolved(session->id, window.id, window.active_pane_id, context.current_client_id);
+      }
+    }
+
+    return user_error("wmux: target window not found");
+  }
+
   if (const auto session_id = context.state.sessions.session_id_for_name(name)) {
     return resolve_session_id(context, *session_id, context.current_client_id);
   }
@@ -401,12 +444,44 @@ std::optional<RuntimeCommand> runtime_command_from_command_line(
   switch (command.kind) {
     case CommandKind::NewWindow:
       runtime.kind = RuntimeCommandKind::NewWindow;
-      runtime.name = command.window_name;
+      if (!command.window_name.empty()) {
+        runtime.name = command.window_name;
+      }
       return runtime;
 
     case CommandKind::RenameWindow:
       runtime.kind = RuntimeCommandKind::RenameWindow;
       runtime.name = command.window_name;
+      return runtime;
+
+    case CommandKind::SelectWindow:
+      runtime.kind = RuntimeCommandKind::SelectWindow;
+      runtime.target = Target::named(command.target_name);
+      runtime.target_name = command.target_name;
+      return runtime;
+
+    case CommandKind::NextWindow:
+      runtime.kind = RuntimeCommandKind::NextWindow;
+      return runtime;
+
+    case CommandKind::PreviousWindow:
+      runtime.kind = RuntimeCommandKind::PreviousWindow;
+      return runtime;
+
+    case CommandKind::KillWindow:
+      runtime.kind = RuntimeCommandKind::KillWindow;
+      if (!command.target_name.empty()) {
+        runtime.target = Target::named(command.target_name);
+        runtime.target_name = command.target_name;
+      }
+      return runtime;
+
+    case CommandKind::KillPane:
+      runtime.kind = RuntimeCommandKind::KillPane;
+      if (!command.target_name.empty()) {
+        runtime.target = Target::named(command.target_name);
+        runtime.target_name = command.target_name;
+      }
       return runtime;
 
     case CommandKind::SplitWindow: {
@@ -419,6 +494,30 @@ std::optional<RuntimeCommand> runtime_command_from_command_line(
       runtime.axis = *direction;
       return runtime;
     }
+
+    case CommandKind::ResizePane: {
+      const auto direction = parse_runtime_resize_direction(command.resize_direction);
+      if (!direction) {
+        error = "wmux: resize-pane requires one of -L, -R, -U, or -D";
+        return std::nullopt;
+      }
+      runtime.kind = RuntimeCommandKind::ResizePane;
+      if (!command.target_name.empty()) {
+        runtime.target = Target::named(command.target_name);
+        runtime.target_name = command.target_name;
+      }
+      runtime.resize_direction = *direction;
+      runtime.amount = 1;
+      return runtime;
+    }
+
+    case CommandKind::SelectLayout:
+      runtime.kind = RuntimeCommandKind::SpreadPanesEvenly;
+      if (!command.target_name.empty()) {
+        runtime.target = Target::named(command.target_name);
+        runtime.target_name = command.target_name;
+      }
+      return runtime;
 
     case CommandKind::SetOption:
       runtime.kind = RuntimeCommandKind::SetOption;
@@ -477,6 +576,14 @@ std::optional<RuntimeCommand> runtime_command_from_attach_command(
     runtime.kind = RuntimeCommandKind::PreviousWindow;
     return runtime;
   }
+  if (command.size() == std::string_view{"select-window-"}.size() + 1 &&
+      command.rfind("select-window-", 0) == 0 &&
+      std::isdigit(static_cast<unsigned char>(command.back())) != 0) {
+    runtime.kind = RuntimeCommandKind::SelectWindow;
+    runtime.target = Target::named(std::string{command.substr(command.size() - 1)});
+    runtime.target_name = runtime.target.name;
+    return runtime;
+  }
   if (command == "split-horizontal") {
     runtime.kind = RuntimeCommandKind::SplitPane;
     runtime.axis = SplitDirection::Horizontal;
@@ -505,6 +612,30 @@ std::optional<RuntimeCommand> runtime_command_from_attach_command(
   if (command == "select-pane-down") {
     runtime.kind = RuntimeCommandKind::SelectPane;
     runtime.pane_direction = PaneDirection::Down;
+    return runtime;
+  }
+  if (command == "resize-pane-left" || command == "resize-pane-left-large") {
+    runtime.kind = RuntimeCommandKind::ResizePane;
+    runtime.resize_direction = ResizeDirection::Left;
+    runtime.amount = command == "resize-pane-left-large" ? 5 : 1;
+    return runtime;
+  }
+  if (command == "resize-pane-right" || command == "resize-pane-right-large") {
+    runtime.kind = RuntimeCommandKind::ResizePane;
+    runtime.resize_direction = ResizeDirection::Right;
+    runtime.amount = command == "resize-pane-right-large" ? 5 : 1;
+    return runtime;
+  }
+  if (command == "resize-pane-up" || command == "resize-pane-up-large") {
+    runtime.kind = RuntimeCommandKind::ResizePane;
+    runtime.resize_direction = ResizeDirection::Up;
+    runtime.amount = command == "resize-pane-up-large" ? 5 : 1;
+    return runtime;
+  }
+  if (command == "resize-pane-down" || command == "resize-pane-down-large") {
+    runtime.kind = RuntimeCommandKind::ResizePane;
+    runtime.resize_direction = ResizeDirection::Down;
+    runtime.amount = command == "resize-pane-down-large" ? 5 : 1;
     return runtime;
   }
   if (command == "kill-pane") {
@@ -559,6 +690,32 @@ std::optional<RuntimeCommand> runtime_command_from_command_mode_text(
     }
     runtime.kind = RuntimeCommandKind::KillPane;
     return runtime;
+  }
+
+  if (command_name == "next-window") {
+    if (reject_extra_command_mode_args(parsed_text.args, command_name, error)) {
+      return std::nullopt;
+    }
+    runtime.kind = RuntimeCommandKind::NextWindow;
+    return runtime;
+  }
+
+  if (command_name == "previous-window") {
+    if (reject_extra_command_mode_args(parsed_text.args, command_name, error)) {
+      return std::nullopt;
+    }
+    runtime.kind = RuntimeCommandKind::PreviousWindow;
+    return runtime;
+  }
+
+  if (command_name == "resize-pane") {
+    const auto args = command_args_as_views(parsed_text.args);
+    const auto command = parse_command_line(args);
+    if (command.kind == CommandKind::Unknown) {
+      error = "wmux: " + command.error;
+      return std::nullopt;
+    }
+    return runtime_command_from_command_line(command, true, error);
   }
 
   if (command_name == "kill-window") {
@@ -623,7 +780,9 @@ std::optional<RuntimeCommand> runtime_command_from_ipc_request(
   if (request.type == "NewWindow") {
     runtime.kind = RuntimeCommandKind::NewWindow;
     runtime.target = target_from_optional_session_name(request.session_name);
-    runtime.name = request.window_name;
+    if (!request.window_name.empty()) {
+      runtime.name = request.window_name;
+    }
     return runtime;
   }
 
@@ -631,6 +790,43 @@ std::optional<RuntimeCommand> runtime_command_from_ipc_request(
     runtime.kind = RuntimeCommandKind::RenameWindow;
     runtime.target = target_from_optional_session_name(request.session_name);
     runtime.name = request.window_name;
+    return runtime;
+  }
+
+  if (request.type == "SelectWindow") {
+    runtime.kind = RuntimeCommandKind::SelectWindow;
+    runtime.target = Target::named(request.target_name);
+    runtime.target_name = request.target_name;
+    return runtime;
+  }
+
+  if (request.type == "NextWindow") {
+    runtime.kind = RuntimeCommandKind::NextWindow;
+    runtime.target = target_from_optional_session_name(request.session_name);
+    return runtime;
+  }
+
+  if (request.type == "PreviousWindow") {
+    runtime.kind = RuntimeCommandKind::PreviousWindow;
+    runtime.target = target_from_optional_session_name(request.session_name);
+    return runtime;
+  }
+
+  if (request.type == "KillWindow") {
+    runtime.kind = RuntimeCommandKind::KillWindow;
+    if (!request.target_name.empty()) {
+      runtime.target = Target::named(request.target_name);
+      runtime.target_name = request.target_name;
+    }
+    return runtime;
+  }
+
+  if (request.type == "KillPane") {
+    runtime.kind = RuntimeCommandKind::KillPane;
+    if (!request.target_name.empty()) {
+      runtime.target = Target::named(request.target_name);
+      runtime.target_name = request.target_name;
+    }
     return runtime;
   }
 
@@ -643,6 +839,33 @@ std::optional<RuntimeCommand> runtime_command_from_ipc_request(
     runtime.kind = RuntimeCommandKind::SplitPane;
     runtime.target = target_from_optional_session_name(request.session_name);
     runtime.axis = *direction;
+    return runtime;
+  }
+
+  if (request.type == "ResizePane") {
+    const auto direction = parse_runtime_resize_direction(request.resize_direction);
+    if (!direction) {
+      error = "wmux: resize-pane requires one of -L, -R, -U, or -D";
+      return std::nullopt;
+    }
+    runtime.kind = RuntimeCommandKind::ResizePane;
+    if (!request.target_name.empty()) {
+      runtime.target = Target::named(request.target_name);
+      runtime.target_name = request.target_name;
+    }
+    runtime.resize_direction = *direction;
+    runtime.amount = 1;
+    return runtime;
+  }
+
+  if (request.type == "SelectLayout") {
+    runtime.kind = RuntimeCommandKind::SpreadPanesEvenly;
+    if (!request.target_name.empty()) {
+      runtime.target = Target::named(request.target_name);
+      runtime.target_name = request.target_name;
+    } else {
+      runtime.target = Target::current();
+    }
     return runtime;
   }
 

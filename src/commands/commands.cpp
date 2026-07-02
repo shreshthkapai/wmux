@@ -105,11 +105,81 @@ CommandLine parse_new_window(const std::vector<std::string_view>& args) {
     return invalid(message.str());
   }
 
-  if (command.window_name.empty()) {
-    return invalid("new-window requires -n <name>");
+  return command;
+}
+
+CommandLine parse_select_window(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::SelectWindow;
+
+  if (args.size() == 1) {
+    return invalid("select-window requires -t <target-window>");
   }
 
-  return command;
+  if (args.size() == 2 && !is_empty(args[1])) {
+    command.target_name = std::string{args[1]};
+    return command;
+  }
+
+  if (args.size() == 3 && args[1] == "-t" && !is_empty(args[2])) {
+    command.target_name = std::string{args[2]};
+    return command;
+  }
+
+  return invalid("select-window requires -t <target-window>");
+}
+
+CommandLine parse_window_cycle_command(
+    const std::vector<std::string_view>& args,
+    CommandKind kind,
+    std::string_view command_name) {
+  CommandLine command;
+  command.kind = kind;
+
+  if (args.size() == 1) {
+    return command;
+  }
+
+  if (args.size() == 3 && args[1] == "-t" && !is_empty(args[2])) {
+    command.session_name = std::string{args[2]};
+    return command;
+  }
+
+  std::ostringstream message;
+  message << command_name << " accepts optional -t <session>";
+  return invalid(message.str());
+}
+
+CommandLine parse_kill_window(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::KillWindow;
+
+  if (args.size() == 1) {
+    return command;
+  }
+
+  if (args.size() == 3 && args[1] == "-t" && !is_empty(args[2])) {
+    command.target_name = std::string{args[2]};
+    return command;
+  }
+
+  return invalid("kill-window accepts optional -t <target-window>");
+}
+
+CommandLine parse_kill_pane(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::KillPane;
+
+  if (args.size() == 1) {
+    return command;
+  }
+
+  if (args.size() == 3 && args[1] == "-t" && !is_empty(args[2])) {
+    command.target_name = std::string{args[2]};
+    return command;
+  }
+
+  return invalid("kill-pane accepts optional -t <target-pane>");
 }
 
 CommandLine parse_list_windows(const std::vector<std::string_view>& args) {
@@ -174,6 +244,73 @@ CommandLine parse_split_window(const std::vector<std::string_view>& args) {
 
   if (command.split_direction.empty()) {
     return invalid("split-window requires one of -h or -v");
+  }
+
+  return command;
+}
+
+CommandLine parse_resize_pane(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::ResizePane;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "-t") {
+      if (i + 1 >= args.size() || is_empty(args[i + 1])) {
+        return invalid("resize-pane requires -t <target-pane>");
+      }
+      command.target_name = std::string{args[++i]};
+      continue;
+    }
+
+    if (args[i] == "-L" || args[i] == "-R" || args[i] == "-U" || args[i] == "-D") {
+      if (!command.resize_direction.empty()) {
+        return invalid("resize-pane accepts only one resize direction");
+      }
+      command.resize_direction = std::string{args[i]};
+      continue;
+    }
+
+    std::ostringstream message;
+    message << "resize-pane does not accept argument " << quoted(args[i]);
+    return invalid(message.str());
+  }
+
+  if (command.resize_direction.empty()) {
+    return invalid("resize-pane requires one of -L, -R, -U, or -D");
+  }
+
+  return command;
+}
+
+CommandLine parse_select_layout(const std::vector<std::string_view>& args) {
+  CommandLine command;
+  command.kind = CommandKind::SelectLayout;
+
+  bool saw_spread = false;
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "-t") {
+      if (i + 1 >= args.size() || is_empty(args[i + 1])) {
+        return invalid("select-layout requires -t <target-window>");
+      }
+      command.target_name = std::string{args[++i]};
+      continue;
+    }
+
+    if (args[i] == "-E") {
+      if (saw_spread) {
+        return invalid("select-layout accepts only one -E");
+      }
+      saw_spread = true;
+      continue;
+    }
+
+    std::ostringstream message;
+    message << "select-layout does not accept argument " << quoted(args[i]);
+    return invalid(message.str());
+  }
+
+  if (!saw_spread) {
+    return invalid("select-layout supports only -E");
   }
 
   return command;
@@ -327,6 +464,26 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
     return parse_new_window(args);
   }
 
+  if (args[0] == "select-window") {
+    return parse_select_window(args);
+  }
+
+  if (args[0] == "next-window") {
+    return parse_window_cycle_command(args, CommandKind::NextWindow, "next-window");
+  }
+
+  if (args[0] == "previous-window") {
+    return parse_window_cycle_command(args, CommandKind::PreviousWindow, "previous-window");
+  }
+
+  if (args[0] == "kill-window") {
+    return parse_kill_window(args);
+  }
+
+  if (args[0] == "kill-pane") {
+    return parse_kill_pane(args);
+  }
+
   if (args[0] == "list-windows") {
     return parse_list_windows(args);
   }
@@ -337,6 +494,14 @@ CommandLine parse_command_line(const std::vector<std::string_view>& args) {
 
   if (args[0] == "split-window") {
     return parse_split_window(args);
+  }
+
+  if (args[0] == "resize-pane") {
+    return parse_resize_pane(args);
+  }
+
+  if (args[0] == "select-layout") {
+    return parse_select_layout(args);
   }
 
   if (args[0] == "set") {
@@ -399,13 +564,21 @@ std::string render_help(std::string_view executable_name) {
   out << "  attach -t <name>               Attach to a session\n";
   out << "  rename-session -t <old> <new>  Rename a session\n";
   out << "  kill-session -t <name>         Kill a session\n";
-  out << "  new-window [-t <session>] -n <name>\n";
+  out << "  new-window [-t <session>] [-n <name>]\n";
   out << "                                 Create a window\n";
+  out << "  select-window -t <target>      Select a window\n";
+  out << "  next-window [-t <session>]     Select next window\n";
+  out << "  previous-window [-t <session>] Select previous window\n";
+  out << "  kill-window [-t <target>]      Kill active or targeted window\n";
+  out << "  kill-pane [-t <target>]        Kill active or targeted pane\n";
   out << "  list-windows [-t <session>]    List windows\n";
   out << "  rename-window [-t <session>] <new>\n";
   out << "                                 Rename the active window\n";
   out << "  split-window [-t <session>] -h|-v\n";
   out << "                                 Split the active pane\n";
+  out << "  resize-pane [-t <target>] -L|-R|-U|-D\n";
+  out << "                                 Resize the active pane\n";
+  out << "  select-layout [-t <target>] -E Spread panes evenly\n";
   out << "  set -g <option> <value>       Set a validated global option\n";
   out << "  bind-key <key> <action>       Bind a prefix key globally\n";
   out << "  unbind-key <key>              Disable a prefix key globally\n";
@@ -458,9 +631,43 @@ std::string render_placeholder_response(const CommandLine& command) {
       out << "wmux: would kill session '" << command.session_name << "'\n";
       break;
     case CommandKind::NewWindow:
-      out << "wmux: would create window '" << command.window_name << "'";
+      out << "wmux: would create window";
+      if (!command.window_name.empty()) {
+        out << " '" << command.window_name << "'";
+      }
       if (!command.session_name.empty()) {
         out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::SelectWindow:
+      out << "wmux: would select window '" << command.target_name << "'\n";
+      break;
+    case CommandKind::NextWindow:
+      out << "wmux: would select next window";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::PreviousWindow:
+      out << "wmux: would select previous window";
+      if (!command.session_name.empty()) {
+        out << " in session '" << command.session_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::KillWindow:
+      out << "wmux: would kill window";
+      if (!command.target_name.empty()) {
+        out << " '" << command.target_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::KillPane:
+      out << "wmux: would kill pane";
+      if (!command.target_name.empty()) {
+        out << " '" << command.target_name << "'";
       }
       out << "\n";
       break;
@@ -484,6 +691,16 @@ std::string render_placeholder_response(const CommandLine& command) {
         out << " in session '" << command.session_name << "'";
       }
       out << "\n";
+      break;
+    case CommandKind::ResizePane:
+      out << "wmux: would resize pane " << command.resize_direction;
+      if (!command.target_name.empty()) {
+        out << " '" << command.target_name << "'";
+      }
+      out << "\n";
+      break;
+    case CommandKind::SelectLayout:
+      out << "wmux: would spread panes evenly\n";
       break;
     case CommandKind::SetOption:
       out << "wmux: would set " << command.option_name << " to " << command.option_value << "\n";

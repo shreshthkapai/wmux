@@ -64,8 +64,9 @@ same session with processes still running.
 ### Mouse Support
 
 Mouse support is a first-class workflow, not an afterthought. Users should be
-able to focus panes, resize pane boundaries, and interact with copy mode using
-mouse input where the surrounding terminal supports it.
+able to focus panes, scroll, and interact with copy mode using mouse input where
+the surrounding terminal supports it. Mouse input must not resize panes by
+default; layout mutation remains an explicit keyboard/command workflow.
 
 ### Copy Mode and Clipboard Integration
 

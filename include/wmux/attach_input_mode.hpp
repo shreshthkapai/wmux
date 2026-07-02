@@ -17,6 +17,7 @@ enum class AttachClientModeKind {
   PrefixPending,
   CopyMode,
   CommandPrompt,
+  ConfirmPrompt,
   MouseDragResize,
 };
 
@@ -24,6 +25,8 @@ struct AttachClientModeState {
   AttachClientModeKind kind{AttachClientModeKind::Normal};
   std::chrono::steady_clock::time_point started_at{};
   CommandPromptState command_prompt;
+  std::string confirm_command;
+  std::string confirm_prompt;
 };
 
 enum class AttachInputActionKind {

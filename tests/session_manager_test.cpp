@@ -302,6 +302,26 @@ void selects_next_and_previous_window() {
   assert(sessions.active_window_id(created_session.id) == 3);
 }
 
+void selects_window_by_stable_id() {
+  wmux::SessionManager sessions;
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  const auto logs = sessions.create_window(created_session.id, "logs");
+  assert(logs.ok);
+  const auto agents = sessions.create_window(created_session.id, "agents");
+  assert(agents.ok);
+  assert(sessions.active_window_id(created_session.id) == agents.window_id);
+
+  const auto selected = sessions.select_window(created_session.id, logs.window_id);
+  assert(selected.ok);
+  assert(selected.window_id == logs.window_id);
+  assert(sessions.active_window_id(created_session.id) == logs.window_id);
+
+  const auto missing = sessions.select_window(created_session.id, 404);
+  assert(!missing.ok);
+  assert(missing.error == wmux::WindowError::WindowNotFound);
+}
+
 void kills_active_window_without_killing_session() {
   wmux::SessionManager sessions;
 
@@ -938,6 +958,47 @@ void resizes_same_direction_sibling_boundary() {
   assert_layout_covers_without_overlap(rects, 120, 29);
 }
 
+void keyboard_resize_adjusts_active_pane_like_tmux_keys() {
+  wmux::SessionManager sessions;
+
+  const auto created_session = sessions.create_session("finance");
+  assert(created_session.ok);
+  assert(sessions.split_active_pane(created_session.id, wmux::SplitDirection::Horizontal).ok);
+
+  auto resized = sessions.resize_active_pane(
+      created_session.id,
+      wmux::PaneDirection::Left,
+      10,
+      120,
+      29);
+  assert(resized.ok);
+
+  auto active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  auto rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects.size() == 2);
+  assert(rects[0].width == 50);
+  assert(rects[1].left == 50);
+  assert(rects[1].width == 70);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+
+  resized = sessions.resize_active_pane(
+      created_session.id,
+      wmux::PaneDirection::Right,
+      5,
+      120,
+      29);
+  assert(resized.ok);
+
+  active = sessions.active_window_summary(created_session.id);
+  assert(active);
+  rects = wmux::compute_pane_layout_rects(active->pane_tree, 120, 29);
+  assert(rects[0].width == 55);
+  assert(rects[1].left == 55);
+  assert(rects[1].width == 65);
+  assert_layout_covers_without_overlap(rects, 120, 29);
+}
+
 void rejects_resize_target_away_from_split_border() {
   wmux::SessionManager sessions;
 
@@ -1261,6 +1322,7 @@ void run_session_manager_tests() {
   renames_active_window();
   rejects_duplicate_window_names();
   selects_next_and_previous_window();
+  selects_window_by_stable_id();
   kills_active_window_without_killing_session();
   keeps_active_ids_valid_after_window_and_pane_kills();
   rejects_killing_last_window();
@@ -1288,6 +1350,7 @@ void run_session_manager_tests() {
   resizes_nested_vertical_split_ratio();
   finds_same_direction_sibling_resize_targets();
   resizes_same_direction_sibling_boundary();
+  keyboard_resize_adjusts_active_pane_like_tmux_keys();
   rejects_resize_target_away_from_split_border();
   clamps_split_resize_ratio();
   equalizes_nearest_parent_first();

@@ -4,6 +4,7 @@
 #include "wmux/pty_output.hpp"
 #include "wmux/session_manager.hpp"
 #include "wmux/status_line.hpp"
+#include "wmux/ui_theme.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -56,7 +57,7 @@ struct RenderDiffCell {
   std::string text;
   TerminalCellWidth width{TerminalCellWidth::Narrow};
   TerminalAttributes attributes;
-  bool inverse{false};
+  bool accent_overlay{false};
 };
 
 struct RenderDiffRow {
@@ -87,6 +88,7 @@ struct RenderStatus {
   StatusLineMode mode{StatusLineMode::Normal};
   bool mouse_enabled{false};
   bool mouse_drag_active{false};
+  UiTheme ui;
 };
 
 struct CopyModePoint {

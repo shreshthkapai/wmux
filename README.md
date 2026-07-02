@@ -188,10 +188,13 @@ Ctrl+b d       detach
 Ctrl+b c       new window
 Ctrl+b n       next window
 Ctrl+b p       previous window
+Ctrl+b 0..9    select window by index
 Ctrl+b %       split horizontal
 Ctrl+b "       split vertical
 Ctrl+b arrows  switch pane
-Ctrl+b x       kill pane
+Ctrl+b x       kill pane after y/n confirmation
+Ctrl+b C-arrows resize pane by 1 cell
+Ctrl+b M-arrows resize pane by 5 cells
 Ctrl+b E       equalize panes
 Ctrl+b [       copy mode
 Ctrl+b ]       paste buffer
@@ -208,6 +211,12 @@ set -g prefix C-b
 set -g mouse on
 set -g default-shell pwsh.exe
 set -g status on
+# wmux-owned UI highlights use blue by default. Change this to red, a 0-255
+# terminal color index, or a truecolor value like "#1e90ff".
+set -g accent blue
+set -g ui-inherit-terminal-theme on
+set -g ui-tmux-style off
+set -g border-style smooth
 set -g escape-time-ms 50
 set -g scrollback-max-lines 10000
 set -g paste-buffer-max-bytes 1048576
@@ -239,7 +248,18 @@ exceeded.
 
 Runtime `wmux set -g ...` uses the same validation path as config loading.
 Already-attached clients receive live updates for prefix, mouse reporting,
-escape timing, status visibility, and attach backpressure/render limits.
+escape timing, status visibility, UI accent/theme settings, and attach
+backpressure/render limits.
+
+The renderer keeps shell/application colors from the attached terminal by
+default. wmux only styles the multiplexer-owned UI: pane borders, the active
+pane highlight, copy-mode selection, and the status line. `accent` accepts
+common color names (`blue`, `red`, `green`, etc.), 0-255 terminal color indexes,
+and `#RRGGBB` truecolor values. When `ui-tmux-style` is on, wmux uses tmux-like
+green/black UI styling instead of the configured accent. It is off by default so
+normal terminal themes remain inherited. `border-style smooth` draws tmux-like
+single-line pane borders; use `border-style ascii` only as a fallback for
+terminals or fonts without box-drawing support.
 
 Prefix key bindings can be customized with tmux-style `bind-key` lines. The key
 is the key pressed after the wmux prefix. Supported named keys include `Up`,
@@ -325,7 +345,7 @@ If a rebuild fails because `wmux.exe` is still running, stop the daemon:
 The current skeleton builds a small `wmux` executable with a daemon-owned
 ConPTY shell model, explicit detach/reattach, window and pane commands, basic
 pane rendering, live attach resize, rendering hardening, command prompt
-dispatch, mouse input, click-to-focus, border drag resize, and an explicit
+dispatch, mouse input, click-to-focus, and an explicit
 daemon-owned mouse setting:
 
 ```bash
@@ -339,11 +359,17 @@ cmake --build build
 ./build/wmux new -s finance
 ./build/wmux ls
 ./build/wmux attach -t finance
+./build/wmux new-window
 ./build/wmux new-window -n logs
 ./build/wmux list-windows
+./build/wmux select-window -t 1
+./build/wmux next-window
+./build/wmux previous-window
 ./build/wmux rename-window agents
 ./build/wmux split-window -h
 ./build/wmux split-window -v
+./build/wmux resize-pane -L
+./build/wmux select-layout -E
 ./build/wmux set -g mouse on
 ./build/wmux set -g status off
 ./build/wmux set -g scrollback-max-lines 10000
@@ -373,24 +399,35 @@ session exists. They also accept `-t <session>` for explicit daemon commands:
 ```bash
 ./build/wmux new-window -t finance -n logs
 ./build/wmux list-windows -t finance
+./build/wmux select-window -t finance:1
+./build/wmux next-window -t finance
+./build/wmux previous-window -t finance
 ./build/wmux rename-window -t finance agents
 ./build/wmux split-window -t finance -h
 ./build/wmux split-window -t finance -v
+./build/wmux resize-pane -t finance:1 -L
+./build/wmux select-layout -t finance:1 -E
+./build/wmux kill-pane -t finance:1
+./build/wmux kill-window -t finance:1
 ```
 
 `split-window` updates daemon-owned pane state for the active window, spawns a
 new ConPTY shell for the created pane, and marks the new pane active.
 Interactive attach also supports `Ctrl+b %`, `Ctrl+b "`, `Ctrl+b x`,
-`Ctrl+b E`, and `Ctrl+b` arrow keys. Input is routed only to the active pane.
-Attached windows now render all visible panes with ASCII borders, an active-pane highlight,
-clipped pane text, and a status line. The current renderer avoids drawing pane
-text over tiny-pane borders, coalesces continuous output redraws, and has
-layout tests for nested geometry, clamped split ratios, and tiny terminal
-dimensions. Interactive splits refuse to shrink the active pane below a small
-TUI-safe floor; this avoids creating pane sizes that commonly destabilize
-full-screen terminal applications. Pane text now comes from a daemon-owned
-virtual terminal grid that is updated by the PTY reader thread, not from ad hoc
-raw-byte sanitization during every redraw.
+`Ctrl+b E`, `Ctrl+b` arrow keys, `Ctrl+b C-arrow` resize-by-one, and
+`Ctrl+b M-arrow` resize-by-five. Input is routed only to the active pane.
+Attached windows render visible panes with shared tmux-like single-cell
+separators, active-pane highlighting, clipped pane text, and a bottom status
+line shaped like tmux's default session/window/status layout. The status line
+keeps a generous gap before the right-side segment so active window/pane text
+does not collide with clock/title text. The renderer avoids drawing pane text
+over tiny-pane borders, coalesces continuous output redraws, and has layout
+tests for nested geometry, clamped split ratios, and tiny terminal dimensions.
+Interactive splits refuse to shrink the active pane below a small TUI-safe
+floor; this avoids creating pane sizes that commonly destabilize full-screen
+terminal applications. Pane text now comes from a daemon-owned virtual terminal
+grid that is updated by the PTY reader thread, not from ad hoc raw-byte
+sanitization during every redraw.
 
 `wmux server stop` refuses to stop while live sessions exist. Use
 `wmux server stop --force` only when you explicitly want the daemon to terminate
@@ -410,9 +447,9 @@ mouse sequences, consumes mouse traffic, and sends compact mouse event frames
 to the daemon. When mouse mode is off, attached clients do not enable terminal
 mouse reporting and do not treat mouse sequences as wmux control traffic. The
 daemon maps left-click coordinates to the active window's pane rectangles for
-focus, detects press/drag/release sequences on split borders, updates split
-ratios in the pane tree, recomputes the layout, resizes visible pane ConPTYs,
-and redraws the active window. Clicks and drags outside panes/status are no-ops.
+focus. Drag/release sequences are parsed and ignored for layout by design:
+mouse mode does not resize panes. Clicks and drags outside panes/status are
+no-ops.
 
 For the current Windows shell-lifetime stability check, run:
 
@@ -451,22 +488,33 @@ dirty-region frame diffs, scrollback, or copy-mode selection.
 `Ctrl+b :` now enters command prompt mode in the attached client. The prompt is
 rendered through the daemon-owned status line and supports basic ASCII text
 entry, quoted arguments, backspace, `Esc` cancel, and `Enter` submission.
-Command mode currently dispatches safe current-session commands:
+Command mode dispatches the same tmux-style command names for implemented wmux
+features:
 
 ```text
 rename-session <new>
-new-window -n <name>
+new-window [-n <name>]
+select-window -t <window>
+next-window
+previous-window
 rename-window <new>
 split-window -h
 split-window -v
+resize-pane -L
+resize-pane -R
+resize-pane -U
+resize-pane -D
+select-layout -E
 kill-pane
 kill-window
+bind-key <key> <action>
+unbind-key <key>
 ```
 
 Errors and successful command results are shown in the status line. Destructive
-command-mode operations are scoped to the attached session: `kill-pane` refuses
-to remove the last pane in a window, and `kill-window` refuses to remove the
-last window in a session. These commands do not implicitly kill the session.
+command-mode operations are scoped to the attached session. `Ctrl+b x` prompts
+for confirmation before executing `kill-pane`; textual `kill-pane` commands
+execute directly like tmux commands.
 
 For the current command-mode dispatch check, run:
 
@@ -524,17 +572,6 @@ For the current daemon mouse setting check, run:
 The script requires an empty daemon, verifies the default `mouse: off` status,
 sets mouse on and off through command IPC, and confirms attach startup responses
 include the expected `mouse_enabled` value.
-
-For the current mouse border drag-resize check, run:
-
-```powershell
-.\scripts\test-mouse-resize.ps1 -Wmux .\build-vs\Debug\wmux.exe
-```
-
-The script requires an empty daemon, restarts it with a deterministic
-`cmd.exe /D /Q` test shell, drives the attach pipe directly with mouse event
-frames, drags the horizontal split border, and verifies later click-to-focus
-uses the updated pane geometry.
 
 For development from WSL or Linux, the same IPC abstraction uses a Unix-domain
 socket fallback so daemon lifecycle behavior can be validated before ConPTY

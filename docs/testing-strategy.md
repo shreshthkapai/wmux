@@ -52,7 +52,6 @@ Important scripts:
 - `scripts\test-pane-focus.ps1`
 - `scripts\test-command-mode.ps1`
 - `scripts\test-mouse-focus.ps1`
-- `scripts\test-mouse-resize.ps1`
 - `scripts\test-process-lifecycle.ps1`
 - `scripts\test-process-cleanup.ps1`
 - `scripts\test-daemon-recovery.ps1`

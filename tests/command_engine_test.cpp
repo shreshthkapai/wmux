@@ -81,6 +81,14 @@ void maps_attach_commands_to_runtime_commands() {
   assert(next);
   assert(next->kind == wmux::RuntimeCommandKind::NextWindow);
 
+  const auto select_window = wmux::daemon_internal::runtime_command_from_attach_command(
+      "select-window-2",
+      error);
+  assert(select_window);
+  assert(select_window->kind == wmux::RuntimeCommandKind::SelectWindow);
+  assert(select_window->target.kind == wmux::TargetKind::Named);
+  assert(select_window->target.name == "2");
+
   const auto split_horizontal = wmux::daemon_internal::runtime_command_from_attach_command(
       "split-horizontal",
       error);
@@ -127,6 +135,21 @@ void maps_command_mode_text_to_runtime_commands() {
   assert(new_window->kind == wmux::RuntimeCommandKind::NewWindow);
   assert(new_window->name == "logs");
 
+  const auto unnamed_window = wmux::daemon_internal::runtime_command_from_command_mode_text(
+      "new-window",
+      error);
+  assert(unnamed_window);
+  assert(unnamed_window->kind == wmux::RuntimeCommandKind::NewWindow);
+  assert(!unnamed_window->name);
+
+  const auto select_window = wmux::daemon_internal::runtime_command_from_command_mode_text(
+      "select-window -t 1",
+      error);
+  assert(select_window);
+  assert(select_window->kind == wmux::RuntimeCommandKind::SelectWindow);
+  assert(select_window->target.kind == wmux::TargetKind::Named);
+  assert(select_window->target.name == "1");
+
   const auto split_vertical = wmux::daemon_internal::runtime_command_from_command_mode_text(
       "split-window -v",
       error);
@@ -139,6 +162,13 @@ void maps_command_mode_text_to_runtime_commands() {
       error);
   assert(tmux_spread);
   assert(tmux_spread->kind == wmux::RuntimeCommandKind::SpreadPanesEvenly);
+
+  const auto resize_left = wmux::daemon_internal::runtime_command_from_command_mode_text(
+      "resize-pane -L",
+      error);
+  assert(resize_left);
+  assert(resize_left->kind == wmux::RuntimeCommandKind::ResizePane);
+  assert(resize_left->resize_direction == wmux::ResizeDirection::Left);
 
   const auto bind_key = wmux::daemon_internal::runtime_command_from_command_mode_text(
       "bind-key z new-window",
@@ -196,6 +226,25 @@ void maps_ipc_requests_to_runtime_commands() {
   assert(split_command->target.kind == wmux::TargetKind::Named);
   assert(split_command->target.name == "finance");
   assert(split_command->axis == wmux::SplitDirection::Horizontal);
+
+  wmux::IpcRequest select_window;
+  select_window.type = "SelectWindow";
+  select_window.target_name = "finance:1";
+  const auto select_window_command =
+      wmux::daemon_internal::runtime_command_from_ipc_request(select_window, error);
+  assert(select_window_command);
+  assert(select_window_command->kind == wmux::RuntimeCommandKind::SelectWindow);
+  assert(select_window_command->target.kind == wmux::TargetKind::Named);
+  assert(select_window_command->target.name == "finance:1");
+
+  wmux::IpcRequest resize;
+  resize.type = "ResizePane";
+  resize.resize_direction = "-D";
+  const auto resize_command =
+      wmux::daemon_internal::runtime_command_from_ipc_request(resize, error);
+  assert(resize_command);
+  assert(resize_command->kind == wmux::RuntimeCommandKind::ResizePane);
+  assert(resize_command->resize_direction == wmux::ResizeDirection::Down);
 
   wmux::IpcRequest bind;
   bind.type = "BindKey";
@@ -285,6 +334,30 @@ void resolves_named_session_and_window_targets() {
   assert(window.target.window_id != fixture->session.window_id);
 }
 
+void resolves_tmux_session_window_targets() {
+  auto fixture = make_target_fixture();
+  {
+    std::lock_guard lock(fixture->state.mutex);
+    const auto created = fixture->state.sessions.create_window(fixture->session.id, "logs");
+    assert(created.ok);
+  }
+
+  const auto by_index = wmux::daemon_internal::resolve_target(
+      fixture->state,
+      wmux::Target::named("finance:1"),
+      fixture->client_id);
+  assert(by_index.ok);
+  assert(by_index.target.session_id == fixture->session.id);
+  assert(by_index.target.window_id != fixture->session.window_id);
+
+  const auto by_name = wmux::daemon_internal::resolve_target(
+      fixture->state,
+      wmux::Target::named("finance:logs"),
+      fixture->client_id);
+  assert(by_name.ok);
+  assert(by_name.target.window_id == by_index.target.window_id);
+}
+
 void resolves_mouse_position_to_pane() {
   auto fixture = make_target_fixture();
   const auto left_pane = wmux::daemon_internal::resolve_target(
@@ -342,6 +415,7 @@ void run_command_engine_tests() {
   resolves_current_client_target();
   resolves_explicit_session_window_and_pane_targets();
   resolves_named_session_and_window_targets();
+  resolves_tmux_session_window_targets();
   resolves_mouse_position_to_pane();
   reports_stale_targets_as_user_errors();
 }

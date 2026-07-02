@@ -1045,6 +1045,7 @@ DaemonAttachSettings daemon_attach_settings(DaemonState& state) {
       state.config.values.prefix,
       state.config.values.status_bar_enabled,
       state.config.values.escape_time_ms,
+      state.config.values.ui,
       state.config.values.limits,
       serialize_attach_key_binding_overrides(state.config.values.keys.bindings)};
 }

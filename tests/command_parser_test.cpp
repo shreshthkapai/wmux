@@ -102,6 +102,14 @@ void expects_new_window_command() {
   assert(result.error.empty());
 }
 
+void expects_unnamed_new_window_command() {
+  const std::vector<std::string_view> args{"new-window"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::NewWindow);
+  assert(result.window_name.empty());
+  assert(result.error.empty());
+}
+
 void expects_targeted_new_window_command() {
   const std::vector<std::string_view> args{"new-window", "-t", "finance", "-n", "logs"};
   const auto result = wmux::parse_command_line(args);
@@ -109,6 +117,48 @@ void expects_targeted_new_window_command() {
   assert(result.session_name == "finance");
   assert(result.window_name == "logs");
   assert(result.error.empty());
+}
+
+void expects_select_window_command() {
+  const std::vector<std::string_view> args{"select-window", "-t", "1"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SelectWindow);
+  assert(result.target_name == "1");
+  assert(result.error.empty());
+}
+
+void expects_next_previous_window_commands() {
+  {
+    const std::vector<std::string_view> args{"next-window"};
+    const auto result = wmux::parse_command_line(args);
+    assert(result.kind == wmux::CommandKind::NextWindow);
+    assert(result.session_name.empty());
+    assert(result.error.empty());
+  }
+  {
+    const std::vector<std::string_view> args{"previous-window", "-t", "finance"};
+    const auto result = wmux::parse_command_line(args);
+    assert(result.kind == wmux::CommandKind::PreviousWindow);
+    assert(result.session_name == "finance");
+    assert(result.error.empty());
+  }
+}
+
+void expects_kill_window_and_pane_commands() {
+  {
+    const std::vector<std::string_view> args{"kill-window", "-t", "finance:1"};
+    const auto result = wmux::parse_command_line(args);
+    assert(result.kind == wmux::CommandKind::KillWindow);
+    assert(result.target_name == "finance:1");
+    assert(result.error.empty());
+  }
+  {
+    const std::vector<std::string_view> args{"kill-pane"};
+    const auto result = wmux::parse_command_line(args);
+    assert(result.kind == wmux::CommandKind::KillPane);
+    assert(result.target_name.empty());
+    assert(result.error.empty());
+  }
 }
 
 void expects_list_windows_command() {
@@ -160,6 +210,22 @@ void expects_split_window_vertical_command() {
   assert(result.kind == wmux::CommandKind::SplitWindow);
   assert(result.session_name == "finance");
   assert(result.split_direction == "vertical");
+  assert(result.error.empty());
+}
+
+void expects_resize_pane_command() {
+  const std::vector<std::string_view> args{"resize-pane", "-t", "finance:1", "-L"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::ResizePane);
+  assert(result.target_name == "finance:1");
+  assert(result.resize_direction == "-L");
+  assert(result.error.empty());
+}
+
+void expects_select_layout_spread_command() {
+  const std::vector<std::string_view> args{"select-layout", "-E"};
+  const auto result = wmux::parse_command_line(args);
+  assert(result.kind == wmux::CommandKind::SelectLayout);
   assert(result.error.empty());
 }
 
@@ -424,13 +490,19 @@ int main() {
   expects_rename_session_command();
   expects_kill_session_command();
   expects_new_window_command();
+  expects_unnamed_new_window_command();
   expects_targeted_new_window_command();
+  expects_select_window_command();
+  expects_next_previous_window_commands();
+  expects_kill_window_and_pane_commands();
   expects_list_windows_command();
   expects_targeted_list_windows_command();
   expects_rename_window_command();
   expects_targeted_rename_window_command();
   expects_split_window_horizontal_command();
   expects_split_window_vertical_command();
+  expects_resize_pane_command();
+  expects_select_layout_spread_command();
   expects_set_mouse_on_command();
   expects_set_mouse_off_command();
   expects_bind_key_command();

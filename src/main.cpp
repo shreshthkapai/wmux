@@ -52,7 +52,14 @@ int main(int argc, char** argv) {
     case wmux::CommandKind::NewWindow:
     case wmux::CommandKind::ListWindows:
     case wmux::CommandKind::RenameWindow:
+    case wmux::CommandKind::SelectWindow:
+    case wmux::CommandKind::NextWindow:
+    case wmux::CommandKind::PreviousWindow:
+    case wmux::CommandKind::KillWindow:
+    case wmux::CommandKind::KillPane:
     case wmux::CommandKind::SplitWindow:
+    case wmux::CommandKind::ResizePane:
+    case wmux::CommandKind::SelectLayout:
     case wmux::CommandKind::SetOption:
     case wmux::CommandKind::BindKey:
     case wmux::CommandKind::UnbindKey:

@@ -205,16 +205,28 @@ AttachKeyBindingTable default_attach_key_bindings() {
   AttachKeyBindingTable table;
   bind_action(table, "d", detach_action());
   bind_action(table, "D", detach_action());
+  bind_action(table, "\x04", detach_action());
   bind_action(table, "c", command_action("new-window"));
   bind_action(table, "C", command_action("new-window"));
+  bind_action(table, "\x03", command_action("new-window"));
   bind_action(table, "n", command_action("next-window"));
   bind_action(table, "N", command_action("next-window"));
+  bind_action(table, "\x0e", command_action("next-window"));
   bind_action(table, "p", command_action("previous-window"));
   bind_action(table, "P", command_action("previous-window"));
+  bind_action(table, "\x10", command_action("previous-window"));
+  for (char digit = '0'; digit <= '9'; ++digit) {
+    bind_action(
+        table,
+        std::string_view{&digit, 1},
+        command_action("select-window-" + std::string(1, digit)));
+  }
   bind_action(table, "x", command_action("kill-pane"));
   bind_action(table, "X", command_action("kill-pane"));
+  bind_action(table, "\x18", command_action("kill-pane"));
   bind_action(table, "e", none_action());
   bind_action(table, "E", command_action("equalize-panes"));
+  bind_action(table, "\x05", command_action("equalize-panes"));
   bind_action(table, "%", command_action("split-horizontal"));
   bind_action(table, "\"", command_action("split-vertical"));
   bind_action(table, "g", scroll_action(AttachScrollAction::Bottom, 1));
@@ -228,6 +240,14 @@ AttachKeyBindingTable default_attach_key_bindings() {
   bind_action(table, "\x1b[B", command_action("select-pane-down"));
   bind_action(table, "\x1b[C", command_action("select-pane-right"));
   bind_action(table, "\x1b[D", command_action("select-pane-left"));
+  bind_action(table, "\x1b[1;5A", command_action("resize-pane-up"));
+  bind_action(table, "\x1b[1;5B", command_action("resize-pane-down"));
+  bind_action(table, "\x1b[1;5C", command_action("resize-pane-right"));
+  bind_action(table, "\x1b[1;5D", command_action("resize-pane-left"));
+  bind_action(table, "\x1b[1;3A", command_action("resize-pane-up-large"));
+  bind_action(table, "\x1b[1;3B", command_action("resize-pane-down-large"));
+  bind_action(table, "\x1b[1;3C", command_action("resize-pane-right-large"));
+  bind_action(table, "\x1b[1;3D", command_action("resize-pane-left-large"));
   return table;
 }
 
@@ -261,6 +281,30 @@ std::optional<std::string> normalize_attach_key_spec(std::string_view spec) {
   }
   if (named == "left") {
     return std::string{"\x1b[D"};
+  }
+  if (named == "c-up" || named == "ctrl-up") {
+    return std::string{"\x1b[1;5A"};
+  }
+  if (named == "c-down" || named == "ctrl-down") {
+    return std::string{"\x1b[1;5B"};
+  }
+  if (named == "c-right" || named == "ctrl-right") {
+    return std::string{"\x1b[1;5C"};
+  }
+  if (named == "c-left" || named == "ctrl-left") {
+    return std::string{"\x1b[1;5D"};
+  }
+  if (named == "m-up" || named == "alt-up") {
+    return std::string{"\x1b[1;3A"};
+  }
+  if (named == "m-down" || named == "alt-down") {
+    return std::string{"\x1b[1;3B"};
+  }
+  if (named == "m-right" || named == "alt-right") {
+    return std::string{"\x1b[1;3C"};
+  }
+  if (named == "m-left" || named == "alt-left") {
+    return std::string{"\x1b[1;3D"};
   }
   if (named == "pageup" || named == "page-up") {
     return std::string{"\x1b[5~"};
@@ -311,8 +355,35 @@ std::optional<std::string> normalize_attach_key_action_name(std::string_view act
       lowered == "previous-window" || lowered == "kill-pane" ||
       lowered == "split-horizontal" || lowered == "split-vertical" ||
       lowered == "select-pane-left" || lowered == "select-pane-right" ||
-      lowered == "select-pane-up" || lowered == "select-pane-down") {
+      lowered == "select-pane-up" || lowered == "select-pane-down" ||
+      lowered == "resize-pane-left" || lowered == "resize-pane-right" ||
+      lowered == "resize-pane-up" || lowered == "resize-pane-down" ||
+      lowered == "resize-pane-left-large" || lowered == "resize-pane-right-large" ||
+      lowered == "resize-pane-up-large" || lowered == "resize-pane-down-large") {
     return lowered;
+  }
+  if (lowered.size() == std::string_view{"select-window-"}.size() + 1 &&
+      lowered.rfind("select-window-", 0) == 0 &&
+      std::isdigit(static_cast<unsigned char>(lowered.back())) != 0) {
+    return lowered;
+  }
+  constexpr std::string_view kSelectWindowTargetPrefix = "select-window -t ";
+  if (lowered.rfind(kSelectWindowTargetPrefix, 0) == 0 &&
+      lowered.size() == kSelectWindowTargetPrefix.size() + 1 &&
+      std::isdigit(static_cast<unsigned char>(lowered.back())) != 0) {
+    return "select-window-" + std::string{lowered.back()};
+  }
+  if (lowered == "resize-pane -l" || lowered == "resize-pane-l") {
+    return std::string{"resize-pane-left"};
+  }
+  if (lowered == "resize-pane -r" || lowered == "resize-pane-r") {
+    return std::string{"resize-pane-right"};
+  }
+  if (lowered == "resize-pane -u" || lowered == "resize-pane-u") {
+    return std::string{"resize-pane-up"};
+  }
+  if (lowered == "resize-pane -d" || lowered == "resize-pane-d") {
+    return std::string{"resize-pane-down"};
   }
   if (lowered == "equalize-panes" || lowered == "spread-panes-evenly" ||
       lowered == "select-layout -e" || lowered == "select-layout-e") {

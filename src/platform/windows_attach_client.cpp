@@ -509,9 +509,124 @@ bool read_exact(HANDLE handle, char* data, std::size_t size) {
   return true;
 }
 
-bool read_ipc_frame(HANDLE pipe, IpcFrameParseResult& frame) {
+bool wait_for_pipe_io(
+    HANDLE pipe,
+    OVERLAPPED& overlapped,
+    HANDLE event,
+    const std::atomic_bool* stop_requested,
+    HANDLE stop_event,
+    DWORD& bytes_transferred) {
+  while (true) {
+    HANDLE wait_handles[2] = {event, stop_event};
+    const DWORD handle_count = valid_handle(stop_event) ? 2 : 1;
+    const DWORD wait_result = WaitForMultipleObjects(handle_count, wait_handles, FALSE, 50);
+    if (wait_result == WAIT_OBJECT_0) {
+      return GetOverlappedResult(pipe, &overlapped, &bytes_transferred, FALSE) != 0;
+    }
+    if (handle_count == 2 && wait_result == WAIT_OBJECT_0 + 1) {
+      CancelIoEx(pipe, &overlapped);
+      WaitForSingleObject(event, 1000);
+      return false;
+    }
+    if (wait_result != WAIT_TIMEOUT) {
+      CancelIoEx(pipe, &overlapped);
+      WaitForSingleObject(event, 1000);
+      return false;
+    }
+    if (stop_requested != nullptr && stop_requested->load(std::memory_order_relaxed)) {
+      CancelIoEx(pipe, &overlapped);
+      WaitForSingleObject(event, 1000);
+      return false;
+    }
+  }
+}
+
+bool read_pipe_exact(
+    HANDLE pipe,
+    char* data,
+    std::size_t size,
+    const std::atomic_bool* stop_requested = nullptr,
+    HANDLE stop_event = nullptr) {
+  std::size_t total = 0;
+  while (total < size) {
+    UniqueHandle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    if (!event.valid()) {
+      return false;
+    }
+
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    DWORD bytes_read = 0;
+    const auto bytes_to_read =
+        static_cast<DWORD>(std::min<std::size_t>(size - total, 64 * 1024));
+    const BOOL ok = ReadFile(pipe, data + total, bytes_to_read, nullptr, &overlapped);
+    if (!ok) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_IO_PENDING) {
+        return false;
+      }
+      if (!wait_for_pipe_io(pipe, overlapped, event.get(), stop_requested, stop_event, bytes_read)) {
+        return false;
+      }
+    } else if (!GetOverlappedResult(pipe, &overlapped, &bytes_read, FALSE)) {
+      return false;
+    }
+
+    if (bytes_read == 0) {
+      return false;
+    }
+    total += bytes_read;
+  }
+
+  return true;
+}
+
+bool write_pipe_all(
+    HANDLE pipe,
+    std::string_view bytes,
+    const std::atomic_bool* stop_requested = nullptr,
+    HANDLE stop_event = nullptr) {
+  while (!bytes.empty()) {
+    UniqueHandle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    if (!event.valid()) {
+      return false;
+    }
+
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    DWORD bytes_written = 0;
+    const auto bytes_to_write =
+        static_cast<DWORD>(std::min<std::size_t>(bytes.size(), 64 * 1024));
+    const BOOL ok = WriteFile(pipe, bytes.data(), bytes_to_write, nullptr, &overlapped);
+    if (!ok) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_IO_PENDING) {
+        return false;
+      }
+      if (!wait_for_pipe_io(
+              pipe, overlapped, event.get(), stop_requested, stop_event, bytes_written)) {
+        return false;
+      }
+    } else if (!GetOverlappedResult(pipe, &overlapped, &bytes_written, FALSE)) {
+      return false;
+    }
+
+    if (bytes_written == 0) {
+      return false;
+    }
+    bytes.remove_prefix(bytes_written);
+  }
+
+  return true;
+}
+
+bool read_ipc_frame(
+    HANDLE pipe,
+    IpcFrameParseResult& frame,
+    const std::atomic_bool* stop_requested = nullptr,
+    HANDLE stop_event = nullptr) {
   std::array<char, kIpcFrameHeaderSize> raw_header{};
-  if (!read_exact(pipe, raw_header.data(), raw_header.size())) {
+  if (!read_pipe_exact(pipe, raw_header.data(), raw_header.size(), stop_requested, stop_event)) {
     return false;
   }
 
@@ -526,7 +641,12 @@ bool read_ipc_frame(HANDLE pipe, IpcFrameParseResult& frame) {
   }
 
   frame.payload.resize(frame.header.payload_size);
-  return read_exact(pipe, frame.payload.data(), frame.payload.size());
+  return read_pipe_exact(
+      pipe,
+      frame.payload.data(),
+      frame.payload.size(),
+      stop_requested,
+      stop_event);
 }
 
 bool read_response_frame(HANDLE pipe, std::uint64_t request_id, IpcResponse& response) {
@@ -681,7 +801,7 @@ bool connect_pipe(UniqueHandle& pipe) {
         0,
         nullptr,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         nullptr);
 
     if (raw_pipe != INVALID_HANDLE_VALUE) {
@@ -703,7 +823,7 @@ bool connect_pipe(UniqueHandle& pipe) {
 
 bool write_attach_frame(HANDLE pipe, std::string_view frame) {
   const auto request_id = next_attach_request_id();
-  return write_all(pipe, make_ipc_frame(IpcFrameKind::AttachInput, request_id, frame));
+  return write_pipe_all(pipe, make_ipc_frame(IpcFrameKind::AttachInput, request_id, frame));
 }
 
 bool send_attach_input(HANDLE pipe, std::string_view bytes) {
@@ -940,7 +1060,7 @@ void stream_output(
   std::string pending_utf8;
   while (!stop_requested) {
     IpcFrameParseResult frame;
-    if (!read_ipc_frame(pipe, frame)) {
+    if (!read_ipc_frame(pipe, frame, &stop_requested, stop_event)) {
       break;
     }
 
@@ -1160,7 +1280,7 @@ int run_attach_client(const CommandLine& command) {
       IpcFrameKind::Control,
       attach_request_id,
       make_attach_request_json(command, size.columns, size.rows));
-  if (!write_all(pipe.get(), attach_request)) {
+  if (!write_pipe_all(pipe.get(), attach_request)) {
     log_event(
         LogLevel::Error,
         "client.attach",

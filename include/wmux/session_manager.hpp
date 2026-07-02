@@ -228,6 +228,7 @@ class SessionManager {
   WindowOperationResult rename_active_window(SessionId session_id, std::string name);
   WindowOperationResult select_next_window(SessionId session_id);
   WindowOperationResult select_previous_window(SessionId session_id);
+  WindowOperationResult select_window(SessionId session_id, WindowId window_id);
   WindowOperationResult kill_active_window(SessionId session_id);
   PaneOperationResult split_active_pane(SessionId session_id, SplitDirection direction);
   PaneOperationResult select_pane(SessionId session_id, PaneDirection direction);
@@ -242,6 +243,12 @@ class SessionManager {
       const PaneSplitResizeTarget& target,
       int column,
       int row);
+  PaneOperationResult resize_active_pane(
+      SessionId session_id,
+      PaneDirection direction,
+      std::uint16_t amount,
+      int columns,
+      int rows);
   PaneOperationResult equalize_active_window_panes(SessionId session_id);
   PaneOperationResult kill_active_pane(SessionId session_id);
 

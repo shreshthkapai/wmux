@@ -13,6 +13,10 @@ void parses_supported_settings() {
       "set -g mouse on\n"
       "set -g default-shell powershell.exe\n"
       "set -g status off\n"
+      "set -g accent red\n"
+      "set -g ui-inherit-terminal-theme off\n"
+      "set -g ui-tmux-style on\n"
+      "set -g border-style ascii\n"
       "set -g escape-time-ms 75\n"
       "set -g max-sessions 12\n"
       "set -g max-windows-per-session 8\n"
@@ -48,6 +52,12 @@ void parses_supported_settings() {
   assert(result.config.mouse_enabled);
   assert(result.config.default_shell == "powershell.exe");
   assert(!result.config.status_bar_enabled);
+  assert(result.config.ui.accent_spec == "red");
+  assert(result.config.ui.accent.kind == wmux::UiColorKind::Indexed);
+  assert(result.config.ui.accent.index == 1);
+  assert(!result.config.ui.inherit_terminal_theme);
+  assert(result.config.ui.tmux_style);
+  assert(!result.config.ui.smooth_borders);
   assert(result.config.escape_time_ms == 75);
   assert(result.config.limits.max_sessions == 12);
   assert(result.config.limits.max_windows_per_session == 8);
@@ -90,6 +100,12 @@ void preserves_defaults_for_empty_config() {
   assert(result.config.mouse_enabled);
   assert(result.config.default_shell.empty());
   assert(result.config.status_bar_enabled);
+  assert(result.config.ui.accent_spec == "blue");
+  assert(result.config.ui.accent.kind == wmux::UiColorKind::Indexed);
+  assert(result.config.ui.accent.index == 4);
+  assert(result.config.ui.inherit_terminal_theme);
+  assert(!result.config.ui.tmux_style);
+  assert(result.config.ui.smooth_borders);
   assert(result.config.escape_time_ms == 50);
   assert(result.config.limits.max_sessions == wmux::kMaxSessions);
   assert(result.config.limits.max_windows_per_session == wmux::kMaxWindowsPerSession);
@@ -118,16 +134,22 @@ void rejects_bad_boolean_values() {
   const auto result = wmux::parse_config_text(
       "set -g mouse yes\n"
       "set -g status disabled\n"
-      "set -g terminal-mouse maybe\n");
+      "set -g terminal-mouse maybe\n"
+      "set -g ui-tmux-style maybe\n"
+      "set -g border-style dotted\n");
 
   assert(!result.ok());
-  assert(result.errors.size() == 3);
+  assert(result.errors.size() == 5);
   assert(result.errors[0].line == 1);
   assert(result.errors[0].message == "mouse must be on or off");
   assert(result.errors[1].line == 2);
   assert(result.errors[1].message == "status must be on or off");
   assert(result.errors[2].line == 3);
   assert(result.errors[2].message == "terminal-mouse must be on or off");
+  assert(result.errors[3].line == 4);
+  assert(result.errors[3].message == "ui-tmux-style must be on or off");
+  assert(result.errors[4].line == 5);
+  assert(result.errors[4].message == "border-style must be smooth or ascii");
 }
 
 void rejects_bad_prefix_format() {
@@ -147,6 +169,20 @@ void rejects_bad_escape_time() {
   assert(result.errors.size() == 2);
   assert(result.errors[0].message == "escape-time-ms must be between 0 and 5000");
   assert(result.errors[1].message == "escape-time-ms must be between 0 and 5000");
+}
+
+void parses_hex_and_index_accent_colors() {
+  const auto hex = wmux::parse_config_text("set -g accent \"#1e90ff\"\n");
+  assert(hex.ok());
+  assert(hex.config.ui.accent.kind == wmux::UiColorKind::Rgb);
+  assert(hex.config.ui.accent.red == 0x1e);
+  assert(hex.config.ui.accent.green == 0x90);
+  assert(hex.config.ui.accent.blue == 0xff);
+
+  const auto indexed = wmux::parse_config_text("set -g ui-accent 12\n");
+  assert(indexed.ok());
+  assert(indexed.config.ui.accent.kind == wmux::UiColorKind::Indexed);
+  assert(indexed.config.ui.accent.index == 12);
 }
 
 void rejects_bad_resource_limits() {
@@ -170,6 +206,15 @@ void rejects_bad_resource_limits() {
   assert(result.errors[4].line == 5);
   assert(result.errors[4].message ==
          "ipc-frame-max-bytes must be between 1 and the compiled IPC frame hard limit");
+}
+
+void rejects_bad_accent_color() {
+  const auto result = wmux::parse_config_text("set -g accent nope-blue-ish\n");
+
+  assert(!result.ok());
+  assert(result.errors.size() == 1);
+  assert(result.errors[0].message ==
+         "accent must be a named color, 0-255 color index, or #RRGGBB value");
 }
 
 void rejects_missing_explicit_shell_path() {
@@ -289,7 +334,9 @@ void run_config_tests() {
   rejects_bad_boolean_values();
   rejects_bad_prefix_format();
   rejects_bad_escape_time();
+  parses_hex_and_index_accent_colors();
   rejects_bad_resource_limits();
+  rejects_bad_accent_color();
   rejects_missing_explicit_shell_path();
   applies_single_global_option_with_shared_validation();
   applies_key_binding_options_with_shared_validation();

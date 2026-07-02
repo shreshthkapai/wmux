@@ -339,11 +339,13 @@ Current implementation notes:
 - Every new session starts with one initial window named `0`.
 - Window runtime ownership is keyed by stable `SessionId` and `WindowId`; window
   names are metadata and command lookup text, not process ownership keys.
-- `wmux new-window -n <name>`, `wmux list-windows`, and
-  `wmux rename-window <new>` operate on the only live session when exactly one
-  session exists.
+- `wmux new-window [-n <name>]`, `wmux list-windows`,
+  `wmux select-window -t <target>`, `wmux next-window`,
+  `wmux previous-window`, and `wmux rename-window <new>` operate on the only
+  live session when exactly one session exists.
 - The same commands accept `-t <session>` for explicit daemon targeting:
-  `wmux new-window -t finance -n logs`, `wmux list-windows -t finance`, and
+  `wmux new-window -t finance -n logs`, `wmux list-windows -t finance`,
+  `wmux select-window -t finance:1`, `wmux next-window -t finance`, and
   `wmux rename-window -t finance agents`.
 - `wmux attach -t <session>` attaches to that session's active window.
 - Phase 8C replaces raw active-window passthrough with basic daemon-rendered
@@ -353,7 +355,8 @@ Current implementation notes:
 ### Phase 7B: Interactive Window Switching
 
 - Add `Ctrl+b c` for new window
-- Add `Ctrl+b n` and `Ctrl+b p` for next/previous window
+- Add `Ctrl+b n`, `Ctrl+b p`, and `Ctrl+b 0..9` for next/previous/indexed
+  window selection
 - Add command-mode equivalents once command mode exists
 - Ensure attached clients switch to the newly active window cleanly
 
@@ -363,8 +366,9 @@ Current implementation notes:
   explicit detach, and window commands are kept separate.
 - `Ctrl+b c` creates a new daemon-owned window shell in the attached session and
   makes it active.
-- `Ctrl+b n` and `Ctrl+b p` switch the session's active window and replay the
-  newly active shell's bounded output buffer to the attached client.
+- `Ctrl+b n`, `Ctrl+b p`, and `Ctrl+b 0..9` switch the session's active window
+  and replay the newly active shell's bounded output buffer to the attached
+  client.
 - The attach thread performs initial and switch replay before returning to input
   polling. This avoids blocking output behind an idle synchronous pipe read.
 - Server-side attach input reads poll for complete framed messages before
@@ -414,6 +418,7 @@ Current implementation notes:
 - Add `Ctrl+b %` and `Ctrl+b "` for splitting
 - Add `Ctrl+b` arrow keys for pane focus
 - Add `Ctrl+b x` for killing the active pane
+- Add `Ctrl+b C-arrow` and `Ctrl+b M-arrow` for tmux-style pane resizing
 - Add `Ctrl+b E` for recursively equalizing pane sizes in the active window
 - Route input only to the focused pane
 - Ensure each pane keeps independent shell state
@@ -429,8 +434,11 @@ Current implementation notes:
 - `Ctrl+b` arrow keys select the nearest pane in that direction based on the
   pane tree's current virtual rectangles. This is the same neighbor model the
   later renderer can use, but it does not draw borders yet.
-- `Ctrl+b x` kills the active pane through the same cleanup path as
-  `kill-pane`.
+- `Ctrl+b x` opens a status-line `kill-pane? (y/n)` confirmation. Confirmed
+  kills use the same cleanup path as `kill-pane`; confirming the last pane of
+  the last window kills the session and terminates its pane runtime.
+- `Ctrl+b C-arrow` resizes the active pane by one cell and `Ctrl+b M-arrow`
+  resizes by five cells, matching tmux's default bindings.
 - `Ctrl+b E` preserves the pane tree shape and recursively redistributes split
   ratios by leaf count, matching tmux's equalize-current-window behavior more
   closely than a direction-specific resize.
@@ -660,7 +668,7 @@ refusal, and attached-session rename against daemon-visible state.
 - Parse mouse events
 - Map clicks to pane rectangles
 - Click to focus pane
-- Drag borders to resize panes
+- Do not resize panes from mouse drag by default
 
 Current mouse foundation implementation notes:
 
@@ -678,10 +686,9 @@ Current mouse foundation implementation notes:
 - The daemon maps left-click coordinates to the active window's current pane
   rectangles and selects the hit pane without routing the click bytes into the
   shell.
-- Presses on split borders start a per-attach-client drag target. Drag events
-  update the target split ratio in the daemon-owned pane tree, clamp the ratio
-  to the same safe bounds used by layout, recompute pane rectangles, resize
-  visible pane ConPTYs, and redraw the active window.
+- Drag/release events are parsed and consumed as wmux mouse traffic, but they do
+  not resize panes. This intentionally differs from tmux so mouse mode cannot
+  accidentally mutate layout.
 - Clicks and drags outside pane rectangles, including the status line, are
   no-ops rather than protocol failures.
 - `wmux set -g mouse on` and `wmux set -g mouse off` now update daemon-owned
@@ -692,9 +699,7 @@ Current mouse foundation implementation notes:
   reporting disabled when `mouse` is off.
 - Current regression coverage includes parser unit tests and
   `scripts/test-mouse-focus.ps1`, which verifies clicked-pane focus changes
-  shell input routing. `scripts/test-mouse-resize.ps1` verifies drag-resize by
-  moving a split border and confirming subsequent click-to-focus uses the
-  updated pane geometry. `scripts/test-mouse-setting.ps1` verifies command IPC,
+  shell input routing. `scripts/test-mouse-setting.ps1` verifies command IPC,
   status output, and attach response propagation for the mouse setting.
 
 ### Phase 15: Configuration

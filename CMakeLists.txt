@@ -85,6 +85,7 @@ set(WMUX_CORE_SOURCES
   src/core/terminal_input.cpp
   src/core/terminal_grid.cpp
   src/core/terminal_vt.cpp
+  src/core/ui_theme.cpp
   src/core/unicode_width.cpp
   src/core/version.cpp
   src/ipc/protocol.cpp

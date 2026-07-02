@@ -68,6 +68,8 @@ std::string_view runtime_command_name(RuntimeCommandKind kind) {
       return "NextWindow";
     case RuntimeCommandKind::PreviousWindow:
       return "PreviousWindow";
+    case RuntimeCommandKind::SelectWindow:
+      return "SelectWindow";
     case RuntimeCommandKind::KillWindow:
       return "KillWindow";
     case RuntimeCommandKind::SplitPane:

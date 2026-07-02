@@ -84,6 +84,20 @@ std::string split_direction_name(SplitDirection direction) {
   return direction == SplitDirection::Horizontal ? "LeftRight" : "TopBottom";
 }
 
+PaneDirection pane_direction_from_resize_direction(ResizeDirection direction) {
+  switch (direction) {
+    case ResizeDirection::Left:
+      return PaneDirection::Left;
+    case ResizeDirection::Right:
+      return PaneDirection::Right;
+    case ResizeDirection::Up:
+      return PaneDirection::Up;
+    case ResizeDirection::Down:
+      return PaneDirection::Down;
+  }
+  return PaneDirection::Right;
+}
+
 std::string client_mode_name(DaemonState::ClientMode mode) {
   switch (mode) {
     case DaemonState::ClientMode::Normal:
@@ -105,6 +119,20 @@ std::string resource_limit_message(std::string_view object, std::size_t limit) {
   std::ostringstream out;
   out << "wmux: " << object << " limit reached (" << limit << ")\n";
   return out.str();
+}
+
+std::string next_window_name(const std::vector<WindowSummary>& windows) {
+  for (std::uint64_t candidate = 0; candidate < 100000; ++candidate) {
+    const auto name = std::to_string(candidate);
+    const auto exists = std::any_of(windows.begin(), windows.end(), [&](const auto& window) {
+      return window.name == name;
+    });
+    if (!exists) {
+      return name;
+    }
+  }
+
+  return "window-" + std::to_string(windows.size());
 }
 
 std::string process_lifecycle_summary(const PtyProcessLifecycle& lifecycle) {
@@ -789,10 +817,7 @@ std::string handle_new_window(
     DaemonState& state,
     const IpcCommandContext& context) {
   const auto started_at = std::chrono::steady_clock::now();
-  const auto window_name = command.name.value_or("");
-  if (window_name.empty()) {
-    return make_response_json(false, window_error_message(WindowError::EmptyName, {}));
-  }
+  std::string window_name = command.name.value_or("");
 
   std::string error;
   const auto target = resolve_ipc_target(state, command, context, error);
@@ -811,6 +836,9 @@ std::string handle_new_window(
   {
     std::lock_guard lock(state.mutex);
     const auto windows = state.sessions.list_windows(session_id);
+    if (window_name.empty()) {
+      window_name = next_window_name(windows);
+    }
     if (windows.size() >= state.config.values.limits.max_windows_per_session) {
       const auto message = resource_limit_message(
           "window per session",
@@ -909,6 +937,80 @@ std::string handle_new_window(
   return make_response_json(true, out.str());
 }
 
+std::string handle_select_window(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  WindowOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    result = state.sessions.select_window(target->session_id, target->window_id);
+    if (result.ok) {
+      sync_attach_client_focus_locked(state, result.session_id);
+    }
+  }
+  if (!result.ok) {
+    return make_response_json(false, window_error_message(result.error, {}));
+  }
+
+  std::ostringstream out;
+  out << "wmux: selected window " << result.window_id << "\n";
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      ResolvedTarget{result.session_id, result.window_id, result.pane_id, context.client_id},
+      std::chrono::steady_clock::now() - started_at);
+  return make_response_json(true, out.str());
+}
+
+std::string handle_cycle_window(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  WindowOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    if (command.kind == RuntimeCommandKind::NextWindow) {
+      result = state.sessions.select_next_window(target->session_id);
+    } else {
+      result = state.sessions.select_previous_window(target->session_id);
+    }
+    if (result.ok) {
+      sync_attach_client_focus_locked(state, result.session_id);
+    }
+  }
+  if (!result.ok) {
+    return make_response_json(false, window_error_message(result.error, {}));
+  }
+
+  std::ostringstream out;
+  out << "wmux: selected window " << result.window_id << "\n";
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      ResolvedTarget{result.session_id, result.window_id, result.pane_id, context.client_id},
+      std::chrono::steady_clock::now() - started_at);
+  return make_response_json(true, out.str());
+}
+
 std::string handle_list_windows(
     const IpcRequest& request,
     DaemonState& state,
@@ -939,6 +1041,308 @@ std::string handle_list_windows(
     }
     out << "\n";
   }
+  return make_response_json(true, out.str());
+}
+
+std::vector<std::shared_ptr<PtyProcess>> take_window_shells_locked(
+    DaemonState& state,
+    SessionId session_id,
+    WindowId window_id) {
+  std::vector<std::shared_ptr<PtyProcess>> shells;
+  const auto runtime = state.runtimes.find(session_id);
+  if (runtime == state.runtimes.end()) {
+    return shells;
+  }
+
+  const auto window = runtime->second.windows.find(window_id);
+  if (window == runtime->second.windows.end()) {
+    return shells;
+  }
+
+  shells.reserve(window->second.panes.size());
+  for (auto& [pane_id, pane] : window->second.panes) {
+    (void)pane_id;
+    if (pane.shell) {
+      shells.push_back(std::move(pane.shell));
+    }
+  }
+  runtime->second.windows.erase(window);
+  return shells;
+}
+
+void terminate_shells(std::vector<std::shared_ptr<PtyProcess>>& shells) {
+  for (auto& shell : shells) {
+    if (shell) {
+      shell->terminate();
+    }
+  }
+}
+
+std::string handle_kill_window(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  WindowOperationResult result;
+  std::vector<std::shared_ptr<PtyProcess>> removed_shells;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto selected = state.sessions.select_window(target->session_id, target->window_id);
+    if (!selected.ok) {
+      return make_response_json(false, window_error_message(selected.error, {}));
+    }
+    result = state.sessions.kill_active_window(target->session_id);
+    if (!result.ok) {
+      return make_response_json(false, window_error_message(result.error, {}));
+    }
+    removed_shells = take_window_shells_locked(state, result.session_id, result.removed_window_id);
+    sync_attach_client_focus_locked(state, result.session_id);
+  }
+
+  terminate_shells(removed_shells);
+
+  std::ostringstream out;
+  out << "wmux: killed window " << result.removed_window_id << "\n";
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      ResolvedTarget{result.session_id, result.window_id, result.pane_id, context.client_id},
+      std::chrono::steady_clock::now() - started_at);
+  return make_response_json(true, out.str());
+}
+
+std::string handle_kill_pane(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  PaneOperationResult result;
+  WindowOperationResult window_result;
+  bool killed_window = false;
+  bool killed_session = false;
+  std::string killed_session_name;
+  std::vector<std::shared_ptr<PtyProcess>> removed_shells;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto selected_window = state.sessions.select_window(target->session_id, target->window_id);
+    if (!selected_window.ok) {
+      return make_response_json(false, window_error_message(selected_window.error, {}));
+    }
+    if (target->pane_id) {
+      const auto selected_pane = state.sessions.select_pane(target->session_id, *target->pane_id);
+      if (!selected_pane.ok) {
+        return make_response_json(false, pane_error_message(selected_pane.error));
+      }
+    }
+
+    result = state.sessions.kill_active_pane(target->session_id);
+    if (!result.ok) {
+      if (result.error != PaneError::LastPane) {
+        return make_response_json(false, pane_error_message(result.error));
+      }
+
+      const auto windows = state.sessions.list_windows(target->session_id);
+      if (windows.size() <= 1) {
+        for (const auto& session : state.sessions.list_sessions()) {
+          if (session.id == target->session_id) {
+            killed_session_name = session.name;
+            break;
+          }
+        }
+        if (killed_session_name.empty()) {
+          return make_response_json(false, "wmux: target session not found\n");
+        }
+        const auto runtime = state.runtimes.find(target->session_id);
+        if (runtime != state.runtimes.end()) {
+          for (auto& [window_id, window] : runtime->second.windows) {
+            (void)window_id;
+            for (auto& [pane_id, pane] : window.panes) {
+              (void)pane_id;
+              if (pane.shell) {
+                removed_shells.push_back(std::move(pane.shell));
+              }
+            }
+          }
+          state.runtimes.erase(runtime);
+        }
+        const auto killed = state.sessions.kill_session(killed_session_name);
+        if (!killed.ok) {
+          return make_response_json(false, session_error_message(killed.error, killed_session_name));
+        }
+        sync_attach_client_focus_locked(state, target->session_id);
+        killed_session = true;
+      } else {
+        window_result = state.sessions.kill_active_window(target->session_id);
+        if (!window_result.ok) {
+          return make_response_json(false, window_error_message(window_result.error, {}));
+        }
+        removed_shells =
+            take_window_shells_locked(state, window_result.session_id, window_result.removed_window_id);
+        sync_attach_client_focus_locked(state, window_result.session_id);
+        killed_window = true;
+      }
+    } else {
+      const auto runtime = state.runtimes.find(result.session_id);
+      if (runtime != state.runtimes.end()) {
+        const auto window = runtime->second.windows.find(result.window_id);
+        if (window != runtime->second.windows.end()) {
+          const auto pane = window->second.panes.find(result.removed_pane_id);
+          if (pane != window->second.panes.end()) {
+            removed_shells.push_back(std::move(pane->second.shell));
+            window->second.panes.erase(pane);
+          }
+        }
+      }
+      sync_attach_client_focus_locked(state, result.session_id);
+    }
+  }
+
+  terminate_shells(removed_shells);
+
+  std::ostringstream out;
+  if (killed_session) {
+    out << "wmux: killed session " << quoted(killed_session_name) << "\n";
+  } else if (killed_window) {
+    out << "wmux: killed window " << window_result.removed_window_id << "\n";
+  } else {
+    out << "wmux: killed pane " << result.removed_pane_id << "\n";
+  }
+
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      std::nullopt,
+      std::chrono::steady_clock::now() - started_at);
+  return make_response_json(true, out.str());
+}
+
+std::pair<int, int> target_frame_size(
+    DaemonState& state,
+    SessionId session_id,
+    bool status_bar_enabled) {
+  std::lock_guard lock(state.mutex);
+  for (const auto& [client_id, client] : state.attach_clients) {
+    (void)client_id;
+    if (client.client.attached_session == session_id &&
+        client.client.size.columns > 0 &&
+        client.client.size.rows > 0) {
+      const int columns = static_cast<int>(client.client.size.columns);
+      const int rows = static_cast<int>(client.client.size.rows);
+      return {columns, std::max(1, rows - (status_bar_enabled && rows > 1 ? 1 : 0))};
+    }
+  }
+  return {120, status_bar_enabled ? 29 : 30};
+}
+
+std::string handle_resize_pane(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  bool status_bar_enabled = true;
+  {
+    std::lock_guard lock(state.mutex);
+    status_bar_enabled = state.config.values.status_bar_enabled;
+  }
+  const auto [columns, pane_rows] = target_frame_size(state, target->session_id, status_bar_enabled);
+
+  PaneOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto selected_window = state.sessions.select_window(target->session_id, target->window_id);
+    if (!selected_window.ok) {
+      return make_response_json(false, window_error_message(selected_window.error, {}));
+    }
+    if (target->pane_id) {
+      const auto selected_pane = state.sessions.select_pane(target->session_id, *target->pane_id);
+      if (!selected_pane.ok) {
+        return make_response_json(false, pane_error_message(selected_pane.error));
+      }
+    }
+    result = state.sessions.resize_active_pane(
+        target->session_id,
+        pane_direction_from_resize_direction(command.resize_direction),
+        command.amount == 0 ? 1 : command.amount,
+        columns,
+        pane_rows);
+    if (result.ok) {
+      sync_attach_client_focus_locked(state, result.session_id);
+    }
+  }
+  if (!result.ok) {
+    return make_response_json(false, pane_error_message(result.error));
+  }
+
+  std::ostringstream out;
+  out << "wmux: pane resized\n";
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      ResolvedTarget{result.session_id, result.window_id, result.pane_id, context.client_id},
+      std::chrono::steady_clock::now() - started_at);
+  return make_response_json(true, out.str());
+}
+
+std::string handle_spread_panes(
+    const RuntimeCommand& command,
+    DaemonState& state,
+    const IpcCommandContext& context) {
+  const auto started_at = std::chrono::steady_clock::now();
+  std::string error;
+  const auto target = resolve_ipc_target(state, command, context, error);
+  if (!target) {
+    return make_response_json(false, error);
+  }
+
+  PaneOperationResult result;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto selected_window = state.sessions.select_window(target->session_id, target->window_id);
+    if (!selected_window.ok) {
+      return make_response_json(false, window_error_message(selected_window.error, {}));
+    }
+    result = state.sessions.equalize_active_window_panes(target->session_id);
+    if (result.ok) {
+      sync_attach_client_focus_locked(state, result.session_id);
+    }
+  }
+  if (!result.ok) {
+    return make_response_json(false, pane_error_message(result.error));
+  }
+
+  std::ostringstream out;
+  out << "wmux: panes spread evenly\n";
+  log_ipc_command_result(
+      context,
+      command,
+      CommandStatus::Success,
+      out.str(),
+      ResolvedTarget{result.session_id, result.window_id, result.pane_id, context.client_id},
+      std::chrono::steady_clock::now() - started_at);
   return make_response_json(true, out.str());
 }
 
@@ -1217,8 +1621,21 @@ std::string handle_runtime_ipc_command(
       return handle_new_window(command, state, context);
     case RuntimeCommandKind::RenameWindow:
       return handle_rename_window(command, state, context);
+    case RuntimeCommandKind::SelectWindow:
+      return handle_select_window(command, state, context);
+    case RuntimeCommandKind::NextWindow:
+    case RuntimeCommandKind::PreviousWindow:
+      return handle_cycle_window(command, state, context);
+    case RuntimeCommandKind::KillWindow:
+      return handle_kill_window(command, state, context);
+    case RuntimeCommandKind::KillPane:
+      return handle_kill_pane(command, state, context);
     case RuntimeCommandKind::SplitPane:
       return handle_split_window(command, state, context);
+    case RuntimeCommandKind::ResizePane:
+      return handle_resize_pane(command, state, context);
+    case RuntimeCommandKind::SpreadPanesEvenly:
+      return handle_spread_panes(command, state, context);
     case RuntimeCommandKind::SetOption:
       return handle_set_option(command, state, context);
     case RuntimeCommandKind::BindKey:
@@ -1238,7 +1655,14 @@ bool is_runtime_ipc_request(std::string_view type) {
          type == "KillSession" ||
          type == "NewWindow" ||
          type == "RenameWindow" ||
+         type == "SelectWindow" ||
+         type == "NextWindow" ||
+         type == "PreviousWindow" ||
+         type == "KillWindow" ||
+         type == "KillPane" ||
          type == "SplitWindow" ||
+         type == "ResizePane" ||
+         type == "SelectLayout" ||
          type == "SetOption" ||
          type == "BindKey" ||
          type == "UnbindKey";
@@ -1391,6 +1815,13 @@ DaemonCommandResult handle_request(
     out << "effective shell executable: " << shell.executable << "\n";
     out << "effective shell cwd: " << shell.working_directory << "\n";
     out << "config status: " << (stats.config.values.status_bar_enabled ? "on" : "off") << "\n";
+    out << "config ui inherit terminal theme: "
+        << (stats.config.values.ui.inherit_terminal_theme ? "on" : "off") << "\n";
+    out << "config ui tmux style: "
+        << (stats.config.values.ui.tmux_style ? "on" : "off") << "\n";
+    out << "config accent: " << stats.config.values.ui.accent_spec << "\n";
+    out << "config border style: "
+        << (stats.config.values.ui.smooth_borders ? "smooth" : "ascii") << "\n";
     if (!stats.config.errors.empty()) {
       out << "config errors: " << stats.config.errors.size() << "\n";
       for (const auto& error : stats.config.errors) {

@@ -79,6 +79,7 @@ struct DaemonAttachSettings {
   std::string prefix{"C-b"};
   bool status_bar_enabled{true};
   std::uint16_t escape_time_ms{50};
+  UiTheme ui;
   ResourceLimits limits;
   std::string key_bindings;
 };

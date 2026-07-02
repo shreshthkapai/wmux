@@ -74,6 +74,7 @@ tmux behavior:
 wmux intended behavior:
 
 - `Ctrl+b c` creates a new window in the attached session and switches to it.
+- `new-window` without `-n` creates an automatically named window.
 - `wmux new-window -n <name>` creates a named window through control IPC.
 - The new window starts with one pane and one platform PTY process.
 - Existing windows and panes keep their shell state.
@@ -81,7 +82,8 @@ wmux intended behavior:
 Intentional differences:
 
 - wmux uses stable `WindowId` internally. Window indexes are display metadata.
-- Full tmux targeting syntax is not implemented yet.
+- tmux-style `session:window` targets are supported for implemented window
+  commands. The full tmux target grammar is still intentionally out of scope.
 
 Test coverage:
 
@@ -102,6 +104,9 @@ tmux behavior:
 wmux intended behavior:
 
 - `Ctrl+b n` and `Ctrl+b p` select the next/previous window for the session.
+- `Ctrl+b 0` through `Ctrl+b 9` select windows by display index.
+- `select-window -t <window>`, `next-window`, and `previous-window` are
+  available in command mode and through daemon control IPC.
 - Active window is tracked by stable ID.
 - Rendering shows only the active window for the attached client.
 - Window switching must not recreate or reset pane PTY processes.
@@ -109,7 +114,8 @@ wmux intended behavior:
 Intentional differences:
 
 - Multi-client window view semantics are still simpler than tmux.
-- Full window index targeting is not complete.
+- Window indexes remain display metadata; target resolution converts
+  names/indexes into stable `WindowId` values before mutation.
 
 Test coverage:
 
@@ -132,6 +138,8 @@ wmux intended behavior:
 
 - `Ctrl+b %` creates a left/right split.
 - `Ctrl+b "` creates a top/bottom split.
+- `split-window -h` and `split-window -v` are available in command mode and
+  through daemon control IPC.
 - Splits are stored in the n-child weighted layout arena.
 - Same-axis splits are flattened.
 - Opposite-axis splits are nested.
@@ -162,26 +170,56 @@ tmux behavior:
 
 wmux intended behavior:
 
-- `Ctrl+b x` kills the active pane with a safety guard.
+- `Ctrl+b x` shows `kill-pane? (y/n)` in the status line.
+- `y` confirms and executes `kill-pane`; `n`, `q`, or Escape cancels.
 - If the active pane is the last pane in a multi-window session, the active
   window can be removed and another window is selected.
-- If it is the last pane of the last window, wmux refuses instead of killing the
-  entire session accidentally.
+- If it is the last pane of the last window, the confirmed kill removes the
+  session and terminates its pane process tree.
 - Pane kill is idempotent and must clean up the shell process tree where
   Windows allows it.
 
 Intentional differences:
 
-- wmux is stricter than tmux for the last pane of the last window because the
-  product goal is persistent workflow safety.
-- tmux confirmation UI is not fully cloned yet.
+- wmux uses the status row for the confirmation prompt instead of cloning every
+  tmux status-format detail.
 
 Test coverage:
 
 - Covered by `tests/session_manager_test.cpp`.
+- Covered by `tests/attach_input_mode_test.cpp` for the y/n confirmation mode.
 - Covered by process cleanup scripts through `scripts/test-release-gate.ps1`.
 - Partial for all descendant process-tree cleanup cases because Windows Job
   Object assignment can be environment-dependent.
+
+## Pane Resize
+
+tmux behavior:
+
+- `Ctrl+b C-Left`, `Ctrl+b C-Right`, `Ctrl+b C-Up`, and `Ctrl+b C-Down`
+  resize the active pane by one cell.
+- `Ctrl+b M-Left`, `Ctrl+b M-Right`, `Ctrl+b M-Up`, and `Ctrl+b M-Down`
+  resize the active pane by five cells.
+
+wmux intended behavior:
+
+- The same bindings route through `RuntimeCommandKind::ResizePane`.
+- The active pane is resized by walking to the nearest matching split axis and
+  moving that split boundary.
+- Resizing updates layout weights, recomputes pane body sizes, resizes ConPTY
+  panes, and redraws.
+
+Intentional differences:
+
+- wmux exposes the core tmux-style `resize-pane -L`, `resize-pane -R`,
+  `resize-pane -U`, and `resize-pane -D` command surface. Numeric amounts and
+  the full historical `resize-pane` flag matrix are not v1 targets yet.
+
+Test coverage:
+
+- Covered by `tests/attach_keymap_test.cpp`.
+- Covered by `tests/attach_input_mode_test.cpp`.
+- Covered by `tests/session_manager_test.cpp`.
 
 ## Spread/Equalize Panes
 
@@ -196,6 +234,8 @@ wmux intended behavior:
 
 - `Ctrl+b E` maps to `SpreadPanesEvenly`.
 - Lowercase `Ctrl+b e` is intentionally not bound.
+- `select-layout -E` is available in command mode and through daemon control
+  IPC.
 - The command starts at the active pane leaf, walks to the parent split group,
   equalizes that group if visual sizes change, otherwise climbs upward.
 - The layout tree shape is preserved.
@@ -344,22 +384,22 @@ tmux behavior:
 wmux intended behavior:
 
 - SGR mouse drag events are parsed when mouse mode is enabled.
-- Dragging a pane border resolves to a resize target.
-- Resize happens through the daemon command/event path.
-- Layout weights are updated, body rectangles recomputed, and affected PTYs are
-  resized after final geometry is known.
+- Mouse drag does not resize panes by default.
+- Drag/release events are consumed as wmux mouse traffic and ignored for layout,
+  so accidental mouse movement cannot change the pane tree.
 
 Intentional differences:
 
-- Modifier-aware mouse gestures are not complete.
-- Behavior outside pane borders/status line is intentionally ignored.
+- This intentionally differs from tmux. wmux keeps mouse enabled for focus and
+  scroll/copy workflows without allowing border-drag resize.
+- Keyboard/command resize remains a separate command path and must still route
+  through the daemon command/event model.
 
 Test coverage:
 
 - Covered by `tests/mouse_input_test.cpp`.
 - Covered by `tests/ipc_protocol_test.cpp`.
-- Covered by `scripts/test-mouse-resize.ps1`.
-- Partial for terminal-specific drag quirks.
+- Manual verification should confirm border dragging does not alter layout.
 
 ## Status Line
 
@@ -371,8 +411,11 @@ tmux behavior:
 
 wmux intended behavior:
 
-- Status line shows session, active window, active pane, and mode/status
-  messages.
+- Status line follows tmux's default shape: session on the left, active window
+  as `index:name*`, temporary messages on the left side, and a right-side pane
+  title/time segment.
+- The left session/window text is protected from overly aggressive truncation
+  and separated from the right segment by a generous gap.
 - Command prompt uses the status row.
 - User-visible errors should appear in status instead of silently failing.
 - Temporary messages should clear by policy rather than persist forever.

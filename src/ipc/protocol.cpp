@@ -299,8 +299,22 @@ std::string request_type_for_command(CommandKind kind) {
       return "ListWindows";
     case CommandKind::RenameWindow:
       return "RenameWindow";
+    case CommandKind::SelectWindow:
+      return "SelectWindow";
+    case CommandKind::NextWindow:
+      return "NextWindow";
+    case CommandKind::PreviousWindow:
+      return "PreviousWindow";
+    case CommandKind::KillWindow:
+      return "KillWindow";
+    case CommandKind::KillPane:
+      return "KillPane";
     case CommandKind::SplitWindow:
       return "SplitWindow";
+    case CommandKind::ResizePane:
+      return "ResizePane";
+    case CommandKind::SelectLayout:
+      return "SelectLayout";
     case CommandKind::SetOption:
       return "SetOption";
     case CommandKind::BindKey:
@@ -598,6 +612,9 @@ std::string make_command_request_json(const CommandLine& command) {
   if (!command.split_direction.empty()) {
     append_json_field(out, "split_direction", command.split_direction);
   }
+  if (!command.resize_direction.empty()) {
+    append_json_field(out, "resize_direction", command.resize_direction);
+  }
   if (!command.option_name.empty()) {
     append_json_field(out, "option_name", command.option_name);
   }
@@ -689,6 +706,9 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   }
   if (const auto split_direction = find_json_string(json, "split_direction")) {
     request.split_direction = *split_direction;
+  }
+  if (const auto resize_direction = find_json_string(json, "resize_direction")) {
+    request.resize_direction = *resize_direction;
   }
   if (const auto option_name = find_json_string(json, "option_name")) {
     request.option_name = *option_name;

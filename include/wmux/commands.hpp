@@ -19,7 +19,14 @@ enum class CommandKind {
   NewWindow,
   ListWindows,
   RenameWindow,
+  SelectWindow,
+  NextWindow,
+  PreviousWindow,
+  KillWindow,
+  KillPane,
   SplitWindow,
+  ResizePane,
+  SelectLayout,
   SetOption,
   BindKey,
   UnbindKey,
@@ -42,6 +49,7 @@ struct CommandLine {
   std::string new_name;
   std::string window_name;
   std::string split_direction;
+  std::string resize_direction;
   std::string option_name;
   std::string option_value;
   std::string key_name;

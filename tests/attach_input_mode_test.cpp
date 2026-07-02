@@ -84,14 +84,35 @@ void prefix_pane_bindings_become_commands() {
   wmux::AttachClientModeState mode;
 
   const auto kill = actions_for(mode, "\x02" "x");
-  const auto kill_command = find_action(kill, wmux::AttachInputActionKind::Command);
+  assert(has_status_text(kill, "kill-pane? (y/n)"));
+  assert(mode.kind == wmux::AttachClientModeKind::ConfirmPrompt);
+
+  const auto cancelled = actions_for(mode, "n");
+  assert(find_action(cancelled, wmux::AttachInputActionKind::Command) == nullptr);
+  assert(mode.kind == wmux::AttachClientModeKind::Normal);
+
+  const auto confirm = actions_for(mode, "\x02" "x");
+  assert(has_status_text(confirm, "kill-pane? (y/n)"));
+  const auto accepted = actions_for(mode, "y");
+  const auto kill_command = find_action(accepted, wmux::AttachInputActionKind::Command);
   assert(kill_command != nullptr);
   assert(kill_command->text == "kill-pane");
+  assert(mode.kind == wmux::AttachClientModeKind::Normal);
 
   const auto spread = actions_for(mode, "\x02" "E");
   const auto spread_command = find_action(spread, wmux::AttachInputActionKind::Command);
   assert(spread_command != nullptr);
   assert(spread_command->text == "equalize-panes");
+
+  const auto resize = actions_for(mode, "\x02\x1b[1;5D");
+  const auto resize_command = find_action(resize, wmux::AttachInputActionKind::Command);
+  assert(resize_command != nullptr);
+  assert(resize_command->text == "resize-pane-left");
+
+  const auto large_resize = actions_for(mode, "\x02\x1b[1;3C");
+  const auto large_resize_command = find_action(large_resize, wmux::AttachInputActionKind::Command);
+  assert(large_resize_command != nullptr);
+  assert(large_resize_command->text == "resize-pane-right-large");
 
   const auto lower_e = actions_for(mode, "\x02" "e");
   assert(has_status_text(lower_e, "wmux: unknown keybind"));
@@ -174,9 +195,13 @@ void custom_prefix_bindings_route_to_commands() {
   assert(custom_command->text == "new-window");
 
   const auto overridden = actions_for(mode, "\x02" "c", key_bindings);
-  const auto overridden_command = find_action(overridden, wmux::AttachInputActionKind::Command);
+  assert(has_status_text(overridden, "kill-pane? (y/n)"));
+  assert(mode.kind == wmux::AttachClientModeKind::ConfirmPrompt);
+  const auto accepted = actions_for(mode, "y", key_bindings);
+  const auto overridden_command = find_action(accepted, wmux::AttachInputActionKind::Command);
   assert(overridden_command != nullptr);
   assert(overridden_command->text == "kill-pane");
+  assert(mode.kind == wmux::AttachClientModeKind::Normal);
 }
 
 void paste_and_mouse_events_route_by_mode() {

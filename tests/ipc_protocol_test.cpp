@@ -43,6 +43,15 @@ void expects_window_command_request_json() {
   assert(request->window_name == "logs");
 }
 
+void expects_window_selection_request_json() {
+  const std::vector<std::string_view> args{"select-window", "-t", "finance:1"};
+  const auto command = wmux::parse_command_line(args);
+  const auto request = wmux::parse_request_json(wmux::make_command_request_json(command));
+  assert(request);
+  assert(request->type == "SelectWindow");
+  assert(request->target_name == "finance:1");
+}
+
 void expects_split_command_request_json() {
   const std::vector<std::string_view> args{"split-window", "-t", "finance", "-v"};
   const auto command = wmux::parse_command_line(args);
@@ -51,6 +60,16 @@ void expects_split_command_request_json() {
   assert(request->type == "SplitWindow");
   assert(request->session_name == "finance");
   assert(request->split_direction == "vertical");
+}
+
+void expects_resize_command_request_json() {
+  const std::vector<std::string_view> args{"resize-pane", "-t", "finance:1", "-R"};
+  const auto command = wmux::parse_command_line(args);
+  const auto request = wmux::parse_request_json(wmux::make_command_request_json(command));
+  assert(request);
+  assert(request->type == "ResizePane");
+  assert(request->target_name == "finance:1");
+  assert(request->resize_direction == "-R");
 }
 
 void expects_set_option_request_json() {
@@ -554,7 +573,9 @@ void run_ipc_protocol_tests() {
   expects_command_request_json();
   expects_forced_command_request_json();
   expects_window_command_request_json();
+  expects_window_selection_request_json();
   expects_split_command_request_json();
+  expects_resize_command_request_json();
   expects_set_option_request_json();
   expects_bind_key_request_json();
   expects_unbind_key_request_json();

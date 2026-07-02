@@ -17,6 +17,7 @@ enum class RuntimeCommandKind {
   RenameWindow,
   NextWindow,
   PreviousWindow,
+  SelectWindow,
   KillWindow,
   SplitPane,
   KillPane,
@@ -105,6 +106,7 @@ struct RuntimeCommand {
   Target target{Target::current()};
   std::optional<std::string> name;
   std::optional<std::string> shell;
+  std::optional<std::string> target_name;
   SplitDirection axis{SplitDirection::Horizontal};
   PaneDirection pane_direction{PaneDirection::Right};
   ResizeDirection resize_direction{ResizeDirection::Right};

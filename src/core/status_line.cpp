@@ -106,8 +106,29 @@ std::string format_status_line(const StatusState& state, int columns) {
   }
 
   const auto target_columns = static_cast<std::size_t>(columns);
-  if (left.size() + right.size() + 1 >= target_columns) {
-    return left;
+  constexpr std::size_t kRightGap = 8;
+  if (target_columns <= kRightGap + 2) {
+    return left.substr(0, target_columns);
+  }
+
+  const auto minimum_left = std::min<std::size_t>(
+      left.empty() ? 0 : std::max<std::size_t>(1, target_columns / 2),
+      target_columns);
+  const auto max_right =
+      target_columns > minimum_left + kRightGap ? target_columns - minimum_left - kRightGap : 0;
+  if (right.size() > max_right) {
+    right.resize(max_right);
+  }
+
+  if (right.empty()) {
+    return left.substr(0, target_columns);
+  }
+
+  const auto gap = std::min(kRightGap, target_columns - right.size());
+  const auto available_left =
+      target_columns > right.size() + gap ? target_columns - right.size() - gap : 0;
+  if (left.size() > available_left) {
+    left.resize(available_left);
   }
 
   left.append(target_columns - left.size() - right.size(), ' ');

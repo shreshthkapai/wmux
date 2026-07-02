@@ -121,6 +121,16 @@ void enter_mode(AttachClientModeState& mode, AttachClientModeKind kind) {
   mode.started_at = std::chrono::steady_clock::now();
 }
 
+std::vector<AttachInputAction> enter_confirm_prompt(
+    AttachClientModeState& mode,
+    std::string command,
+    std::string prompt) {
+  mode.confirm_command = std::move(command);
+  mode.confirm_prompt = std::move(prompt);
+  enter_mode(mode, AttachClientModeKind::ConfirmPrompt);
+  return {status_action(mode.confirm_prompt)};
+}
+
 std::vector<AttachInputAction> handle_command_prompt_event(
     AttachClientModeState& mode,
     const TerminalInputEvent& event) {
@@ -203,6 +213,9 @@ std::vector<AttachInputAction> handle_prefix_event(
       actions.push_back(detach_action());
       return actions;
     case AttachKeyActionKind::Command:
+      if (action.command == "kill-pane") {
+        return enter_confirm_prompt(mode, action.command, "kill-pane? (y/n)");
+      }
       actions.push_back(command_action(action.command));
       return actions;
     case AttachKeyActionKind::Scroll:
@@ -228,6 +241,43 @@ std::vector<AttachInputAction> handle_prefix_event(
       return actions;
   }
 
+  return actions;
+}
+
+std::vector<AttachInputAction> handle_confirm_prompt_event(
+    AttachClientModeState& mode,
+    const TerminalInputEvent& event) {
+  std::vector<AttachInputAction> actions;
+  if (event.kind != TerminalInputEventKind::Key) {
+    return actions;
+  }
+
+  const bool cancel = event.key.key == Key::Escape ||
+                      (event.key.key == Key::Char &&
+                       (event.key.character == 'n' || event.key.character == 'N' ||
+                        event.key.character == 'q' || event.key.character == 'Q'));
+  if (cancel) {
+    mode.confirm_command.clear();
+    mode.confirm_prompt.clear();
+    enter_mode(mode, AttachClientModeKind::Normal);
+    actions.push_back(status_action(""));
+    return actions;
+  }
+
+  const bool accept = event.key.key == Key::Char &&
+                      (event.key.character == 'y' || event.key.character == 'Y');
+  if (accept) {
+    const auto command = mode.confirm_command;
+    mode.confirm_command.clear();
+    mode.confirm_prompt.clear();
+    enter_mode(mode, AttachClientModeKind::Normal);
+    actions.push_back(command_action(command));
+    return actions;
+  }
+
+  if (!mode.confirm_prompt.empty()) {
+    actions.push_back(status_action(mode.confirm_prompt));
+  }
   return actions;
 }
 
@@ -272,6 +322,8 @@ std::vector<AttachInputAction> handle_attach_input_event(
   switch (mode.kind) {
     case AttachClientModeKind::CommandPrompt:
       return handle_command_prompt_event(mode, event);
+    case AttachClientModeKind::ConfirmPrompt:
+      return handle_confirm_prompt_event(mode, event);
     case AttachClientModeKind::PrefixPending:
       return handle_prefix_event(mode, event, prefix_byte, key_bindings);
     case AttachClientModeKind::CopyMode:
@@ -312,6 +364,8 @@ std::string attach_client_mode_name(AttachClientModeKind mode) {
       return "CopyMode";
     case AttachClientModeKind::CommandPrompt:
       return "CommandPrompt";
+    case AttachClientModeKind::ConfirmPrompt:
+      return "ConfirmPrompt";
     case AttachClientModeKind::MouseDragResize:
       return "MouseDragResize";
   }

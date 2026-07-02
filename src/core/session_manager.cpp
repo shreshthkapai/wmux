@@ -38,6 +38,7 @@ PaneOperationResult missing_pane_session(SessionId session_id) {
 }
 
 double resized_boundary_ratio(const PaneSplitResizeTarget& target, int column, int row);
+std::vector<int> largest_remainder_extents(int extent, const std::vector<double>& weights);
 
 LayoutNode* layout_node(LayoutArena& arena, NodeId id) {
   const auto found = arena.nodes.find(id);
@@ -461,6 +462,177 @@ bool resize_layout_split_boundary(
   node.child_weights = std::move(weights);
   normalize_layout_child_weights_in_place(node);
   return true;
+}
+
+struct NodeIntegerRect {
+  NodeId node_id{0};
+  int left{0};
+  int top{0};
+  int width{0};
+  int height{0};
+};
+
+void collect_node_integer_rects(
+    const LayoutArena& arena,
+    NodeId node_id,
+    int left,
+    int top,
+    int width,
+    int height,
+    std::vector<NodeIntegerRect>& rects) {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
+  const auto* node = layout_node(arena, node_id);
+  if (node == nullptr) {
+    return;
+  }
+
+  rects.push_back(NodeIntegerRect{node_id, left, top, width, height});
+  if (node->kind != LayoutNode::Kind::Split || node->children.empty()) {
+    return;
+  }
+
+  const auto extents = node->direction == SplitDirection::Horizontal
+                           ? largest_remainder_extents(width, normalized_layout_child_weights(*node))
+                           : largest_remainder_extents(height, normalized_layout_child_weights(*node));
+  if (node->direction == SplitDirection::Horizontal) {
+    int child_left = left;
+    for (std::size_t index = 0; index < node->children.size(); ++index) {
+      const int child_width = extents[index];
+      collect_node_integer_rects(
+          arena,
+          node->children[index],
+          child_left,
+          top,
+          child_width,
+          height,
+          rects);
+      child_left += child_width;
+    }
+    return;
+  }
+
+  int child_top = top;
+  for (std::size_t index = 0; index < node->children.size(); ++index) {
+    const int child_height = extents[index];
+    collect_node_integer_rects(
+        arena,
+        node->children[index],
+        left,
+        child_top,
+        width,
+        child_height,
+        rects);
+    child_top += child_height;
+  }
+}
+
+std::optional<NodeIntegerRect> node_integer_rect(
+    const LayoutArena& arena,
+    NodeId node_id,
+    int columns,
+    int rows) {
+  std::vector<NodeIntegerRect> rects;
+  collect_node_integer_rects(arena, arena.root_id, 0, 0, columns, rows, rects);
+  const auto found = std::find_if(rects.begin(), rects.end(), [&](const auto& rect) {
+    return rect.node_id == node_id;
+  });
+  if (found == rects.end()) {
+    return std::nullopt;
+  }
+  return *found;
+}
+
+std::optional<PaneSplitResizeTarget> keyboard_resize_target(
+    const LayoutArena& arena,
+    PaneId active_pane_id,
+    PaneDirection direction,
+    std::uint16_t amount,
+    int columns,
+    int rows,
+    int& column,
+    int& row) {
+  const auto leaf = arena.pane_leaf_index.find(active_pane_id);
+  if (leaf == arena.pane_leaf_index.end() || columns <= 0 || rows <= 0) {
+    return std::nullopt;
+  }
+
+  const bool horizontal =
+      direction == PaneDirection::Left || direction == PaneDirection::Right;
+  const auto wanted_split =
+      horizontal ? SplitDirection::Horizontal : SplitDirection::Vertical;
+  const int signed_amount =
+      direction == PaneDirection::Left || direction == PaneDirection::Up
+          ? -static_cast<int>(std::max<std::uint16_t>(amount, 1))
+          : static_cast<int>(std::max<std::uint16_t>(amount, 1));
+
+  NodeId child_id = leaf->second;
+  auto* child = layout_node(arena, child_id);
+  auto parent_id = child == nullptr ? std::optional<NodeId>{} : child->parent_id;
+  while (parent_id) {
+    const auto* parent = layout_node(arena, *parent_id);
+    if (parent == nullptr || parent->kind != LayoutNode::Kind::Split) {
+      return std::nullopt;
+    }
+
+    const auto child_index = child_index_for_node(*parent, child_id);
+    if (!child_index) {
+      return std::nullopt;
+    }
+
+    if (parent->direction == wanted_split) {
+      std::optional<std::size_t> boundary_index;
+      if (direction == PaneDirection::Left || direction == PaneDirection::Up) {
+        boundary_index = *child_index > 0 ? std::optional<std::size_t>{*child_index - 1}
+                                          : std::optional<std::size_t>{*child_index};
+      } else {
+        boundary_index = *child_index + 1 < parent->children.size()
+                             ? std::optional<std::size_t>{*child_index}
+                             : std::optional<std::size_t>{*child_index - 1};
+      }
+
+      if (!boundary_index || *boundary_index + 1 >= parent->children.size()) {
+        return std::nullopt;
+      }
+
+      const auto rect = node_integer_rect(arena, parent->id, columns, rows);
+      if (!rect) {
+        return std::nullopt;
+      }
+
+      const auto extents = parent->direction == SplitDirection::Horizontal
+                               ? largest_remainder_extents(
+                                     rect->width,
+                                     normalized_layout_child_weights(*parent))
+                               : largest_remainder_extents(
+                                     rect->height,
+                                     normalized_layout_child_weights(*parent));
+      int boundary = parent->direction == SplitDirection::Horizontal ? rect->left : rect->top;
+      for (std::size_t index = 0; index <= *boundary_index && index < extents.size(); ++index) {
+        boundary += extents[index];
+      }
+      boundary += signed_amount;
+
+      column = parent->direction == SplitDirection::Horizontal ? boundary : rect->left;
+      row = parent->direction == SplitDirection::Vertical ? boundary : rect->top;
+      return PaneSplitResizeTarget{
+          parent->id,
+          {},
+          *boundary_index,
+          parent->direction,
+          rect->left,
+          rect->top,
+          rect->width,
+          rect->height};
+    }
+
+    child_id = parent->id;
+    parent_id = parent->parent_id;
+  }
+
+  return std::nullopt;
 }
 
 bool is_valid_split(const PaneNode& node) {
@@ -1162,6 +1334,33 @@ WindowOperationResult SessionManager::select_previous_window(SessionId session_i
       previous_active->active_pane_id};
 }
 
+WindowOperationResult SessionManager::select_window(SessionId session_id, WindowId window_id) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_session(session_id);
+  }
+
+  if (session->second.windows.empty()) {
+    return {false, WindowError::WindowNotFound, session_id};
+  }
+
+  const auto found = std::find(
+      session->second.windows.begin(),
+      session->second.windows.end(),
+      window_id);
+  if (found == session->second.windows.end()) {
+    return {false, WindowError::WindowNotFound, session_id};
+  }
+
+  auto* window = window_by_id(windows_, window_id);
+  if (window == nullptr) {
+    return {false, WindowError::WindowNotFound, session_id};
+  }
+
+  session->second.active_window_id = window->id;
+  return {true, WindowError::None, session_id, window->id, window->active_pane_id};
+}
+
 WindowOperationResult SessionManager::kill_active_window(SessionId session_id) {
   auto session = sessions_.find(session_id);
   if (session == sessions_.end()) {
@@ -1360,6 +1559,53 @@ PaneOperationResult SessionManager::resize_active_window_split(
     return {false, PaneError::PaneNotFound, session_id, window.id, window.active_pane_id};
   }
   return {true, PaneError::None, session_id, window.id, window.active_pane_id};
+}
+
+PaneOperationResult SessionManager::resize_active_pane(
+    SessionId session_id,
+    PaneDirection direction,
+    std::uint16_t amount,
+    int columns,
+    int rows) {
+  auto session = sessions_.find(session_id);
+  if (session == sessions_.end()) {
+    return missing_pane_session(session_id);
+  }
+
+  auto* active = active_window(session->second, windows_);
+  if (active == nullptr) {
+    return {false, PaneError::WindowNotFound, session_id};
+  }
+
+  auto& window = *active;
+  if (window.active_pane_id == 0) {
+    return {false, PaneError::PaneNotFound, session_id, window.id};
+  }
+
+  int column = 0;
+  int row = 0;
+  const auto target = keyboard_resize_target(
+      window.layout,
+      window.active_pane_id,
+      direction,
+      amount,
+      columns,
+      rows,
+      column,
+      row);
+  if (!target) {
+    return {false, PaneError::NoSplit, session_id, window.id, window.active_pane_id};
+  }
+
+  auto* node = layout_node(window.layout, target->split_node_id);
+  if (node == nullptr || !is_valid_layout_split(*node) || node->direction != target->direction) {
+    return {false, PaneError::PaneNotFound, session_id, window.id, window.active_pane_id};
+  }
+
+  if (!resize_layout_split_boundary(*node, *target, column, row)) {
+    return {false, PaneError::PaneNotFound, session_id, window.id, window.active_pane_id};
+  }
+  return {true, PaneError::None, session_id, window.id, window.active_pane_id, 0, true};
 }
 
 PaneOperationResult SessionManager::equalize_active_window_panes(SessionId session_id) {

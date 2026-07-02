@@ -18,6 +18,7 @@ struct IpcRequest {
   std::string new_name;
   std::string window_name;
   std::string split_direction;
+  std::string resize_direction;
   std::string option_name;
   std::string option_value;
   std::string key_name;

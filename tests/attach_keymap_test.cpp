@@ -19,13 +19,33 @@ void maps_window_keybinds() {
   assert(create.command == "new-window");
   assert(create.bytes_consumed == 1);
 
+  const auto create_ctrl_held = wmux::prefixed_attach_key_action("\x03", prefix);
+  assert(create_ctrl_held.kind == wmux::AttachKeyActionKind::Command);
+  assert(create_ctrl_held.command == "new-window");
+
   const auto next = wmux::prefixed_attach_key_action("n", prefix);
   assert(next.kind == wmux::AttachKeyActionKind::Command);
   assert(next.command == "next-window");
 
+  const auto next_ctrl_held = wmux::prefixed_attach_key_action("\x0e", prefix);
+  assert(next_ctrl_held.kind == wmux::AttachKeyActionKind::Command);
+  assert(next_ctrl_held.command == "next-window");
+
   const auto previous = wmux::prefixed_attach_key_action("p", prefix);
   assert(previous.kind == wmux::AttachKeyActionKind::Command);
   assert(previous.command == "previous-window");
+
+  const auto previous_ctrl_held = wmux::prefixed_attach_key_action("\x10", prefix);
+  assert(previous_ctrl_held.kind == wmux::AttachKeyActionKind::Command);
+  assert(previous_ctrl_held.command == "previous-window");
+
+  const auto select_zero = wmux::prefixed_attach_key_action("0", prefix);
+  assert(select_zero.kind == wmux::AttachKeyActionKind::Command);
+  assert(select_zero.command == "select-window-0");
+
+  const auto select_two = wmux::prefixed_attach_key_action("2", prefix);
+  assert(select_two.kind == wmux::AttachKeyActionKind::Command);
+  assert(select_two.command == "select-window-2");
 }
 
 void maps_existing_pane_keybinds() {
@@ -35,6 +55,10 @@ void maps_existing_pane_keybinds() {
   assert(kill.kind == wmux::AttachKeyActionKind::Command);
   assert(kill.command == "kill-pane");
 
+  const auto kill_ctrl_held = wmux::prefixed_attach_key_action("\x18", prefix);
+  assert(kill_ctrl_held.kind == wmux::AttachKeyActionKind::Command);
+  assert(kill_ctrl_held.command == "kill-pane");
+
   const auto equalize_lower = wmux::prefixed_attach_key_action("e", prefix);
   assert(equalize_lower.kind == wmux::AttachKeyActionKind::None);
   assert(equalize_lower.bytes_consumed == 1);
@@ -42,6 +66,10 @@ void maps_existing_pane_keybinds() {
   const auto equalize_upper = wmux::prefixed_attach_key_action("E", prefix);
   assert(equalize_upper.kind == wmux::AttachKeyActionKind::Command);
   assert(equalize_upper.command == "equalize-panes");
+
+  const auto equalize_ctrl_held = wmux::prefixed_attach_key_action("\x05", prefix);
+  assert(equalize_ctrl_held.kind == wmux::AttachKeyActionKind::Command);
+  assert(equalize_ctrl_held.command == "equalize-panes");
 
   const auto horizontal = wmux::prefixed_attach_key_action("%", prefix);
   assert(horizontal.kind == wmux::AttachKeyActionKind::Command);
@@ -64,6 +92,16 @@ void maps_arrow_keybinds() {
   assert(right.kind == wmux::AttachKeyActionKind::Command);
   assert(right.command == "select-pane-right");
   assert(right.bytes_consumed == 3);
+
+  const auto ctrl_left = wmux::prefixed_attach_key_action("\x1b[1;5D", prefix);
+  assert(ctrl_left.kind == wmux::AttachKeyActionKind::Command);
+  assert(ctrl_left.command == "resize-pane-left");
+  assert(ctrl_left.bytes_consumed == 6);
+
+  const auto alt_right = wmux::prefixed_attach_key_action("\x1b[1;3C", prefix);
+  assert(alt_right.kind == wmux::AttachKeyActionKind::Command);
+  assert(alt_right.command == "resize-pane-right-large");
+  assert(alt_right.bytes_consumed == 6);
 }
 
 void passes_unknown_keys_through() {
@@ -112,9 +150,25 @@ void normalizes_key_specs_and_actions() {
   assert(control_a->size() == 1);
   assert((*control_a)[0] == '\x01');
 
+  const auto ctrl_up = wmux::normalize_attach_key_spec("C-Up");
+  assert(ctrl_up);
+  assert(*ctrl_up == "\x1b[1;5A");
+
+  const auto alt_down = wmux::normalize_attach_key_spec("M-Down");
+  assert(alt_down);
+  assert(*alt_down == "\x1b[1;3B");
+
   const auto spread = wmux::normalize_attach_key_action_name("select-layout -E");
   assert(spread);
   assert(*spread == "equalize-panes");
+
+  const auto resize = wmux::normalize_attach_key_action_name("resize-pane -L");
+  assert(resize);
+  assert(*resize == "resize-pane-left");
+
+  const auto select_window = wmux::normalize_attach_key_action_name("select-window -t 2");
+  assert(select_window);
+  assert(*select_window == "select-window-2");
 }
 
 void serializes_key_binding_overrides() {

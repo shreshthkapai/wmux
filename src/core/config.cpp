@@ -425,6 +425,7 @@ Config::Config(const Config& other)
       status_bar_enabled(global.status_bar_enabled),
       escape_time_ms(global.escape_time_ms),
       terminal_overrides(global.terminal_overrides),
+      ui(global.ui),
       limits(global.limits) {}
 
 Config& Config::operator=(const Config& other) {
@@ -453,6 +454,7 @@ Config::Config(Config&& other) noexcept
       status_bar_enabled(global.status_bar_enabled),
       escape_time_ms(global.escape_time_ms),
       terminal_overrides(global.terminal_overrides),
+      ui(global.ui),
       limits(global.limits) {}
 
 Config& Config::operator=(Config&& other) noexcept {
@@ -518,6 +520,48 @@ std::optional<ConfigParseError> apply_global_config_option(
     }
     config.status_bar_enabled = enabled;
     return std::nullopt;
+  }
+
+  if (option == "accent" || option == "ui-accent") {
+    const auto color = parse_ui_color(value);
+    if (!color) {
+      return ConfigParseError{
+          kRuntimeLine,
+          "accent must be a named color, 0-255 color index, or #RRGGBB value"};
+    }
+    config.ui.accent = *color;
+    config.ui.accent_spec = value;
+    return std::nullopt;
+  }
+
+  if (option == "ui-inherit-terminal-theme" || option == "inherit-terminal-theme") {
+    bool enabled = true;
+    if (!parse_on_off(value, enabled)) {
+      return ConfigParseError{kRuntimeLine, "ui-inherit-terminal-theme must be on or off"};
+    }
+    config.ui.inherit_terminal_theme = enabled;
+    return std::nullopt;
+  }
+
+  if (option == "ui-tmux-style" || option == "tmux-style") {
+    bool enabled = false;
+    if (!parse_on_off(value, enabled)) {
+      return ConfigParseError{kRuntimeLine, "ui-tmux-style must be on or off"};
+    }
+    config.ui.tmux_style = enabled;
+    return std::nullopt;
+  }
+
+  if (option == "border-style" || option == "ui-border-style") {
+    if (value == "smooth" || value == "unicode") {
+      config.ui.smooth_borders = true;
+      return std::nullopt;
+    }
+    if (value == "ascii") {
+      config.ui.smooth_borders = false;
+      return std::nullopt;
+    }
+    return ConfigParseError{kRuntimeLine, "border-style must be smooth or ascii"};
   }
 
   if (option == "escape-time-ms" || option == "input-escape-time-ms") {

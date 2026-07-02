@@ -2,6 +2,7 @@
 
 #include "wmux/resource_limits.hpp"
 #include "wmux/terminal_capabilities.hpp"
+#include "wmux/ui_theme.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -21,6 +22,7 @@ struct GlobalOptions {
   bool status_bar_enabled{true};
   std::uint16_t escape_time_ms{50};
   TerminalCapabilityOverrides terminal_overrides;
+  UiTheme ui;
   ResourceLimits limits;
 };
 
@@ -55,6 +57,7 @@ struct Config {
   bool& status_bar_enabled{global.status_bar_enabled};
   std::uint16_t& escape_time_ms{global.escape_time_ms};
   TerminalCapabilityOverrides& terminal_overrides{global.terminal_overrides};
+  UiTheme& ui{global.ui};
   ResourceLimits& limits{global.limits};
 
   Config() = default;
