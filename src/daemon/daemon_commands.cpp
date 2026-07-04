@@ -1204,6 +1204,7 @@ std::string handle_kill_pane(
           if (pane != window->second.panes.end()) {
             removed_shells.push_back(std::move(pane->second.shell));
             window->second.panes.erase(pane);
+            mark_window_layout_changed_locked(state, result.session_id, result.window_id);
           }
         }
       }
@@ -1288,6 +1289,9 @@ std::string handle_resize_pane(
         columns,
         pane_rows);
     if (result.ok) {
+      if (result.changed) {
+        mark_window_layout_changed_locked(state, result.session_id, result.window_id);
+      }
       sync_attach_client_focus_locked(state, result.session_id);
     }
   }
@@ -1327,6 +1331,9 @@ std::string handle_spread_panes(
     }
     result = state.sessions.equalize_active_window_panes(target->session_id);
     if (result.ok) {
+      if (result.changed) {
+        mark_window_layout_changed_locked(state, result.session_id, result.window_id);
+      }
       sync_attach_client_focus_locked(state, result.session_id);
     }
   }
@@ -1446,6 +1453,7 @@ std::string handle_split_window(
           result.window_id,
           result.pane_id,
           std::move(shell_process));
+      mark_window_layout_changed_locked(state, result.session_id, result.window_id);
       sync_attach_client_focus_locked(state, result.session_id);
     }
   }
@@ -1750,6 +1758,18 @@ DaemonCommandResult handle_request(
         << "\n";
     out << "render total frame micros: " << stats.render_frame_duration_us << "\n";
     out << "render max frame micros: " << stats.render_max_frame_duration_us << "\n";
+    out << "render geometry micros: " << stats.render_geometry_duration_us << "\n";
+    out << "render max geometry micros: " << stats.render_max_geometry_duration_us << "\n";
+    out << "render snapshot micros: " << stats.render_snapshot_duration_us << "\n";
+    out << "render max snapshot micros: " << stats.render_max_snapshot_duration_us << "\n";
+    out << "render state micros: " << stats.render_state_duration_us << "\n";
+    out << "render max state micros: " << stats.render_max_state_duration_us << "\n";
+    out << "render diff micros: " << stats.render_diff_duration_us << "\n";
+    out << "render max diff micros: " << stats.render_max_diff_duration_us << "\n";
+    out << "render queue micros: " << stats.render_queue_duration_us << "\n";
+    out << "render max queue micros: " << stats.render_max_queue_duration_us << "\n";
+    out << "client write micros: " << stats.client_write_duration_us << "\n";
+    out << "client max write micros: " << stats.client_max_write_duration_us << "\n";
     out << "render slow clients: " << stats.render_slow_clients << "\n";
     out << "render write failures: " << stats.render_write_failures << "\n";
     out << "render queue pending client bytes: " << stats.render_pending_client_output_bytes
@@ -1762,6 +1782,18 @@ DaemonCommandResult handle_request(
     out << "pty resize applied: " << stats.pty_resize_applied << "\n";
     out << "pty resize skipped: " << stats.pty_resize_skipped << "\n";
     out << "pty resize failures: " << stats.pty_resize_failures << "\n";
+    out << "pty output read chunks: " << stats.pty_output_read_chunks << "\n";
+    out << "pty output read bytes: " << stats.pty_output_read_bytes << "\n";
+    out << "pty output feed micros: " << stats.pty_output_feed_duration_us << "\n";
+    out << "pty output max feed micros: " << stats.pty_output_max_feed_duration_us << "\n";
+    out << "pty output lock wait micros: " << stats.pty_output_lock_wait_duration_us << "\n";
+    out << "pty output max lock wait micros: "
+        << stats.pty_output_max_lock_wait_duration_us << "\n";
+    out << "pty output grid feed micros: " << stats.pty_output_grid_feed_duration_us << "\n";
+    out << "pty output max grid feed micros: "
+        << stats.pty_output_max_grid_feed_duration_us << "\n";
+    out << "pty output buffer micros: " << stats.pty_output_buffer_duration_us << "\n";
+    out << "pty output max buffer micros: " << stats.pty_output_max_buffer_duration_us << "\n";
     out << "paste buffer id: " << stats.paste_buffer_id << "\n";
     out << "paste buffer bytes: " << stats.paste_buffer_bytes << "\n";
     out << "paste buffer original bytes: " << stats.paste_buffer_original_bytes << "\n";

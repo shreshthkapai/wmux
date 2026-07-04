@@ -47,6 +47,19 @@ namespace {
 constexpr auto kRequestReadTimeout = std::chrono::seconds{5};
 constexpr auto kRequestReadPoll = std::chrono::milliseconds{10};
 constexpr auto kOutputRedrawInterval = std::chrono::milliseconds{16};
+constexpr auto kV2IdleOutputPoll = std::chrono::milliseconds{2};
+constexpr auto kV2SlowOutputRedrawInterval = std::chrono::milliseconds{4};
+constexpr auto kV2VerySlowOutputRedrawInterval = std::chrono::milliseconds{8};
+constexpr auto kV2BurstQuietWindow = std::chrono::milliseconds{24};
+constexpr auto kV2BurstMaxPresentationInterval = std::chrono::milliseconds{250};
+constexpr auto kHighOutputRedrawInterval = std::chrono::milliseconds{100};
+constexpr auto kVeryHighOutputRedrawInterval = std::chrono::milliseconds{250};
+constexpr std::size_t kHighOutputPendingBytes = 4 * 1024;
+constexpr std::size_t kVeryHighOutputPendingBytes = 16 * 1024;
+constexpr std::size_t kBacklogRenderPendingBytes = 16 * 1024;
+constexpr std::size_t kBacklogRenderCoalescedEvents = 32;
+constexpr std::size_t kV2BurstFastForwardPendingBytes = 32 * 1024;
+constexpr std::size_t kV2BurstFastForwardCoalescedEvents = 4;
 constexpr auto kSlowClientWriteTimeout = std::chrono::seconds{5};
 // Match tmux's practical behavior: splitting is bounded by visible geometry,
 // not by a high arbitrary pane-size cap. With borders enabled, a 3x3 pane is
@@ -56,9 +69,20 @@ constexpr int kMinimumInteractivePaneBodyRows = 1;
 constexpr int kPaneBorderColumns = 2;
 constexpr int kPaneBorderRows = 2;
 
-enum class ReplayKind {
-  Full,
-  Output,
+enum class SceneInvalidationPolicy {
+  InitialAttach,
+  FullScene,
+  SceneDelta,
+  LayoutOnly,
+  OutputDelta,
+  LatestViewport,
+};
+
+enum class AttachRenderMode {
+  Auto,
+  FullLatestOnly,
+  DirtyRowDiff,
+  BacklogFullFrame,
 };
 
 struct AttachTarget {
@@ -83,6 +107,9 @@ struct QueuedAttachWrite {
   AttachWriteKind kind{AttachWriteKind::Output};
   bool partial_frame{false};
   std::size_t dirty_pane_count{0};
+  bool establishes_baseline{false};
+  std::optional<RenderDiffState> baseline_after_write;
+  std::optional<std::unordered_map<PaneId, std::uint64_t>> sequences_after_write;
 };
 
 class LocalHandle {
@@ -143,6 +170,126 @@ void update_atomic_peak(std::atomic<std::uint64_t>& target, std::uint64_t value)
          !target.compare_exchange_weak(
              observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
   }
+}
+
+std::uint64_t elapsed_us(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now()) {
+  const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  return static_cast<std::uint64_t>(std::max<std::int64_t>(0, micros));
+}
+
+std::string environment_variable_value(const char* name) {
+  const auto required = GetEnvironmentVariableA(name, nullptr, 0);
+  if (required == 0) {
+    return {};
+  }
+
+  std::string value(required, '\0');
+  const auto written = GetEnvironmentVariableA(name, value.data(), required);
+  if (written == 0 || written >= required) {
+    return {};
+  }
+
+  value.resize(written);
+  return value;
+}
+
+AttachRenderMode attach_render_mode_from_environment() {
+  const auto mode = environment_variable_value("WMUX_RENDER_MODE");
+  if (mode.empty()) {
+    return AttachRenderMode::Auto;
+  }
+  if (mode == "full" || mode == "full-latest-only" || mode == "full_latest_only") {
+    return AttachRenderMode::FullLatestOnly;
+  }
+  if (mode == "dirty" || mode == "dirty-row" || mode == "dirty-row-diff" ||
+      mode == "dirty_row_diff") {
+    return AttachRenderMode::DirtyRowDiff;
+  }
+  if (mode == "backlog" || mode == "backlog-full" || mode == "backlog_full_frame") {
+    return AttachRenderMode::BacklogFullFrame;
+  }
+  return AttachRenderMode::Auto;
+}
+
+std::string_view attach_render_mode_name(AttachRenderMode mode) {
+  switch (mode) {
+    case AttachRenderMode::Auto:
+      return "auto";
+    case AttachRenderMode::FullLatestOnly:
+      return "full";
+    case AttachRenderMode::DirtyRowDiff:
+      return "dirty-row-diff";
+    case AttachRenderMode::BacklogFullFrame:
+      return "backlog-full";
+  }
+  return "auto";
+}
+
+std::string_view scene_invalidation_policy_name(SceneInvalidationPolicy policy) {
+  switch (policy) {
+    case SceneInvalidationPolicy::InitialAttach:
+      return "initial-attach";
+    case SceneInvalidationPolicy::FullScene:
+      return "full-scene";
+    case SceneInvalidationPolicy::SceneDelta:
+      return "scene-delta";
+    case SceneInvalidationPolicy::LayoutOnly:
+      return "layout-only";
+    case SceneInvalidationPolicy::OutputDelta:
+      return "output-delta";
+    case SceneInvalidationPolicy::LatestViewport:
+      return "latest-viewport";
+  }
+  return "unknown";
+}
+
+bool render_mode_uses_diff(AttachRenderMode mode) {
+  // Dirty-row diffing is currently a diagnostic mode only. The full/latest
+  // path is the safe default until cache invalidation has stronger coverage.
+  return mode == AttachRenderMode::DirtyRowDiff;
+}
+
+bool render_mode_allows_dirty_row_snapshots(AttachRenderMode mode) {
+  return mode == AttachRenderMode::DirtyRowDiff;
+}
+
+std::chrono::milliseconds redraw_interval_for_pending_bytes(std::size_t pending_bytes) {
+  if (pending_bytes >= kVeryHighOutputPendingBytes) {
+    return kVeryHighOutputRedrawInterval;
+  }
+  if (pending_bytes >= kHighOutputPendingBytes) {
+    return kHighOutputRedrawInterval;
+  }
+  return kOutputRedrawInterval;
+}
+
+std::chrono::milliseconds output_redraw_interval_for_mode(
+    AttachRenderMode mode,
+    std::size_t pending_bytes,
+    std::uint64_t last_render_micros) {
+  const auto base = redraw_interval_for_pending_bytes(pending_bytes);
+  if (last_render_micros >= 50'000) {
+    return std::max(base, std::chrono::milliseconds{250});
+  }
+  if (last_render_micros >= 16'000) {
+    return std::max(base, std::chrono::milliseconds{100});
+  }
+  if (mode != AttachRenderMode::DirtyRowDiff) {
+    return std::max(base, std::chrono::milliseconds{33});
+  }
+  return base;
+}
+
+std::chrono::milliseconds v2_smooth_output_redraw_interval(std::uint64_t last_render_micros) {
+  if (last_render_micros >= 25'000) {
+    return kV2VerySlowOutputRedrawInterval;
+  }
+  if (last_render_micros >= 12'000) {
+    return kV2SlowOutputRedrawInterval;
+  }
+  return std::chrono::milliseconds{0};
 }
 
 std::optional<AttachTarget> target_for_attach(
@@ -219,6 +366,7 @@ bool attach_settings_equal(
     const DaemonAttachSettings& lhs,
     const DaemonAttachSettings& rhs) {
   return lhs.mouse_enabled == rhs.mouse_enabled &&
+         lhs.synchronized_output_supported == rhs.synchronized_output_supported &&
          lhs.prefix == rhs.prefix &&
          lhs.status_bar_enabled == rhs.status_bar_enabled &&
          lhs.escape_time_ms == rhs.escape_time_ms &&
@@ -236,6 +384,7 @@ DaemonAttachSettings attach_settings_for_client(DaemonState& state, ClientId cli
 
   DaemonAttachSettings settings{
       state.mouse_enabled,
+      false,
       state.config.values.prefix,
       state.config.values.status_bar_enabled,
       state.config.values.escape_time_ms,
@@ -247,6 +396,10 @@ DaemonAttachSettings attach_settings_for_client(DaemonState& state, ClientId cli
   if (client != state.attach_clients.end() &&
       !client->second.client.terminal_caps.supports_sgr_mouse) {
     settings.mouse_enabled = false;
+  }
+  if (client != state.attach_clients.end()) {
+    settings.synchronized_output_supported =
+        client->second.client.terminal_caps.supports_synchronized_output;
   }
 
   return settings;
@@ -292,9 +445,11 @@ std::optional<ActiveWindowFrame> active_window_frame(
 
   const int pane_rows =
       std::max(1, frame.rows - (reserve_status_row && frame.rows > 1 ? 1 : 0));
+  frame.pane_rows = pane_rows;
   const auto rects = compute_pane_layout_rects(window->pane_tree, frame.columns, pane_rows);
 
   frame.window_id = window->id;
+  frame.layout_generation = window_runtime->second.layout_generation;
   frame.active_pane_id = window->active_pane_id;
   frame.window_name = window->name;
   frame.window_index = window->index;
@@ -350,7 +505,9 @@ ClientId register_attach_client(
     std::string session_name,
     HANDLE pipe,
     std::uint16_t columns,
-    std::uint16_t rows) {
+    std::uint16_t rows,
+    const TerminalCapabilities& terminal_capabilities,
+    bool terminal_capabilities_provided) {
   assert_daemon_state_mutation_allowed("register_attach_client");
   std::lock_guard lock(state.mutex);
   const ClientId client_id = state.next_client_id++;
@@ -362,9 +519,12 @@ ClientId register_attach_client(
   client.client.active_pane = state.sessions.active_pane_id(session_id);
   client.client.size.columns = columns;
   client.client.size.rows = rows;
+  const auto detected_capabilities =
+      terminal_capabilities_provided ? terminal_capabilities : detect_terminal_capabilities();
   client.client.terminal_caps = apply_terminal_capability_overrides(
-      detect_terminal_capabilities(),
+      detected_capabilities,
       state.config.values.terminal_overrides);
+  const auto terminal_host = terminal_host_name(client.client.terminal_caps.host);
   client.session_name = std::move(session_name);
   client.pipe = pipe;
   state.attach_clients.emplace(client_id, std::move(client));
@@ -374,7 +534,8 @@ ClientId register_attach_client(
       "register",
       {{"client_id", std::to_string(client_id)},
        {"session_id", std::to_string(session_id)},
-       {"session_name", registered_session_name}});
+       {"session_name", registered_session_name},
+       {"terminal_host", terminal_host}});
   return client_id;
 }
 
@@ -905,8 +1066,8 @@ PaneResizePlan collect_pending_pane_resizes(
       continue;
     }
 
-    const short columns = bounded_pty_dimension(body_width(pane.rect));
-    const short rows = bounded_pty_dimension(body_height(pane.rect));
+    const short columns = bounded_pty_dimension(body_width(pane.rect, frame.columns));
+    const short rows = bounded_pty_dimension(body_height(pane.rect, frame.pane_rows));
     if (pane_runtime->second.pty_columns == columns && pane_runtime->second.pty_rows == rows) {
       ++plan.skipped;
       continue;
@@ -1251,6 +1412,7 @@ bool split_interactive_pane(
           result.window_id,
           result.pane_id,
           std::move(shell_process));
+      mark_window_layout_changed_locked(state, result.session_id, result.window_id);
       sync_attach_client_focus_locked(state, result.session_id);
     }
   }
@@ -1386,6 +1548,9 @@ std::optional<bool> resize_interactive_split(
     error = pane_error_message(result.error);
     return std::nullopt;
   }
+  if (result.changed) {
+    mark_window_layout_changed_locked(state, result.session_id, result.window_id);
+  }
 
   return true;
 }
@@ -1428,6 +1593,9 @@ std::optional<bool> resize_interactive_active_pane(
     error = pane_error_message(result.error);
     return std::nullopt;
   }
+  if (result.changed) {
+    mark_window_layout_changed_locked(state, result.session_id, result.window_id);
+  }
   sync_attach_client_focus_locked(state, result.session_id);
   return result.changed;
 }
@@ -1454,7 +1622,6 @@ RuntimeCommand select_pane_at_mouse_command(
 std::optional<bool> handle_interactive_mouse_event(
     DaemonState& state,
     ClientId client_id,
-    SessionId session_id,
     const AttachMouseEventPayload& mouse,
     short columns,
     short rows,
@@ -1601,6 +1768,7 @@ bool kill_interactive_pane(DaemonState& state, SessionId session_id, std::string
           if (pane != window->second.panes.end()) {
             removed_shells.push_back(std::move(pane->second.shell));
             window->second.panes.erase(pane);
+            mark_window_layout_changed_locked(state, result.session_id, result.window_id);
           }
         }
       }
@@ -1702,6 +1870,9 @@ bool equalize_interactive_panes(DaemonState& state, SessionId session_id, std::s
     if (!result.ok) {
       status = status_from_error(pane_error_message(result.error));
       return false;
+    }
+    if (result.changed) {
+      mark_window_layout_changed_locked(state, result.session_id, result.window_id);
     }
   }
 
@@ -2263,13 +2434,15 @@ bool read_attach_frame(
 
   frame.type = parsed->type;
   frame.request_id = ipc.header.request_id;
-  log_event(
-      LogLevel::Debug,
-      "daemon.attach",
-      "frame",
-      {{"request_id", std::to_string(frame.request_id)},
-       {"type", std::string{attach_frame_type_name(frame.type)}},
-       {"payload_bytes", std::to_string(parsed->payload_size)}});
+  if (should_log(LogLevel::Debug)) {
+    log_event(
+        LogLevel::Debug,
+        "daemon.attach",
+        "frame",
+        {{"request_id", std::to_string(frame.request_id)},
+         {"type", std::string{attach_frame_type_name(frame.type)}},
+         {"payload_bytes", std::to_string(parsed->payload_size)}});
+  }
   frame.payload.clear();
   if (parsed->payload_size == 0) {
     return true;
@@ -2291,6 +2464,7 @@ void run_attach_connection(
     short columns,
     short rows,
     DaemonAttachSettings initial_settings) {
+  const auto render_mode = attach_render_mode_from_environment();
   std::mutex settings_mutex;
   DaemonAttachSettings settings = std::move(initial_settings);
   const auto settings_snapshot = [&]() {
@@ -2319,6 +2493,7 @@ void run_attach_connection(
        {"prefix", settings.prefix},
        {"status", settings.status_bar_enabled ? "on" : "off"},
        {"escape_time_ms", std::to_string(settings.escape_time_ms)},
+       {"render_mode", std::string{attach_render_mode_name(render_mode)}},
        {"key_bindings_bytes", std::to_string(settings.key_bindings.size())}});
   if (!write_all_overlapped(
           pipe,
@@ -2354,7 +2529,10 @@ void run_attach_connection(
   std::unordered_map<PaneId, std::uint64_t> next_sequences;
   PaneViewportStates viewport_states;
   CopyModeState copy_mode;
-  RenderDiffState render_diff_state;
+  std::mutex scene_baseline_mutex;
+  RenderDiffState client_scene_baseline;
+  std::atomic<std::uint64_t> last_render_duration_us{0};
+  std::atomic_bool client_render_baseline_unknown{false};
   StatusState status_state;
   StatusLineMode status_mode{StatusLineMode::Normal};
   std::uint64_t next_output_frame_id = 1;
@@ -2476,7 +2654,12 @@ void run_attach_connection(
                                         AttachWriteKind kind,
                                         std::string frame,
                                         bool partial_frame,
-                                        std::size_t dirty_pane_count) {
+                                        std::size_t dirty_pane_count,
+                                        bool replace_pending_output,
+                                        bool establishes_baseline,
+                                        std::optional<RenderDiffState> baseline_after_write,
+                                        std::optional<std::unordered_map<PaneId, std::uint64_t>>
+                                            sequences_after_write) {
     const auto current_settings = settings_snapshot();
     const auto max_pending_bytes = current_settings.limits.max_client_output_queue_bytes;
     const auto max_pending_frames = current_settings.limits.max_client_output_queue_frames;
@@ -2494,9 +2677,16 @@ void run_attach_connection(
     const auto would_exceed_frames = write_queue.size() >= max_pending_frames;
     std::size_t coalesced_write_bytes = 0;
     std::uint64_t coalesced_write_frames = 0;
-    if ((would_exceed_bytes || would_exceed_frames) && kind == AttachWriteKind::Output) {
+    bool dropped_output_that_may_have_advanced_cache = false;
+    if ((replace_pending_output || would_exceed_bytes || would_exceed_frames) &&
+        kind == AttachWriteKind::Output) {
       for (auto queued = write_queue.begin(); queued != write_queue.end();) {
         if (queued->kind == AttachWriteKind::Output) {
+          if (queued->establishes_baseline && !establishes_baseline) {
+            ++queued;
+            continue;
+          }
+          dropped_output_that_may_have_advanced_cache = true;
           coalesced_write_bytes += queued->frame.size();
           ++coalesced_write_frames;
           pending_write_bytes -= queued->frame.size();
@@ -2534,12 +2724,15 @@ void run_attach_connection(
       return false;
     }
 
-    const auto frame_bytes = frame.size();
     write_queue.push_back(QueuedAttachWrite{
         std::move(frame),
         kind,
         partial_frame,
-        dirty_pane_count});
+        dirty_pane_count,
+        establishes_baseline,
+        std::move(baseline_after_write),
+        std::move(sequences_after_write)});
+    const auto frame_bytes = write_queue.back().frame.size();
     pending_write_bytes += frame_bytes;
     queue_lock.unlock();
 
@@ -2552,14 +2745,17 @@ void run_attach_connection(
         state.render_metrics.skipped_frames.fetch_add(
             coalesced_write_frames, std::memory_order_relaxed);
         state.render_metrics.coalesced_output_events.fetch_add(
-            coalesced_write_frames, std::memory_order_relaxed);
+          coalesced_write_frames, std::memory_order_relaxed);
+      }
+      if (dropped_output_that_may_have_advanced_cache && !establishes_baseline) {
+        client_render_baseline_unknown.store(true, std::memory_order_release);
       }
       const auto current = state.render_metrics.pending_client_output_bytes.fetch_add(
                                frame_bytes, std::memory_order_relaxed) +
                            frame_bytes;
       update_atomic_peak(state.render_metrics.peak_pending_client_output_bytes, current);
     });
-    if (coalesced_write_frames > 0) {
+    if (coalesced_write_frames > 0 && should_log(LogLevel::Debug)) {
       log_event(
           LogLevel::Debug,
           "daemon.attach",
@@ -2576,10 +2772,34 @@ void run_attach_connection(
   const auto queue_attach_output = [&](
                                      std::string_view payload,
                                      bool partial_frame,
-                                     std::size_t dirty_pane_count) {
+                                     std::size_t dirty_pane_count,
+                                     bool replace_pending_output,
+                                     bool establishes_baseline,
+                                     std::optional<RenderDiffState> baseline_after_write,
+                                     std::optional<std::unordered_map<PaneId, std::uint64_t>>
+                                         sequences_after_write) {
     auto output_frame = make_ipc_frame(IpcFrameKind::AttachOutput, next_output_frame_id++, payload);
     return enqueue_attach_write(
-        AttachWriteKind::Output, std::move(output_frame), partial_frame, dirty_pane_count);
+        AttachWriteKind::Output,
+        std::move(output_frame),
+        partial_frame,
+        dirty_pane_count,
+        replace_pending_output,
+        establishes_baseline,
+        std::move(baseline_after_write),
+        std::move(sequences_after_write));
+  };
+
+  const auto commit_output_sequences = [&](
+                                           const std::unordered_map<PaneId, std::uint64_t>&
+                                               sequences_after_write) {
+    if (sequences_after_write.empty()) {
+      return;
+    }
+    std::lock_guard stream_lock(stream_mutex);
+    for (const auto& [pane_id, sequence] : sequences_after_write) {
+      next_sequences[pane_id] = sequence;
+    }
   };
 
   const auto queue_attach_settings_event = [&](const DaemonAttachSettings& event_settings) {
@@ -2594,7 +2814,15 @@ void run_attach_connection(
             event_settings.status_bar_enabled,
             event_settings.escape_time_ms,
             event_settings.key_bindings));
-    return enqueue_attach_write(AttachWriteKind::Event, std::move(settings_frame), false, 0);
+    return enqueue_attach_write(
+        AttachWriteKind::Event,
+        std::move(settings_frame),
+        false,
+        0,
+        false,
+        false,
+        std::nullopt,
+        std::nullopt);
   };
 
   const auto write_attach_error = [&](std::string_view message) {
@@ -2602,7 +2830,15 @@ void run_attach_connection(
         IpcFrameKind::Error,
         next_output_frame_id++,
         make_response_json(false, message));
-    return enqueue_attach_write(AttachWriteKind::Error, std::move(error_frame), false, 0);
+    return enqueue_attach_write(
+        AttachWriteKind::Error,
+        std::move(error_frame),
+        false,
+        0,
+        false,
+        false,
+        std::nullopt,
+        std::nullopt);
   };
 
   std::thread writer_thread{[&] {
@@ -2661,9 +2897,26 @@ void run_attach_connection(
         continue;
       }
 
+      if (queued.sequences_after_write) {
+        commit_output_sequences(*queued.sequences_after_write);
+      }
+
+      if (queued.baseline_after_write) {
+        std::lock_guard baseline_lock(scene_baseline_mutex);
+        client_scene_baseline = std::move(*queued.baseline_after_write);
+      }
+
+      if (queued.establishes_baseline) {
+        client_render_baseline_unknown.store(false, std::memory_order_release);
+      }
+
+      const auto write_micros = elapsed_us(write_started_at);
       events.call([&](DaemonState& state) {
         state.render_metrics.frames_written.fetch_add(1, std::memory_order_relaxed);
         state.render_metrics.bytes_written.fetch_add(queued.frame.size(), std::memory_order_relaxed);
+        state.render_metrics.client_write_duration_us.fetch_add(
+            write_micros, std::memory_order_relaxed);
+        update_atomic_peak(state.render_metrics.max_client_write_duration_us, write_micros);
         if (queued.partial_frame) {
           state.render_metrics.partial_frames_written.fetch_add(1, std::memory_order_relaxed);
           state.render_metrics.dirty_panes_rendered.fetch_add(
@@ -2710,15 +2963,29 @@ void run_attach_connection(
            copy_mode.active;
   };
 
-  const auto replay_active_window = [&](
-                                      std::string& error,
-                                      std::optional<AttachScrollAction> scroll,
-                                      std::optional<AttachCopyModeAction> copy_action,
-                                      ReplayKind replay_kind,
-                                      const std::unordered_set<PaneId>& dirty_panes) {
-    std::string replay;
+  const auto render_active_window_scene = [&](
+                                            std::string& error,
+                                            std::optional<AttachScrollAction> scroll,
+                                            std::optional<AttachCopyModeAction> copy_action,
+                                            SceneInvalidationPolicy scene_policy,
+                                            const std::unordered_set<PaneId>& dirty_panes) {
+    if (client_render_baseline_unknown.load(std::memory_order_acquire) &&
+        scene_policy != SceneInvalidationPolicy::InitialAttach &&
+        scene_policy != SceneInvalidationPolicy::FullScene) {
+      scene_policy = SceneInvalidationPolicy::FullScene;
+    }
+
+    std::string scene_frame;
     bool partial_frame = false;
     const auto render_started_at = std::chrono::steady_clock::now();
+    std::uint64_t geometry_micros = 0;
+    std::uint64_t snapshot_micros = 0;
+    std::uint64_t state_micros = 0;
+    std::uint64_t diff_micros = 0;
+    std::uint64_t queue_micros = 0;
+    RenderFrameStats render_stats;
+    std::unordered_map<PaneId, std::uint64_t> frame_next_sequences;
+    RenderDiffState pending_scene_baseline;
 
     {
       std::lock_guard render_order_lock(render_mutex);
@@ -2774,37 +3041,144 @@ void run_attach_connection(
           record_pane_resize_results(state, session_id, applied_resizes, failed_resizes);
         });
       }
-      log_event(
-          LogLevel::Debug,
-          "daemon.attach",
-          "replay_after_resize",
-          {{"client_id", std::to_string(client_id)},
-           {"session_id", std::to_string(session_id)},
-           {"panes", std::to_string(frame->panes.size())},
-           {"applied_resizes", std::to_string(applied_resizes)},
-           {"failed_resizes", std::to_string(failed_resizes.size())}});
+      if ((applied_resizes > 0 || !failed_resizes.empty()) && should_log(LogLevel::Debug)) {
+        log_event(
+            LogLevel::Debug,
+            "daemon.attach",
+            "scene_after_resize",
+            {{"client_id", std::to_string(client_id)},
+             {"session_id", std::to_string(session_id)},
+             {"panes", std::to_string(frame->panes.size())},
+             {"applied_resizes", std::to_string(applied_resizes)},
+             {"failed_resizes", std::to_string(failed_resizes.size())}});
+      }
+      geometry_micros = elapsed_us(render_started_at);
+
+      const bool has_scrolled_viewport = [&] {
+        std::lock_guard stream_lock(stream_mutex);
+        return std::ranges::any_of(viewport_states, [](const auto& entry) {
+          return entry.second.offset > 0;
+        });
+      }();
+      const bool needs_full_history = [&] {
+        if (copy_action) {
+          return true;
+        }
+        std::lock_guard stream_lock(stream_mutex);
+        if (copy_mode.active) {
+          return true;
+        }
+        if (scroll || has_scrolled_viewport) {
+          return false;
+        }
+        return false;
+      }();
+      const bool bounded_scroll_history = [&] {
+        if ((!scroll && !has_scrolled_viewport) || copy_action) {
+          return false;
+        }
+        std::lock_guard stream_lock(stream_mutex);
+        return !copy_mode.active;
+      }();
+      const auto snapshot_mode = needs_full_history ? PtyOutputSnapshotMode::FullHistory
+                                                    : PtyOutputSnapshotMode::ScreenOnly;
+      const bool dirty_rows_only_snapshot =
+          render_mode_allows_dirty_row_snapshots(render_mode) &&
+          scene_policy == SceneInvalidationPolicy::OutputDelta &&
+          !dirty_panes.empty() &&
+          !scroll && !copy_action && snapshot_mode == PtyOutputSnapshotMode::ScreenOnly;
+      const bool can_use_live_line_views =
+          terminal_engine_kind_from_environment() == TerminalEngineKind::V2 &&
+          snapshot_mode == PtyOutputSnapshotMode::ScreenOnly &&
+          !scroll && !copy_action && !has_scrolled_viewport;
 
       std::unordered_map<PaneId, PtyOutputSnapshot> snapshots;
-      snapshots.reserve(frame->panes.size());
-      for (const auto& pane : frame->panes) {
-        snapshots.emplace(pane.rect.pane_id, pane.shell->output_snapshot());
+      if (!can_use_live_line_views) {
+        snapshots.reserve(frame->panes.size());
+        const auto snapshot_started_at = std::chrono::steady_clock::now();
+        for (const auto& pane : frame->panes) {
+          snapshots.emplace(
+              pane.rect.pane_id,
+              pane.shell->output_snapshot(snapshot_mode, true, dirty_rows_only_snapshot));
+        }
+        snapshot_micros = elapsed_us(snapshot_started_at);
+        if (should_log(LogLevel::Debug)) {
+          log_event(
+              LogLevel::Debug,
+              "daemon.attach",
+              "scene_snapshots_ready",
+              {{"client_id", std::to_string(client_id)},
+               {"session_id", std::to_string(session_id)},
+               {"snapshots", std::to_string(snapshots.size())},
+               {"history", needs_full_history ? "full" : "screen-only"}});
+        }
       }
-      log_event(
-          LogLevel::Debug,
-          "daemon.attach",
-          "replay_snapshots_ready",
-          {{"client_id", std::to_string(client_id)},
-           {"session_id", std::to_string(session_id)},
-           {"snapshots", std::to_string(snapshots.size())}});
 
       {
+        const auto state_started_at = std::chrono::steady_clock::now();
         std::lock_guard stream_lock(stream_mutex);
         (void)status_expire_temporary(status_state, std::chrono::steady_clock::now());
-        update_viewport_states(*frame, snapshots, viewport_states, copy_mode);
+        if (!can_use_live_line_views) {
+          update_viewport_states(*frame, snapshots, viewport_states, copy_mode);
+        }
         if (scroll) {
           (void)apply_active_viewport_scroll(*frame, snapshots, viewport_states, *scroll);
         }
-        if (copy_action) {
+        if (!can_use_live_line_views && bounded_scroll_history) {
+          for (const auto& pane : frame->panes) {
+            const auto snapshot = snapshots.find(pane.rect.pane_id);
+            if (snapshot == snapshots.end()) {
+              continue;
+            }
+            const auto viewport = viewport_states.find(pane.rect.pane_id);
+            if (viewport == viewport_states.end() || viewport->second.offset == 0) {
+              continue;
+            }
+            const int frame_pane_rows =
+                frame->pane_rows > 0
+                    ? frame->pane_rows
+                    : std::max(
+                          1,
+                          frame->rows -
+                              (frame->status_bar_enabled && frame->rows > 1 ? 1 : 0));
+            const int height = body_height(pane.rect, frame_pane_rows);
+            if (height <= 0) {
+              continue;
+            }
+            const auto scrollback_lines = snapshot->second.screen.scrollback_line_count;
+            const auto screen_lines =
+                std::max(
+                    snapshot->second.screen.line_snapshots.size(),
+                    snapshot->second.screen.lines.size());
+            const auto screen_line_count =
+                screen_lines == 0
+                    ? static_cast<std::size_t>(std::max(0, snapshot->second.screen.rows))
+                    : screen_lines;
+            const auto total_lines = scrollback_lines + screen_line_count;
+            const auto visible_lines =
+                std::min<std::size_t>(total_lines, static_cast<std::size_t>(height));
+            const auto max_offset =
+                total_lines > visible_lines ? total_lines - visible_lines : std::size_t{0};
+            const auto clamped_offset = std::min(viewport->second.offset, max_offset);
+            const auto first_visible = total_lines - visible_lines - clamped_offset;
+            if (first_visible >= scrollback_lines) {
+              continue;
+            }
+            const auto wanted_lines =
+                std::min<std::size_t>(
+                    static_cast<std::size_t>(height),
+                    scrollback_lines - first_visible);
+            snapshot->second.scrollback_included = true;
+            snapshot->second.scrollback =
+                pane.shell->output_snapshot(
+                    PtyOutputSnapshotMode::FullHistory,
+                    false,
+                    false,
+                    PtyOutputScrollbackRange{first_visible, wanted_lines})
+                    .scrollback;
+          }
+        }
+        if (!can_use_live_line_views && copy_action) {
           std::string copied_text;
           const auto applied = apply_copy_mode_action(
               *frame, snapshots, viewport_states, copy_mode, *copy_action, copied_text);
@@ -2858,6 +3232,9 @@ void run_attach_connection(
                       const auto clipboard =
                           platform_services().clipboard().write_text(clipboard_text);
                       if (clipboard.ok) {
+                        if (!should_log(LogLevel::Debug)) {
+                          return;
+                        }
                         log_event(
                             LogLevel::Debug,
                             "daemon.attach",
@@ -2889,105 +3266,293 @@ void run_attach_connection(
               break;
           }
         }
-        clamp_copy_mode_cursor(copy_mode, *frame, snapshots);
+        if (!can_use_live_line_views) {
+          clamp_copy_mode_cursor(copy_mode, *frame, snapshots);
+        }
 
-        partial_frame = replay_kind == ReplayKind::Output && !dirty_panes.empty() &&
+        const bool force_full_latest_only = render_mode == AttachRenderMode::FullLatestOnly;
+        partial_frame = !force_full_latest_only &&
+                        scene_policy == SceneInvalidationPolicy::OutputDelta &&
+                        !dirty_panes.empty() &&
                         !scroll && !copy_action;
         RenderStatus render_status;
         render_status.state = status_state;
         render_status.mode = status_mode;
         render_status.mouse_enabled = current_settings.mouse_enabled;
+        render_status.synchronized_output_supported =
+            current_settings.synchronized_output_supported;
         render_status.ui = current_settings.ui;
-        if (partial_frame) {
-          replay = render_frame_update(
-              *frame,
-              snapshots,
-              viewport_states,
-              copy_mode,
-              render_status,
-              RenderFrameOptions{
-                  false,
-                  false,
-                  false,
-                  dirty_panes},
-              render_diff_state);
-        } else {
-          replay = render_frame_update(
-              *frame,
-              snapshots,
-              viewport_states,
-              copy_mode,
-              render_status,
-              RenderFrameOptions{},
-              render_diff_state);
+        const auto diff_started_at = std::chrono::steady_clock::now();
+        const auto render_options_for_scene_policy = [&](SceneInvalidationPolicy policy) {
+          RenderFrameOptions options;
+          if (policy == SceneInvalidationPolicy::InitialAttach) {
+            options.clear_terminal = false;
+            options.draw_borders = true;
+            options.draw_status = true;
+            options.draw_pane_bodies = true;
+            options.force_body_repaint = false;
+            return options;
+          }
+          if (policy == SceneInvalidationPolicy::LatestViewport) {
+            options.clear_terminal = false;
+            options.draw_borders = true;
+            options.draw_status = true;
+            options.draw_pane_bodies = true;
+            options.force_body_repaint = true;
+            return options;
+          }
+          if (policy == SceneInvalidationPolicy::FullScene) {
+            options.clear_terminal = false;
+            options.draw_borders = true;
+            options.draw_status = true;
+            options.draw_pane_bodies = true;
+            options.force_body_repaint = true;
+            return options;
+          }
+          if (policy == SceneInvalidationPolicy::LayoutOnly) {
+            options.clear_terminal = false;
+            options.draw_borders = true;
+            options.draw_status = true;
+            options.draw_pane_bodies = true;
+            options.force_body_repaint = false;
+            options.preserve_layout_cache = true;
+            options.repaint_body_on_geometry_change = true;
+            return options;
+          }
+          if (policy == SceneInvalidationPolicy::SceneDelta) {
+            options.clear_terminal = false;
+            options.draw_borders = true;
+            options.draw_status = true;
+            options.draw_pane_bodies = true;
+            options.force_body_repaint = false;
+            return options;
+          }
+          return options;
+        };
+        {
+          std::lock_guard baseline_lock(scene_baseline_mutex);
+          pending_scene_baseline = client_scene_baseline;
         }
-        log_event(
-            LogLevel::Debug,
-            "daemon.attach",
-            "replay_rendered",
-            {{"client_id", std::to_string(client_id)},
-             {"session_id", std::to_string(session_id)},
-             {"bytes", std::to_string(replay.size())},
-             {"partial", partial_frame ? "true" : "false"}});
+        const auto should_reset_baseline_for_scene_policy = [&](SceneInvalidationPolicy policy) {
+          return policy == SceneInvalidationPolicy::InitialAttach ||
+                 policy == SceneInvalidationPolicy::FullScene ||
+                 policy == SceneInvalidationPolicy::LatestViewport ||
+                 render_mode == AttachRenderMode::FullLatestOnly;
+        };
+
+        if (should_reset_baseline_for_scene_policy(scene_policy)) {
+          reset_render_diff_state(pending_scene_baseline);
+        }
+
+        if (can_use_live_line_views) {
+          std::unordered_map<PaneId, std::uint64_t> live_next_sequences;
+          if (scene_frame.empty()) {
+            RenderFrameOptions live_options = render_options_for_scene_policy(scene_policy);
+            live_options.dirty_panes = dirty_panes;
+            scene_frame = render_live_frame_update(
+                *frame,
+                viewport_states,
+                copy_mode,
+                render_status,
+                live_options,
+                pending_scene_baseline,
+                live_next_sequences,
+                scene_policy == SceneInvalidationPolicy::InitialAttach ? &render_stats : nullptr);
+          }
+          frame_next_sequences = std::move(live_next_sequences);
+        } else {
+          RenderFrameOptions snapshot_options = render_options_for_scene_policy(scene_policy);
+          snapshot_options.dirty_panes = dirty_panes;
+          scene_frame = render_frame_update(
+              *frame,
+              snapshots,
+              viewport_states,
+              copy_mode,
+              render_status,
+              snapshot_options,
+              pending_scene_baseline);
+        }
+        diff_micros = elapsed_us(diff_started_at);
+        if (should_log(LogLevel::Debug)) {
+          log_event(
+              LogLevel::Debug,
+              "daemon.attach",
+              "scene_rendered",
+              {{"client_id", std::to_string(client_id)},
+               {"session_id", std::to_string(session_id)},
+               {"scene_policy", std::string{scene_invalidation_policy_name(scene_policy)}},
+               {"bytes", std::to_string(scene_frame.size())},
+               {"partial", partial_frame ? "true" : "false"}});
+        }
 
         current_shells.clear();
-        next_sequences.clear();
         current_shells.reserve(frame->panes.size());
-        next_sequences.reserve(frame->panes.size());
+        frame_next_sequences.reserve(frame->panes.size());
         for (const auto& pane : frame->panes) {
           current_shells.emplace(pane.rect.pane_id, pane.shell);
-          const auto snapshot = snapshots.find(pane.rect.pane_id);
-          next_sequences.emplace(
-              pane.rect.pane_id,
-              snapshot == snapshots.end() ? 1 : snapshot->second.next_sequence);
+          if (!can_use_live_line_views) {
+            const auto snapshot = snapshots.find(pane.rect.pane_id);
+            frame_next_sequences.emplace(
+                pane.rect.pane_id,
+                snapshot == snapshots.end() ? 1 : snapshot->second.next_sequence);
+          }
         }
+        const auto state_total = elapsed_us(state_started_at);
+        state_micros = state_total > diff_micros ? state_total - diff_micros : 0;
       }
 
-      if (replay.empty()) {
+      if (scene_frame.empty()) {
+        if (!frame_next_sequences.empty()) {
+          commit_output_sequences(frame_next_sequences);
+        }
         events.call([&](DaemonState& state) {
           state.render_metrics.skipped_frames.fetch_add(1, std::memory_order_relaxed);
         });
         return true;
       }
 
-      if (replay.size() > current_settings.limits.max_attach_render_frame_bytes) {
+      if (scene_frame.size() > current_settings.limits.max_attach_render_frame_bytes) {
         log_event(
             LogLevel::Error,
             "daemon.attach",
             "render_frame_too_large",
             {{"client_id", std::to_string(client_id)},
              {"session_id", std::to_string(session_id)},
-             {"bytes", std::to_string(replay.size())},
+             {"bytes", std::to_string(scene_frame.size())},
              {"limit", std::to_string(current_settings.limits.max_attach_render_frame_bytes)}});
         output_closed = true;
         return false;
       }
 
-      const auto render_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now() - render_started_at);
-      events.call([&](DaemonState& state) {
-        const auto micros =
-            static_cast<std::uint64_t>(std::max<std::int64_t>(0, render_elapsed.count()));
-        state.render_metrics.render_frame_duration_us.fetch_add(
-            micros, std::memory_order_relaxed);
-        update_atomic_peak(state.render_metrics.max_render_frame_duration_us, micros);
-      });
-
-      if (!queue_attach_output(replay, partial_frame, dirty_panes.size())) {
+      const auto render_micros = elapsed_us(render_started_at);
+      last_render_duration_us.store(render_micros, std::memory_order_relaxed);
+      const auto queue_started_at = std::chrono::steady_clock::now();
+      const bool has_pending_scene_baseline = pending_scene_baseline.baseline_valid;
+      const bool baseline_frame =
+          scene_policy == SceneInvalidationPolicy::InitialAttach ||
+          scene_policy == SceneInvalidationPolicy::FullScene ||
+          scene_policy == SceneInvalidationPolicy::SceneDelta ||
+          scene_policy == SceneInvalidationPolicy::LayoutOnly ||
+          scene_policy == SceneInvalidationPolicy::LatestViewport;
+      const bool replace_pending_output = baseline_frame;
+      const bool establishes_baseline = has_pending_scene_baseline;
+      if (!baseline_frame) {
+        commit_output_sequences(frame_next_sequences);
+      }
+      if (!queue_attach_output(
+              scene_frame,
+              partial_frame,
+              dirty_panes.size(),
+              replace_pending_output,
+              establishes_baseline,
+              has_pending_scene_baseline
+                  ? std::optional<RenderDiffState>{std::move(pending_scene_baseline)}
+                  : std::nullopt,
+              frame_next_sequences.empty() || !baseline_frame
+                  ? std::nullopt
+                  : std::optional<std::unordered_map<PaneId, std::uint64_t>>{
+                        frame_next_sequences})) {
         output_closed.store(true, std::memory_order_relaxed);
         return false;
       }
+      queue_micros = elapsed_us(queue_started_at);
+
+      if (scene_policy == SceneInvalidationPolicy::InitialAttach) {
+        std::uint64_t min_sequence = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t max_sequence = 0;
+        std::size_t sequence_count = 0;
+        for (const auto& [pane_id, sequence] : frame_next_sequences) {
+          (void)pane_id;
+          min_sequence = std::min(min_sequence, sequence);
+          max_sequence = std::max(max_sequence, sequence);
+        }
+        sequence_count = frame_next_sequences.size();
+        if (min_sequence == std::numeric_limits<std::uint64_t>::max()) {
+          min_sequence = 0;
+        }
+        log_event(
+            LogLevel::Info,
+            "daemon.attach",
+             "first_paint",
+             {{"client_id", std::to_string(client_id)},
+              {"session_id", std::to_string(session_id)},
+             {"scene_policy", std::string{scene_invalidation_policy_name(scene_policy)}},
+             {"panes", std::to_string(sequence_count)},
+             {"frame_bytes", std::to_string(scene_frame.size())},
+             {"render_us", std::to_string(render_micros)},
+             {"geometry_us", std::to_string(geometry_micros)},
+             {"snapshot_us", std::to_string(snapshot_micros)},
+             {"state_us", std::to_string(state_micros)},
+             {"frame_build_us", std::to_string(diff_micros)},
+             {"queued_us", std::to_string(queue_micros)},
+             {"pending_output_total_at_attach", "0"},
+             {"fast_forward_skipped_frames_before_first_paint", "0"},
+             {"visible_pane_rows", std::to_string(render_stats.visible_pane_rows)},
+             {"rows_considered", std::to_string(render_stats.rows_considered)},
+             {"rows_emitted", std::to_string(render_stats.rows_emitted)},
+             {"rows_skipped_generation_cache",
+              std::to_string(render_stats.rows_skipped_generation_cache)},
+             {"rows_skipped_empty_default",
+              std::to_string(render_stats.rows_skipped_empty_default)},
+             {"body_bytes_emitted", std::to_string(render_stats.body_bytes_emitted)},
+             {"border_status_bytes_emitted",
+              std::to_string(render_stats.border_status_bytes_emitted)},
+             {"cursor_bytes_emitted", std::to_string(render_stats.cursor_bytes_emitted)},
+             {"alternate_screen_panes", std::to_string(render_stats.alternate_screen_panes)},
+             {"pane_sequence_min", std::to_string(min_sequence)},
+             {"pane_sequence_max", std::to_string(max_sequence)}});
+      }
+
+      events.call([&](DaemonState& state) {
+        state.render_metrics.render_frame_duration_us.fetch_add(
+            render_micros, std::memory_order_relaxed);
+        update_atomic_peak(state.render_metrics.max_render_frame_duration_us, render_micros);
+        state.render_metrics.render_geometry_duration_us.fetch_add(
+            geometry_micros, std::memory_order_relaxed);
+        update_atomic_peak(
+            state.render_metrics.max_render_geometry_duration_us, geometry_micros);
+        state.render_metrics.render_snapshot_duration_us.fetch_add(
+            snapshot_micros, std::memory_order_relaxed);
+        update_atomic_peak(
+            state.render_metrics.max_render_snapshot_duration_us, snapshot_micros);
+        state.render_metrics.render_state_duration_us.fetch_add(
+            state_micros, std::memory_order_relaxed);
+        update_atomic_peak(state.render_metrics.max_render_state_duration_us, state_micros);
+        state.render_metrics.render_diff_duration_us.fetch_add(
+            diff_micros, std::memory_order_relaxed);
+        update_atomic_peak(state.render_metrics.max_render_diff_duration_us, diff_micros);
+        state.render_metrics.render_queue_duration_us.fetch_add(
+            queue_micros, std::memory_order_relaxed);
+        update_atomic_peak(state.render_metrics.max_render_queue_duration_us, queue_micros);
+      });
     }
 
     return true;
   };
 
-  const auto replay_full_window = [&](
+  const auto render_initial_attach_scene = [&](std::string& error) {
+    static const std::unordered_set<PaneId> kNoDirtyPanes;
+    return render_active_window_scene(
+        error,
+        std::nullopt,
+        std::nullopt,
+        SceneInvalidationPolicy::InitialAttach,
+        kNoDirtyPanes);
+  };
+
+  const auto render_scene_delta = [&](
                                       std::string& error,
                                       std::optional<AttachScrollAction> scroll,
                                       std::optional<AttachCopyModeAction> copy_action) {
     static const std::unordered_set<PaneId> kNoDirtyPanes;
-    return replay_active_window(error, scroll, copy_action, ReplayKind::Full, kNoDirtyPanes);
+    return render_active_window_scene(
+        error, scroll, copy_action, SceneInvalidationPolicy::SceneDelta, kNoDirtyPanes);
+  };
+
+  const auto layout_active_window = [&](std::string& error) {
+    static const std::unordered_set<PaneId> kNoDirtyPanes;
+    return render_active_window_scene(
+        error, std::nullopt, std::nullopt, SceneInvalidationPolicy::LayoutOnly, kNoDirtyPanes);
   };
 
   const auto refresh_attach_settings = [&] {
@@ -3017,7 +3582,15 @@ void run_attach_connection(
 
   {
     std::string error;
-    if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+    log_event(
+        LogLevel::Info,
+        "daemon.attach",
+         "first_paint_start",
+         {{"client_id", std::to_string(client_id)},
+          {"session_id", std::to_string(session_id)},
+         {"scene_policy",
+          std::string{scene_invalidation_policy_name(SceneInvalidationPolicy::InitialAttach)}}});
+    if (!render_initial_attach_scene(error)) {
       if (!error.empty()) {
         (void)write_attach_error(error);
       }
@@ -3032,8 +3605,11 @@ void run_attach_connection(
 
   std::thread output_thread{[&] {
     auto last_output_redraw = std::chrono::steady_clock::time_point{};
+    auto first_deferred_output = std::chrono::steady_clock::time_point{};
+    auto last_deferred_output = std::chrono::steady_clock::time_point{};
     std::unordered_map<PaneId, std::size_t> pending_output_bytes_by_pane;
     std::size_t pending_output_total = 0;
+    std::unordered_set<PaneId> deferred_dirty_panes;
 
     const auto set_pending_output_bytes = [&](PaneId pane_id, std::size_t bytes) {
       const auto previous = pending_output_bytes_by_pane[pane_id];
@@ -3092,7 +3668,7 @@ void run_attach_connection(
       }
       if (status_dirty.exchange(false, std::memory_order_acq_rel) || status_expired) {
         std::string error;
-        if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+        if (!layout_active_window(error)) {
           stop_requested = true;
           break;
         }
@@ -3116,6 +3692,7 @@ void run_attach_connection(
       }
 
       std::unordered_set<PaneId> dirty_panes;
+      std::unordered_map<PaneId, std::uint64_t> drained_sequences;
       std::size_t coalesced_output_events = 0;
       for (const auto& [pane_id, shell] : shells) {
         const auto sequence = sequences.find(pane_id);
@@ -3123,21 +3700,61 @@ void run_attach_connection(
           continue;
         }
 
-        const auto output = shell->wait_for_output(sequence->second, std::chrono::milliseconds{0});
-        if (!output.bytes.empty()) {
+        const auto output =
+            shell->wait_for_output_drain(sequence->second, std::chrono::milliseconds{0});
+        if (output.bytes > 0) {
           const auto previous = pending_output_bytes_by_pane[pane_id];
-          if (previous > 0 && output.bytes.size() > previous) {
+          if (previous > 0 && output.bytes > previous) {
             ++coalesced_output_events;
           }
-          set_pending_output_bytes(pane_id, output.bytes.size());
+          set_pending_output_bytes(pane_id, output.bytes);
           dirty_panes.insert(pane_id);
+          drained_sequences[pane_id] = output.next_sequence;
         }
       }
 
+      const auto maybe_render_deferred_latest = [&]() -> bool {
+        if (deferred_dirty_panes.empty()) {
+          return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (last_deferred_output.time_since_epoch().count() != 0 &&
+            now - last_deferred_output < kV2BurstQuietWindow) {
+          return false;
+        }
+
+        std::string error;
+        if (!render_active_window_scene(
+                error,
+                std::nullopt,
+                std::nullopt,
+                SceneInvalidationPolicy::LatestViewport,
+                deferred_dirty_panes)) {
+          stop_requested = true;
+          return true;
+        }
+        deferred_dirty_panes.clear();
+        first_deferred_output = std::chrono::steady_clock::time_point{};
+        last_deferred_output = std::chrono::steady_clock::time_point{};
+        last_output_redraw = std::chrono::steady_clock::now();
+        return true;
+      };
+
       if (!dirty_panes.empty()) {
         const auto now = std::chrono::steady_clock::now();
+        bool v2_presenting_deferred_burst = false;
+        const bool using_v2_engine =
+            terminal_engine_kind_from_environment() == TerminalEngineKind::V2;
+        const auto redraw_interval =
+            using_v2_engine && render_mode == AttachRenderMode::Auto
+                ? v2_smooth_output_redraw_interval(
+                      last_render_duration_us.load(std::memory_order_relaxed))
+                : output_redraw_interval_for_mode(
+                      render_mode,
+                      pending_output_total,
+                      last_render_duration_us.load(std::memory_order_relaxed));
         if (last_output_redraw.time_since_epoch().count() != 0) {
-          const auto next_allowed = last_output_redraw + kOutputRedrawInterval;
+          const auto next_allowed = last_output_redraw + redraw_interval;
           if (now < next_allowed) {
             std::this_thread::sleep_for(next_allowed - now);
           }
@@ -3158,14 +3775,15 @@ void run_attach_connection(
           }
 
           const auto output =
-              shell->wait_for_output(sequence->second, std::chrono::milliseconds{0});
-          if (!output.bytes.empty()) {
+              shell->wait_for_output_drain(sequence->second, std::chrono::milliseconds{0});
+          if (output.bytes > 0) {
             const auto previous = pending_output_bytes_by_pane[pane_id];
-            if (previous > 0 && output.bytes.size() > previous) {
+            if (previous > 0 && output.bytes > previous) {
               ++coalesced_output_events;
             }
-            set_pending_output_bytes(pane_id, output.bytes.size());
+            set_pending_output_bytes(pane_id, output.bytes);
             dirty_panes.insert(pane_id);
+            drained_sequences[pane_id] = output.next_sequence;
           }
         }
 
@@ -3176,16 +3794,78 @@ void run_attach_connection(
           });
         }
 
+        const bool v2_burst_fast_forward =
+            using_v2_engine && render_mode == AttachRenderMode::Auto &&
+            (pending_output_total >= kV2BurstFastForwardPendingBytes ||
+             coalesced_output_events >= kV2BurstFastForwardCoalescedEvents ||
+             last_render_duration_us.load(std::memory_order_relaxed) >= 16'000);
+        if (v2_burst_fast_forward) {
+          deferred_dirty_panes.insert(dirty_panes.begin(), dirty_panes.end());
+          if (first_deferred_output.time_since_epoch().count() == 0) {
+            first_deferred_output = now;
+          }
+          last_deferred_output = now;
+          commit_output_sequences(drained_sequences);
+          clear_pending_output_bytes();
+
+          const bool presentation_overdue =
+              now - first_deferred_output >= kV2BurstMaxPresentationInterval;
+          if (!presentation_overdue) {
+            events.call([&](DaemonState& state) {
+              state.render_metrics.skipped_frames.fetch_add(1, std::memory_order_relaxed);
+            });
+            std::this_thread::sleep_for(kV2IdleOutputPoll);
+            continue;
+          }
+
+          dirty_panes = deferred_dirty_panes;
+          v2_presenting_deferred_burst = true;
+        }
+
+        const bool force_full_output =
+            render_mode == AttachRenderMode::FullLatestOnly ||
+            render_mode == AttachRenderMode::BacklogFullFrame ||
+            (!using_v2_engine &&
+             (pending_output_total >= kBacklogRenderPendingBytes ||
+              coalesced_output_events >= kBacklogRenderCoalescedEvents));
+        const bool v2_latest_viewport_output = v2_presenting_deferred_burst;
+        const auto output_scene_policy =
+            v2_latest_viewport_output
+                ? SceneInvalidationPolicy::LatestViewport
+                : (force_full_output
+                       ? SceneInvalidationPolicy::FullScene
+                       : SceneInvalidationPolicy::OutputDelta);
+
         std::string error;
-        if (!replay_active_window(
-                error, std::nullopt, std::nullopt, ReplayKind::Output, dirty_panes)) {
+        if (!render_active_window_scene(
+                error,
+                std::nullopt,
+                std::nullopt,
+                output_scene_policy,
+                dirty_panes)) {
           stop_requested = true;
           break;
         }
         clear_pending_output_bytes();
+        if (!deferred_dirty_panes.empty()) {
+          deferred_dirty_panes.clear();
+          first_deferred_output = std::chrono::steady_clock::time_point{};
+          last_deferred_output = std::chrono::steady_clock::time_point{};
+        }
         last_output_redraw = std::chrono::steady_clock::now();
       } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds{8});
+        if (maybe_render_deferred_latest()) {
+          if (stop_requested) {
+            break;
+          }
+          continue;
+        }
+        const bool using_v2_engine =
+            terminal_engine_kind_from_environment() == TerminalEngineKind::V2;
+        std::this_thread::sleep_for(
+            using_v2_engine && render_mode == AttachRenderMode::Auto
+                ? kV2IdleOutputPoll
+                : std::chrono::milliseconds{8});
       }
     }
     clear_pending_output_bytes();
@@ -3222,7 +3902,7 @@ void run_attach_connection(
               command_result.error.empty() ? "wmux: command failed" : command_result.error);
         }
       }
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3247,7 +3927,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3278,7 +3958,7 @@ void run_attach_connection(
         continue;
       }
 
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3304,7 +3984,7 @@ void run_attach_connection(
           continue;
         }
 
-        if (!replay_full_window(error, scroll, std::nullopt)) {
+        if (!render_scene_delta(error, scroll, std::nullopt)) {
           end_reason = AttachEndReason::OutputClosed;
           break;
         }
@@ -3340,7 +4020,7 @@ void run_attach_connection(
         set_temporary_status("wmux: pane selected");
       }
 
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3355,7 +4035,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_full_window(error, *scroll, std::nullopt)) {
+      if (!render_scene_delta(error, *scroll, std::nullopt)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3370,7 +4050,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_full_window(error, std::nullopt, *action)) {
+      if (!render_scene_delta(error, std::nullopt, *action)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3381,7 +4061,7 @@ void run_attach_connection(
       set_status_frame(frame.payload);
 
       std::string error;
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3404,7 +4084,7 @@ void run_attach_connection(
       set_temporary_status(command_result.status);
 
       std::string error;
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3426,7 +4106,7 @@ void run_attach_connection(
       if (!paste_result.shell) {
         set_temporary_status(paste_result.status);
         std::string error;
-        if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+        if (!layout_active_window(error)) {
           end_reason = AttachEndReason::OutputClosed;
           break;
         }
@@ -3456,6 +4136,9 @@ void run_attach_connection(
                   kMaxPasteWriteChunkBytes,
                   std::chrono::milliseconds{kPasteWriteChunkDelayMs});
               if (ok) {
+                if (!should_log(LogLevel::Debug)) {
+                  return;
+                }
                 log_event(
                     LogLevel::Debug,
                     "daemon.attach",
@@ -3480,7 +4163,7 @@ void run_attach_connection(
       }
 
       std::string error;
-      if (!replay_full_window(error, std::nullopt, std::nullopt)) {
+      if (!layout_active_window(error)) {
         end_reason = AttachEndReason::OutputClosed;
         break;
       }
@@ -3729,12 +4412,14 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
     if (state.attach_clients.find(*event.client_id) == state.attach_clients.end()) {
       result.ok = false;
       result.error = "wmux: stale attach client\n";
-      log_event(
-          LogLevel::Debug,
-          "daemon.attach",
-          "stale_event",
-          {{"event", std::string{daemon_event_kind_name(event.kind)}},
-           {"client_id", std::to_string(*event.client_id)}});
+      if (should_log(LogLevel::Debug)) {
+        log_event(
+            LogLevel::Debug,
+            "daemon.attach",
+            "stale_event",
+            {{"event", std::string{daemon_event_kind_name(event.kind)}},
+             {"client_id", std::to_string(*event.client_id)}});
+      }
       return false;
     }
 
@@ -3761,7 +4446,9 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
               target->session_name,
               event.pipe,
               event.columns,
-              event.rows);
+              event.rows,
+              event.command.terminal_capabilities,
+              event.command.terminal_capabilities_provided);
 #else
       const ClientId client_id = 0;
 #endif
@@ -3775,12 +4462,14 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
         if (client != state.attach_clients.end()) {
           const bool supports_sgr_mouse = client->second.client.terminal_caps.supports_sgr_mouse;
           if (!supports_sgr_mouse) {
-            log_event(
-                LogLevel::Debug,
-                "daemon.attach",
-                "mouse_capability_disabled",
-                {{"client_id", std::to_string(client_id)},
-                 {"session_id", std::to_string(target->session_id)}});
+            if (should_log(LogLevel::Debug)) {
+              log_event(
+                  LogLevel::Debug,
+                  "daemon.attach",
+                  "mouse_capability_disabled",
+                  {{"client_id", std::to_string(client_id)},
+                   {"session_id", std::to_string(target->session_id)}});
+            }
           }
         }
       }
@@ -3865,20 +4554,24 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
         return result;
       }
       if (!daemon_mouse_setting_enabled(state)) {
+        if (should_log(LogLevel::Debug)) {
+          log_event(
+              LogLevel::Debug,
+              "daemon.mouse",
+              "ignored_disabled",
+              {{"client_id", std::to_string(*event.client_id)}, {"event", "focus"}});
+        }
+        return result;
+      }
+      if (should_log(LogLevel::Debug)) {
         log_event(
             LogLevel::Debug,
             "daemon.mouse",
-            "ignored_disabled",
-            {{"client_id", std::to_string(*event.client_id)}, {"event", "focus"}});
-        return result;
+            "focus",
+            {{"client_id", std::to_string(*event.client_id)},
+             {"column", std::to_string(event.focus.column)},
+             {"row", std::to_string(event.focus.row)}});
       }
-      log_event(
-          LogLevel::Debug,
-          "daemon.mouse",
-          "focus",
-          {{"client_id", std::to_string(*event.client_id)},
-           {"column", std::to_string(event.focus.column)},
-           {"row", std::to_string(event.focus.row)}});
 
       const auto command =
           select_pane_at_mouse_command(*event.client_id, event.focus.column, event.focus.row);
@@ -3907,22 +4600,26 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
         return result;
       }
       if (!daemon_mouse_setting_enabled(state)) {
+        if (should_log(LogLevel::Debug)) {
+          log_event(
+              LogLevel::Debug,
+              "daemon.mouse",
+              "ignored_disabled",
+              {{"client_id", std::to_string(*event.client_id)}, {"event", "mouse"}});
+        }
+        return result;
+      }
+      if (should_log(LogLevel::Debug)) {
         log_event(
             LogLevel::Debug,
             "daemon.mouse",
-            "ignored_disabled",
-            {{"client_id", std::to_string(*event.client_id)}, {"event", "mouse"}});
-        return result;
+            "event",
+            {{"client_id", std::to_string(*event.client_id)},
+             {"column", std::to_string(event.attach_mouse.column)},
+             {"row", std::to_string(event.attach_mouse.row)},
+             {"button_code", std::to_string(event.attach_mouse.button_code)},
+             {"action", std::to_string(static_cast<int>(event.attach_mouse.action))}});
       }
-      log_event(
-          LogLevel::Debug,
-          "daemon.mouse",
-          "event",
-          {{"client_id", std::to_string(*event.client_id)},
-           {"column", std::to_string(event.attach_mouse.column)},
-           {"row", std::to_string(event.attach_mouse.row)},
-           {"button_code", std::to_string(event.attach_mouse.button_code)},
-           {"action", std::to_string(static_cast<int>(event.attach_mouse.action))}});
 
       MouseDragState drag;
       {
@@ -3940,7 +4637,6 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
       const auto changed = handle_interactive_mouse_event(
           state,
           *event.client_id,
-          event.session_id,
           event.attach_mouse,
           bounded_attach_columns(event.columns),
           bounded_attach_rows(event.rows),
@@ -3990,7 +4686,7 @@ std::optional<DaemonEventResult> handle_attach_daemon_event(
 
       result.shell = shell->shell;
       result.pane_id = shell->pane_id;
-      const auto snapshot = result.shell->output_snapshot();
+      const auto snapshot = result.shell->output_snapshot(PtyOutputSnapshotMode::ScreenOnly);
       result.text =
           prepare_paste_text_for_terminal(paste_buffer.text, snapshot.screen.bracketed_paste_mode);
       result.status = "wmux: paste queued " + std::to_string(paste_buffer.text.size()) + " bytes";

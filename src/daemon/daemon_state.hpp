@@ -76,6 +76,7 @@ struct DaemonTimerEvent {
 
 struct DaemonAttachSettings {
   bool mouse_enabled{false};
+  bool synchronized_output_supported{false};
   std::string prefix{"C-b"};
   bool status_bar_enabled{true};
   std::uint16_t escape_time_ms{50};
@@ -249,6 +250,7 @@ struct DaemonState {
 
   struct WindowRuntime {
     std::unordered_map<PaneId, PaneRuntime> panes;
+    std::uint64_t layout_generation{1};
   };
 
   struct SessionRuntime {
@@ -318,6 +320,18 @@ struct DaemonState {
     std::atomic<std::uint64_t> peak_pending_client_output_bytes{0};
     std::atomic<std::uint64_t> render_frame_duration_us{0};
     std::atomic<std::uint64_t> max_render_frame_duration_us{0};
+    std::atomic<std::uint64_t> render_geometry_duration_us{0};
+    std::atomic<std::uint64_t> max_render_geometry_duration_us{0};
+    std::atomic<std::uint64_t> render_snapshot_duration_us{0};
+    std::atomic<std::uint64_t> max_render_snapshot_duration_us{0};
+    std::atomic<std::uint64_t> render_state_duration_us{0};
+    std::atomic<std::uint64_t> max_render_state_duration_us{0};
+    std::atomic<std::uint64_t> render_diff_duration_us{0};
+    std::atomic<std::uint64_t> max_render_diff_duration_us{0};
+    std::atomic<std::uint64_t> render_queue_duration_us{0};
+    std::atomic<std::uint64_t> max_render_queue_duration_us{0};
+    std::atomic<std::uint64_t> client_write_duration_us{0};
+    std::atomic<std::uint64_t> max_client_write_duration_us{0};
     std::atomic<std::uint64_t> slow_clients{0};
     std::atomic<std::uint64_t> write_failures{0};
     std::atomic<std::uint64_t> client_resize_events{0};
@@ -429,6 +443,18 @@ struct DaemonStats {
   std::uint64_t render_peak_pending_client_output_bytes{0};
   std::uint64_t render_frame_duration_us{0};
   std::uint64_t render_max_frame_duration_us{0};
+  std::uint64_t render_geometry_duration_us{0};
+  std::uint64_t render_max_geometry_duration_us{0};
+  std::uint64_t render_snapshot_duration_us{0};
+  std::uint64_t render_max_snapshot_duration_us{0};
+  std::uint64_t render_state_duration_us{0};
+  std::uint64_t render_max_state_duration_us{0};
+  std::uint64_t render_diff_duration_us{0};
+  std::uint64_t render_max_diff_duration_us{0};
+  std::uint64_t render_queue_duration_us{0};
+  std::uint64_t render_max_queue_duration_us{0};
+  std::uint64_t client_write_duration_us{0};
+  std::uint64_t client_max_write_duration_us{0};
   std::uint64_t render_slow_clients{0};
   std::uint64_t render_write_failures{0};
   std::uint64_t client_resize_events{0};
@@ -437,6 +463,16 @@ struct DaemonStats {
   std::uint64_t pty_resize_applied{0};
   std::uint64_t pty_resize_skipped{0};
   std::uint64_t pty_resize_failures{0};
+  std::uint64_t pty_output_read_chunks{0};
+  std::uint64_t pty_output_read_bytes{0};
+  std::uint64_t pty_output_feed_duration_us{0};
+  std::uint64_t pty_output_max_feed_duration_us{0};
+  std::uint64_t pty_output_lock_wait_duration_us{0};
+  std::uint64_t pty_output_max_lock_wait_duration_us{0};
+  std::uint64_t pty_output_grid_feed_duration_us{0};
+  std::uint64_t pty_output_max_grid_feed_duration_us{0};
+  std::uint64_t pty_output_buffer_duration_us{0};
+  std::uint64_t pty_output_max_buffer_duration_us{0};
   BufferId paste_buffer_id{0};
   std::size_t paste_buffer_bytes{0};
   std::size_t paste_buffer_original_bytes{0};
@@ -472,6 +508,11 @@ void install_pane_runtime_shell_locked(
     WindowId window_id,
     PaneId pane_id,
     std::shared_ptr<PtyProcess> shell);
+
+void mark_window_layout_changed_locked(
+    DaemonState& state,
+    SessionId session_id,
+    WindowId window_id);
 std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state);
 void sync_attach_client_focus_locked(DaemonState& state, SessionId session_id);
 

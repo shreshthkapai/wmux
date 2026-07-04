@@ -28,6 +28,9 @@ struct LogField {
 void initialize_logging(LogRole role);
 void shutdown_logging();
 void configure_logging(std::size_t max_file_bytes);
+void set_log_level(LogLevel level);
+LogLevel current_log_level();
+bool should_log(LogLevel level);
 std::filesystem::path log_directory();
 std::filesystem::path log_file_path(LogRole role);
 std::filesystem::path rotated_log_file_path(LogRole role);

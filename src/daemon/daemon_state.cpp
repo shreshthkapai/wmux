@@ -969,6 +969,16 @@ DaemonStats daemon_stats(DaemonState& state) {
   std::size_t terminating_shell_count = 0;
   std::size_t job_object_shell_count = 0;
   std::size_t degraded_cleanup_shell_count = 0;
+  std::uint64_t pty_output_read_chunks = 0;
+  std::uint64_t pty_output_read_bytes = 0;
+  std::uint64_t pty_output_feed_duration_us = 0;
+  std::uint64_t pty_output_max_feed_duration_us = 0;
+  std::uint64_t pty_output_lock_wait_duration_us = 0;
+  std::uint64_t pty_output_max_lock_wait_duration_us = 0;
+  std::uint64_t pty_output_grid_feed_duration_us = 0;
+  std::uint64_t pty_output_max_grid_feed_duration_us = 0;
+  std::uint64_t pty_output_buffer_duration_us = 0;
+  std::uint64_t pty_output_max_buffer_duration_us = 0;
   for (const auto& [session_id, runtime] : state.runtimes) {
     (void)session_id;
     runtime_window_count += runtime.windows.size();
@@ -988,6 +998,23 @@ DaemonStats daemon_stats(DaemonState& state) {
           } else {
             ++degraded_cleanup_shell_count;
           }
+          pty_output_read_chunks += lifecycle.output_read_chunks;
+          pty_output_read_bytes += lifecycle.output_read_bytes;
+          pty_output_feed_duration_us += lifecycle.output_feed_duration_us;
+          pty_output_max_feed_duration_us =
+              std::max(pty_output_max_feed_duration_us, lifecycle.max_output_feed_duration_us);
+          pty_output_lock_wait_duration_us += lifecycle.output_lock_wait_duration_us;
+          pty_output_max_lock_wait_duration_us = std::max(
+              pty_output_max_lock_wait_duration_us,
+              lifecycle.max_output_lock_wait_duration_us);
+          pty_output_grid_feed_duration_us += lifecycle.output_grid_feed_duration_us;
+          pty_output_max_grid_feed_duration_us = std::max(
+              pty_output_max_grid_feed_duration_us,
+              lifecycle.max_output_grid_feed_duration_us);
+          pty_output_buffer_duration_us += lifecycle.output_buffer_duration_us;
+          pty_output_max_buffer_duration_us = std::max(
+              pty_output_max_buffer_duration_us,
+              lifecycle.max_output_buffer_duration_us);
         }
       }
     }
@@ -1020,6 +1047,18 @@ DaemonStats daemon_stats(DaemonState& state) {
       state.render_metrics.peak_pending_client_output_bytes.load(std::memory_order_relaxed),
       state.render_metrics.render_frame_duration_us.load(std::memory_order_relaxed),
       state.render_metrics.max_render_frame_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.render_geometry_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_render_geometry_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.render_snapshot_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_render_snapshot_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.render_state_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_render_state_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.render_diff_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_render_diff_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.render_queue_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_render_queue_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.client_write_duration_us.load(std::memory_order_relaxed),
+      state.render_metrics.max_client_write_duration_us.load(std::memory_order_relaxed),
       state.render_metrics.slow_clients.load(std::memory_order_relaxed),
       state.render_metrics.write_failures.load(std::memory_order_relaxed),
       state.render_metrics.client_resize_events.load(std::memory_order_relaxed),
@@ -1028,6 +1067,16 @@ DaemonStats daemon_stats(DaemonState& state) {
       state.render_metrics.pty_resize_applied.load(std::memory_order_relaxed),
       state.render_metrics.pty_resize_skipped.load(std::memory_order_relaxed),
       state.render_metrics.pty_resize_failures.load(std::memory_order_relaxed),
+      pty_output_read_chunks,
+      pty_output_read_bytes,
+      pty_output_feed_duration_us,
+      pty_output_max_feed_duration_us,
+      pty_output_lock_wait_duration_us,
+      pty_output_max_lock_wait_duration_us,
+      pty_output_grid_feed_duration_us,
+      pty_output_max_grid_feed_duration_us,
+      pty_output_buffer_duration_us,
+      pty_output_max_buffer_duration_us,
       state.paste_buffer.id,
       state.paste_buffer.text.size(),
       state.paste_buffer.original_bytes,
@@ -1042,6 +1091,7 @@ DaemonAttachSettings daemon_attach_settings(DaemonState& state) {
   std::lock_guard lock(state.mutex);
   return {
       state.mouse_enabled,
+      false,
       state.config.values.prefix,
       state.config.values.status_bar_enabled,
       state.config.values.escape_time_ms,
@@ -1067,6 +1117,25 @@ void install_pane_runtime_shell_locked(
   pane_runtime.shell = std::move(shell);
   pane_runtime.pty_columns = 0;
   pane_runtime.pty_rows = 0;
+}
+
+void mark_window_layout_changed_locked(
+    DaemonState& state,
+    SessionId session_id,
+    WindowId window_id) {
+  assert_daemon_state_mutation_allowed("mark_window_layout_changed_locked");
+  const auto runtime = state.runtimes.find(session_id);
+  if (runtime == state.runtimes.end()) {
+    return;
+  }
+  const auto window = runtime->second.windows.find(window_id);
+  if (window == runtime->second.windows.end()) {
+    return;
+  }
+  ++window->second.layout_generation;
+  if (window->second.layout_generation == 0) {
+    window->second.layout_generation = 1;
+  }
 }
 
 std::vector<std::shared_ptr<PtyProcess>> take_all_shells(DaemonState& state) {

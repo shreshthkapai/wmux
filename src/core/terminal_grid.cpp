@@ -22,33 +22,40 @@ int clamped_dimension(int value, int fallback) {
   return value > 0 ? value : fallback;
 }
 
-std::vector<TerminalCell> resized_buffer(
-    const std::vector<TerminalCell>& old_buffer,
+TerminalLine make_line(int columns, const TerminalCell& blank) {
+  TerminalLine line;
+  line.cells.assign(static_cast<std::size_t>(columns), blank);
+  return line;
+}
+
+std::vector<TerminalLine> make_lines(int rows, int columns, const TerminalCell& blank) {
+  std::vector<TerminalLine> lines;
+  lines.reserve(static_cast<std::size_t>(rows));
+  for (int row = 0; row < rows; ++row) {
+    lines.push_back(make_line(columns, blank));
+  }
+  return lines;
+}
+
+std::vector<TerminalLine> resized_lines(
+    const std::vector<TerminalLine>& old_lines,
     int old_columns,
     int old_rows,
     int new_columns,
     int new_rows,
     const TerminalCell& blank) {
-  std::vector<TerminalCell> next(static_cast<std::size_t>(new_columns * new_rows), blank);
+  auto next = make_lines(new_rows, new_columns, blank);
   const int copied_rows = std::min(old_rows, new_rows);
   const int copied_columns = std::min(old_columns, new_columns);
   for (int row = 0; row < copied_rows; ++row) {
+    next[static_cast<std::size_t>(row)].wrapped =
+        old_lines[static_cast<std::size_t>(row)].wrapped;
+    next[static_cast<std::size_t>(row)].generation =
+        old_lines[static_cast<std::size_t>(row)].generation + 1;
     for (int column = 0; column < copied_columns; ++column) {
-      next[static_cast<std::size_t>((row * new_columns) + column)] =
-          old_buffer[static_cast<std::size_t>((row * old_columns) + column)];
+      next[static_cast<std::size_t>(row)].cells[static_cast<std::size_t>(column)] =
+          old_lines[static_cast<std::size_t>(row)].cells[static_cast<std::size_t>(column)];
     }
-  }
-  return next;
-}
-
-std::vector<bool> resized_wrapped_lines(
-    const std::vector<bool>& old_wrapped_lines,
-    int old_rows,
-    int new_rows) {
-  std::vector<bool> next(static_cast<std::size_t>(new_rows), false);
-  const int copied_rows = std::min(old_rows, new_rows);
-  for (int row = 0; row < copied_rows; ++row) {
-    next[static_cast<std::size_t>(row)] = old_wrapped_lines[static_cast<std::size_t>(row)];
   }
   return next;
 }
@@ -84,23 +91,85 @@ int param_or_default(const std::vector<int>& params, std::size_t index, int defa
   return params[index];
 }
 
+bool terminal_attributes_default(const TerminalAttributes& attributes) {
+  return !attributes.bold && !attributes.dim && !attributes.italic && !attributes.underline &&
+         !attributes.inverse && attributes.foreground == -1 && attributes.background == -1;
+}
+
+bool cell_has_default_ascii_glyph(const TerminalCell& cell) {
+  return cell.width == TerminalCellWidth::Narrow && cell.extended.empty() &&
+         cell.codepoint >= U' ' && cell.codepoint < 0x7f;
+}
+
+std::string cell_glyph(const TerminalCell& cell) {
+  if (!cell.extended.empty()) {
+    return cell.extended;
+  }
+  return utf8_from_codepoint(static_cast<std::uint32_t>(cell.codepoint));
+}
+
+void append_cell_glyph(std::string& out, const TerminalCell& cell) {
+  if (!cell.extended.empty()) {
+    out += cell.extended;
+    return;
+  }
+  if (cell.codepoint < 0x80) {
+    out.push_back(static_cast<char>(cell.codepoint));
+    return;
+  }
+  out += utf8_from_codepoint(static_cast<std::uint32_t>(cell.codepoint));
+}
+
+bool row_needs_rich_snapshot(const TerminalLine& line) {
+  for (std::size_t column = 0; column < line.cells.size(); ++column) {
+    const auto& cell = line.cells[static_cast<std::size_t>(column)];
+    if (!terminal_attributes_default(cell.attributes) ||
+        !cell_has_default_ascii_glyph(cell)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void apply_damage_row_range(TerminalDamage& damage, int rows) {
+  if (damage.kind == DamageKind::None) {
+    damage.first_row = -1;
+    damage.last_row = -1;
+    return;
+  }
+  if (damage.kind >= DamageKind::FullPane && rows > 0) {
+    damage.first_row = 0;
+    damage.last_row = rows - 1;
+    return;
+  }
+  if (!damage.dirty_rows.empty()) {
+    damage.first_row = damage.dirty_rows.front();
+    damage.last_row = damage.dirty_rows.back();
+    return;
+  }
+  damage.first_row = -1;
+  damage.last_row = -1;
+}
+
 }  // namespace
 
+DamageKind merge_damage(DamageKind a, DamageKind b) {
+  return static_cast<int>(a) > static_cast<int>(b) ? a : b;
+}
+
 TerminalGrid::TerminalGrid()
-    : normal_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      alternate_buffer_(static_cast<std::size_t>(kDefaultColumns * kDefaultRows)),
-      normal_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false),
-      alternate_wrapped_lines_(static_cast<std::size_t>(kDefaultRows), false) {
+    : normal_lines_(make_lines(kDefaultRows, kDefaultColumns, TerminalCell{})),
+      alternate_lines_(make_lines(kDefaultRows, kDefaultColumns, TerminalCell{})),
+      dirty_rows_(static_cast<std::size_t>(kDefaultRows), true) {
   reset_scroll_region();
 }
 
 TerminalGrid::TerminalGrid(int columns, int rows)
     : columns_(clamped_dimension(columns, kDefaultColumns)),
       rows_(clamped_dimension(rows, kDefaultRows)),
-      normal_buffer_(static_cast<std::size_t>(columns_ * rows_)),
-      alternate_buffer_(static_cast<std::size_t>(columns_ * rows_)),
-      normal_wrapped_lines_(static_cast<std::size_t>(rows_), false),
-      alternate_wrapped_lines_(static_cast<std::size_t>(rows_), false) {
+      normal_lines_(make_lines(rows_, columns_, TerminalCell{})),
+      alternate_lines_(make_lines(rows_, columns_, TerminalCell{})),
+      dirty_rows_(static_cast<std::size_t>(rows_), true) {
   reset_scroll_region();
 }
 
@@ -109,13 +178,9 @@ void TerminalGrid::resize(int columns, int rows) {
   const int next_rows = clamped_dimension(rows, kDefaultRows);
   const auto blank = blank_cell();
 
-  normal_buffer_ =
-      resized_buffer(normal_buffer_, columns_, rows_, next_columns, next_rows, blank);
-  alternate_buffer_ =
-      resized_buffer(alternate_buffer_, columns_, rows_, next_columns, next_rows, blank);
-  normal_wrapped_lines_ = resized_wrapped_lines(normal_wrapped_lines_, rows_, next_rows);
-  alternate_wrapped_lines_ =
-      resized_wrapped_lines(alternate_wrapped_lines_, rows_, next_rows);
+  normal_lines_ = resized_lines(normal_lines_, columns_, rows_, next_columns, next_rows, blank);
+  alternate_lines_ =
+      resized_lines(alternate_lines_, columns_, rows_, next_columns, next_rows, blank);
 
   columns_ = next_columns;
   rows_ = next_rows;
@@ -126,13 +191,19 @@ void TerminalGrid::resize(int columns, int rows) {
   saved_cursor_row_ = std::clamp(saved_cursor_row_, 0, rows_ - 1);
   reset_scroll_region();
   pending_wrap_ = false;
+  mark_full_pane_dirty();
 }
 
 void TerminalGrid::feed(std::string_view bytes) {
-  operation_buffer_.clear();
-  parser_.feed(bytes, operation_buffer_);
-  for (const auto& operation : operation_buffer_) {
-    apply_operation(operation);
+  std::size_t index = 0;
+  while (index < bytes.size()) {
+    if (parser_.fast_path_ready()) {
+      feed_ascii_fast_path(bytes, index);
+      continue;
+    }
+
+    feed_parser_byte(bytes[index]);
+    ++index;
   }
 }
 
@@ -143,7 +214,67 @@ void TerminalGrid::set_scrollback_capacity(std::size_t capacity) {
   }
 }
 
-TerminalScreenSnapshot TerminalGrid::snapshot() const {
+int TerminalGrid::columns() const noexcept {
+  return columns_;
+}
+
+int TerminalGrid::rows() const noexcept {
+  return rows_;
+}
+
+CursorState TerminalGrid::cursor() const {
+  return CursorState{
+      cursor_column_,
+      cursor_row_,
+      cursor_visible_,
+      cursor_style_,
+      origin_mode_,
+      wrap_mode_,
+      bracketed_paste_mode_,
+      alternate_screen_};
+}
+
+TerminalLineView TerminalGrid::line_view(int row) const {
+  if (row < 0 || row >= rows_) {
+    return {};
+  }
+  const auto& line = line_at(row);
+  return TerminalLineView{
+      std::span<const TerminalCell>{line.cells.data(), line.cells.size()},
+      line.wrapped,
+      line.generation};
+}
+
+std::uint64_t TerminalGrid::line_generation(int row) const {
+  if (row < 0 || row >= rows_) {
+    return 0;
+  }
+  return line_at(row).generation;
+}
+
+ScrollbackView TerminalGrid::scrollback_view(int start, int count) const {
+  const auto total = scrollback_.size();
+  const auto first = static_cast<std::size_t>(std::clamp(start, 0, static_cast<int>(total)));
+  const auto requested = std::max(0, count);
+  const auto available = total - first;
+  return ScrollbackView{
+      &scrollback_,
+      first,
+      std::min<std::size_t>(available, static_cast<std::size_t>(requested)),
+      total,
+      scrollback_capacity_};
+}
+
+TerminalDamage TerminalGrid::consume_damage() const {
+  TerminalDamage damage;
+  damage.dirty_rows = dirty_rows_snapshot(true);
+  damage.kind = damage_snapshot(true);
+  apply_damage_row_range(damage, rows_);
+  scroll_events_snapshot(true);
+  return damage;
+}
+
+TerminalScreenSnapshot TerminalGrid::snapshot(bool consume_dirty, bool dirty_rows_only) const {
   TerminalScreenSnapshot screen;
   screen.columns = columns_;
   screen.rows = rows_;
@@ -160,11 +291,27 @@ TerminalScreenSnapshot TerminalGrid::snapshot() const {
   screen.unknown_sequence_count = unknown_sequence_count_;
   screen.lines.reserve(static_cast<std::size_t>(rows_));
   screen.line_snapshots.reserve(static_cast<std::size_t>(rows_));
+  screen.dirty_rows = dirty_rows_snapshot(consume_dirty);
+  screen.damage = damage_snapshot(consume_dirty);
+  TerminalDamage damage_range{screen.damage, -1, -1, screen.dirty_rows};
+  apply_damage_row_range(damage_range, rows_);
+  screen.damage_first_row = damage_range.first_row;
+  screen.damage_last_row = damage_range.last_row;
+  screen.scroll_events = scroll_events_snapshot(consume_dirty);
 
-  const auto& buffer = active_buffer();
-  const auto& wrapped_lines = active_wrapped_lines();
+  const auto& lines = active_lines();
+  if (dirty_rows_only) {
+    screen.dirty_line_snapshots.reserve(screen.dirty_rows.size());
+    for (const int row : screen.dirty_rows) {
+      if (row >= 0 && row < rows_) {
+        screen.dirty_line_snapshots.push_back(row_snapshot(lines[static_cast<std::size_t>(row)]));
+      }
+    }
+    return screen;
+  }
+
   for (int row = 0; row < rows_; ++row) {
-    auto line = row_snapshot(buffer, wrapped_lines, row);
+    auto line = row_snapshot(lines[static_cast<std::size_t>(row)]);
     screen.lines.push_back(line.text);
     screen.line_snapshots.push_back(std::move(line));
   }
@@ -175,76 +322,224 @@ TerminalScreenSnapshot TerminalGrid::snapshot() const {
 TerminalScrollbackSnapshot TerminalGrid::scrollback_snapshot() const {
   TerminalScrollbackSnapshot snapshot;
   snapshot.capacity = scrollback_capacity_;
+  snapshot.total_lines = scrollback_.size();
+  snapshot.first_line_index = 0;
+  snapshot.partial = false;
   snapshot.lines.reserve(scrollback_.size());
   snapshot.line_snapshots.reserve(scrollback_.size());
   for (const auto& line : scrollback_) {
-    snapshot.lines.push_back(line.text);
-    snapshot.line_snapshots.push_back(line);
+    auto line_snapshot = row_snapshot(line);
+    snapshot.lines.push_back(line_snapshot.text);
+    snapshot.line_snapshots.push_back(std::move(line_snapshot));
   }
   return snapshot;
 }
 
-std::vector<TerminalCell>& TerminalGrid::active_buffer() {
-  return alternate_screen_ ? alternate_buffer_ : normal_buffer_;
+TerminalScrollbackSnapshot TerminalGrid::scrollback_snapshot_range(
+    std::size_t first_line,
+    std::size_t line_count) const {
+  TerminalScrollbackSnapshot snapshot;
+  snapshot.capacity = scrollback_capacity_;
+  snapshot.total_lines = scrollback_.size();
+  snapshot.partial = true;
+  if (line_count == 0 || first_line >= scrollback_.size()) {
+    snapshot.first_line_index = std::min(first_line, scrollback_.size());
+    return snapshot;
+  }
+
+  const auto last_line = std::min(scrollback_.size(), first_line + line_count);
+  snapshot.first_line_index = first_line;
+  snapshot.lines.reserve(last_line - first_line);
+  snapshot.line_snapshots.reserve(last_line - first_line);
+  for (auto index = first_line; index < last_line; ++index) {
+    const auto& line = scrollback_[index];
+    auto line_snapshot = row_snapshot(line);
+    snapshot.lines.push_back(line_snapshot.text);
+    snapshot.line_snapshots.push_back(std::move(line_snapshot));
+  }
+  return snapshot;
 }
 
-const std::vector<TerminalCell>& TerminalGrid::active_buffer() const {
-  return alternate_screen_ ? alternate_buffer_ : normal_buffer_;
+std::vector<TerminalLine>& TerminalGrid::active_lines() {
+  return alternate_screen_ ? alternate_lines_ : normal_lines_;
 }
 
-std::vector<bool>& TerminalGrid::active_wrapped_lines() {
-  return alternate_screen_ ? alternate_wrapped_lines_ : normal_wrapped_lines_;
+const std::vector<TerminalLine>& TerminalGrid::active_lines() const {
+  return alternate_screen_ ? alternate_lines_ : normal_lines_;
 }
 
-const std::vector<bool>& TerminalGrid::active_wrapped_lines() const {
-  return alternate_screen_ ? alternate_wrapped_lines_ : normal_wrapped_lines_;
+TerminalLine& TerminalGrid::line_at(int row) {
+  return active_lines()[static_cast<std::size_t>(row)];
+}
+
+const TerminalLine& TerminalGrid::line_at(int row) const {
+  return active_lines()[static_cast<std::size_t>(row)];
+}
+
+TerminalCell& TerminalGrid::cell_at(int row, int column) {
+  return line_at(row).cells[static_cast<std::size_t>(column)];
+}
+
+const TerminalCell& TerminalGrid::cell_at(int row, int column) const {
+  return line_at(row).cells[static_cast<std::size_t>(column)];
 }
 
 TerminalCell TerminalGrid::blank_cell() const {
-  return TerminalCell{" ", current_attributes_, TerminalCellWidth::Narrow};
+  return TerminalCell{U' ', {}, current_attributes_, TerminalCellWidth::Narrow};
 }
 
-std::size_t TerminalGrid::offset(int row, int column) const {
-  return static_cast<std::size_t>((row * columns_) + column);
-}
-
-std::vector<TerminalCell> TerminalGrid::row_cells(
-    const std::vector<TerminalCell>& buffer,
-    int row) const {
-  std::vector<TerminalCell> line;
-  line.reserve(static_cast<std::size_t>(columns_));
-  for (int column = 0; column < columns_; ++column) {
-    line.push_back(buffer[offset(row, column)]);
+std::vector<int> TerminalGrid::dirty_rows_snapshot(bool consume_dirty) const {
+  std::vector<int> rows;
+  rows.reserve(dirty_rows_.size());
+  for (int row = 0; row < static_cast<int>(dirty_rows_.size()); ++row) {
+    if (dirty_rows_[static_cast<std::size_t>(row)]) {
+      rows.push_back(row);
+    }
   }
-  return line;
+  if (consume_dirty) {
+    std::fill(dirty_rows_.begin(), dirty_rows_.end(), false);
+  }
+  return rows;
 }
 
-TerminalLineSnapshot TerminalGrid::row_snapshot(
-    const std::vector<TerminalCell>& buffer,
-    const std::vector<bool>& wrapped_lines,
-    int row) const {
+std::vector<TerminalScrollEvent> TerminalGrid::scroll_events_snapshot(bool consume_dirty) const {
+  auto events = scroll_events_;
+  if (consume_dirty) {
+    scroll_events_.clear();
+  }
+  return events;
+}
+
+DamageKind TerminalGrid::damage_snapshot(bool consume_dirty) const {
+  const auto damage = damage_;
+  if (consume_dirty) {
+    damage_ = DamageKind::None;
+  }
+  return damage;
+}
+
+void TerminalGrid::feed_parser_byte(char byte) {
+  operation_buffer_.clear();
+  parser_.feed(std::string_view{&byte, 1}, operation_buffer_);
+  for (const auto& operation : operation_buffer_) {
+    apply_operation(operation);
+  }
+}
+
+void TerminalGrid::feed_ascii_fast_path(std::string_view bytes, std::size_t& index) {
+  const std::size_t start = index;
+  while (index < bytes.size()) {
+    const auto byte = static_cast<unsigned char>(bytes[index]);
+    if (byte < 0x20 || byte >= 0x7f) {
+      break;
+    }
+    ++index;
+  }
+
+  if (index > start) {
+    put_ascii_run(bytes.substr(start, index - start));
+    return;
+  }
+
+  const auto byte = static_cast<unsigned char>(bytes[index]);
+  switch (byte) {
+    case '\r':
+      carriage_return();
+      ++index;
+      return;
+    case '\n':
+      line_feed();
+      ++index;
+      return;
+    case '\b':
+      backspace();
+      ++index;
+      return;
+    case '\t':
+      tab();
+      ++index;
+      return;
+    default:
+      feed_parser_byte(bytes[index]);
+      ++index;
+      return;
+  }
+}
+
+void TerminalGrid::mark_dirty_row(int row) {
+  if (row < 0 || row >= rows_) {
+    return;
+  }
+  if (dirty_rows_.size() != static_cast<std::size_t>(rows_)) {
+    dirty_rows_.assign(static_cast<std::size_t>(rows_), true);
+    damage_ = merge_damage(damage_, DamageKind::FullPane);
+    return;
+  }
+  dirty_rows_[static_cast<std::size_t>(row)] = true;
+  damage_ = merge_damage(damage_, DamageKind::RowRange);
+}
+
+void TerminalGrid::mark_dirty_range(int first, int last) {
+  if (rows_ <= 0) {
+    return;
+  }
+  first = std::clamp(first, 0, rows_ - 1);
+  last = std::clamp(last, 0, rows_ - 1);
+  if (last < first) {
+    return;
+  }
+  if (dirty_rows_.size() != static_cast<std::size_t>(rows_)) {
+    dirty_rows_.assign(static_cast<std::size_t>(rows_), true);
+    damage_ = merge_damage(damage_, DamageKind::FullPane);
+    return;
+  }
+  for (int row = first; row <= last; ++row) {
+    dirty_rows_[static_cast<std::size_t>(row)] = true;
+  }
+  damage_ = merge_damage(damage_, DamageKind::RowRange);
+}
+
+void TerminalGrid::mark_all_dirty() {
+  dirty_rows_.assign(static_cast<std::size_t>(rows_), true);
+  scroll_events_.clear();
+  damage_ = merge_damage(damage_, DamageKind::FullPane);
+}
+
+void TerminalGrid::mark_full_pane_dirty() {
+  dirty_rows_.assign(static_cast<std::size_t>(rows_), true);
+  scroll_events_.clear();
+  damage_ = merge_damage(damage_, DamageKind::FullPane);
+}
+
+TerminalLineSnapshot TerminalGrid::row_snapshot(const TerminalLine& line) const {
   TerminalLineSnapshot snapshot;
-  snapshot.text = row_text(buffer, row);
-  snapshot.wrapped = wrapped_lines[static_cast<std::size_t>(row)];
-  snapshot.attributes.reserve(static_cast<std::size_t>(columns_));
-  snapshot.cells.reserve(static_cast<std::size_t>(columns_));
-  snapshot.cell_widths.reserve(static_cast<std::size_t>(columns_));
-  for (int column = 0; column < columns_; ++column) {
-    const auto& cell = buffer[offset(row, column)];
+  snapshot.text = row_text(line);
+  snapshot.wrapped = line.wrapped;
+  if (!row_needs_rich_snapshot(line)) {
+    return snapshot;
+  }
+
+  snapshot.attributes.reserve(line.cells.size());
+  snapshot.cells.reserve(line.cells.size());
+  snapshot.cell_widths.reserve(line.cells.size());
+  for (const auto& cell : line.cells) {
     snapshot.attributes.push_back(cell.attributes);
     snapshot.cells.push_back(
-        cell.width == TerminalCellWidth::WideContinuation ? std::string{} : cell.glyph);
+        cell.width == TerminalCellWidth::WideContinuation ? std::string{} : cell_glyph(cell));
     snapshot.cell_widths.push_back(cell.width);
   }
   return snapshot;
 }
 
-std::string TerminalGrid::row_text(const std::vector<TerminalCell>& buffer, int row) const {
+std::string TerminalGrid::row_text(const TerminalLine& row) const {
   std::string line;
-  line.reserve(static_cast<std::size_t>(columns_));
-  for (int column = 0; column < columns_; ++column) {
-    const auto& cell = buffer[offset(row, column)];
-    line += cell.width == TerminalCellWidth::WideContinuation ? std::string{" "} : cell.glyph;
+  line.reserve(row.cells.size());
+  for (const auto& cell : row.cells) {
+    if (cell.width == TerminalCellWidth::WideContinuation) {
+      line.push_back(' ');
+    } else {
+      append_cell_glyph(line, cell);
+    }
   }
   return line;
 }
@@ -253,13 +548,88 @@ std::string TerminalGrid::row_text(const std::vector<TerminalCell>& cells) const
   std::string line;
   line.reserve(cells.size());
   for (const auto& cell : cells) {
-    line += cell.width == TerminalCellWidth::WideContinuation ? std::string{" "} : cell.glyph;
+    if (cell.width == TerminalCellWidth::WideContinuation) {
+      line.push_back(' ');
+    } else {
+      append_cell_glyph(line, cell);
+    }
   }
   return line;
 }
 
 void TerminalGrid::put_printable(char glyph) {
-  put_cell(std::string(1, glyph), 1);
+  put_ascii_run(std::string_view{&glyph, 1});
+}
+
+void TerminalGrid::put_ascii_run(std::string_view text) {
+  if (text.empty()) {
+    return;
+  }
+
+  while (!text.empty()) {
+    if (pending_wrap_) {
+      line_at(cursor_row_).wrapped = true;
+      ++line_at(cursor_row_).generation;
+      cursor_column_ = 0;
+      line_feed();
+      pending_wrap_ = false;
+    }
+
+    const auto written = put_ascii_row_segment(text);
+    text.remove_prefix(written);
+  }
+}
+
+std::size_t TerminalGrid::put_ascii_row_segment(std::string_view text) {
+  if (text.empty() || columns_ <= 0) {
+    return 0;
+  }
+
+  const int start_column = cursor_column_;
+  const int available_columns = std::max(1, columns_ - start_column);
+  const auto count = std::min<std::size_t>(
+      text.size(),
+      static_cast<std::size_t>(available_columns));
+  auto& line = line_at(cursor_row_);
+  const auto blank = blank_cell();
+
+  if (start_column > 0 &&
+      line.cells[static_cast<std::size_t>(start_column)].width ==
+          TerminalCellWidth::WideContinuation) {
+    line.cells[static_cast<std::size_t>(start_column - 1)] = blank;
+  }
+
+  const int end_column = start_column + static_cast<int>(count);
+  if (end_column < columns_ &&
+      line.cells[static_cast<std::size_t>(end_column)].width ==
+          TerminalCellWidth::WideContinuation) {
+    line.cells[static_cast<std::size_t>(end_column)] = blank;
+  }
+
+  for (std::size_t offset = 0; offset < count; ++offset) {
+    line.cells[static_cast<std::size_t>(start_column) + offset] =
+        TerminalCell{
+            static_cast<unsigned char>(text[offset]),
+            {},
+            current_attributes_,
+            TerminalCellWidth::Narrow};
+  }
+
+  ++line.generation;
+  mark_dirty_row(cursor_row_);
+
+  if (end_column >= columns_) {
+    if (wrap_mode_) {
+      pending_wrap_ = true;
+    } else {
+      cursor_column_ = columns_ - 1;
+      pending_wrap_ = false;
+    }
+  } else {
+    cursor_column_ = end_column;
+  }
+
+  return count;
 }
 
 void TerminalGrid::put_codepoint(std::uint32_t codepoint) {
@@ -280,12 +650,14 @@ void TerminalGrid::put_codepoint(std::uint32_t codepoint) {
   }
 
   if (codepoint >= 0x20 && codepoint < 0x7f) {
-    put_cell(std::string(1, static_cast<char>(codepoint)), 1);
+    const char ascii = static_cast<char>(codepoint);
+    put_ascii_run(std::string_view{&ascii, 1});
     return;
   }
 
   if (codepoint == kReplacementCodepoint) {
-    put_cell("?", 1);
+    constexpr char replacement = '?';
+    put_ascii_run(std::string_view{&replacement, 1});
     return;
   }
 
@@ -295,7 +667,8 @@ void TerminalGrid::put_codepoint(std::uint32_t codepoint) {
 void TerminalGrid::put_cell(std::string glyph, int width) {
   width = std::clamp(width, 1, std::max(1, columns_));
   if (pending_wrap_) {
-    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = true;
+    line_at(cursor_row_).wrapped = true;
+    ++line_at(cursor_row_).generation;
     cursor_column_ = 0;
     line_feed();
     pending_wrap_ = false;
@@ -303,7 +676,8 @@ void TerminalGrid::put_cell(std::string glyph, int width) {
 
   if (width > 1 && cursor_column_ + width > columns_) {
     if (wrap_mode_) {
-      active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = true;
+      line_at(cursor_row_).wrapped = true;
+      ++line_at(cursor_row_).generation;
       cursor_column_ = 0;
       line_feed();
       pending_wrap_ = false;
@@ -317,17 +691,20 @@ void TerminalGrid::put_cell(std::string glyph, int width) {
     clear_cell_at(cursor_row_, cursor_column_ + 1);
   }
 
-  active_buffer()[offset(cursor_row_, cursor_column_)] =
+  cell_at(cursor_row_, cursor_column_) =
       TerminalCell{
+          U' ',
           std::move(glyph),
           current_attributes_,
           width == 2 ? TerminalCellWidth::WideLeading : TerminalCellWidth::Narrow};
   for (int column = cursor_column_ + 1;
        column < std::min(columns_, cursor_column_ + width);
        ++column) {
-    active_buffer()[offset(cursor_row_, column)] =
-        TerminalCell{"", current_attributes_, TerminalCellWidth::WideContinuation};
+    cell_at(cursor_row_, column) =
+        TerminalCell{U' ', {}, current_attributes_, TerminalCellWidth::WideContinuation};
   }
+  ++line_at(cursor_row_).generation;
+  mark_dirty_row(cursor_row_);
 
   if (cursor_column_ + width >= columns_) {
     if (wrap_mode_) {
@@ -346,13 +723,12 @@ int TerminalGrid::leading_column_for(int row, int column) const {
     return std::clamp(column, 0, std::max(0, columns_ - 1));
   }
 
-  const auto& buffer = active_buffer();
-  if (buffer[offset(row, column)].width != TerminalCellWidth::WideContinuation) {
+  if (cell_at(row, column).width != TerminalCellWidth::WideContinuation) {
     return column;
   }
 
   for (int candidate = column - 1; candidate >= 0; --candidate) {
-    const auto& cell = buffer[offset(row, candidate)];
+    const auto& cell = cell_at(row, candidate);
     if (cell.width != TerminalCellWidth::WideContinuation) {
       return candidate;
     }
@@ -366,43 +742,55 @@ void TerminalGrid::clear_cell_at(int row, int column) {
     return;
   }
 
-  auto& buffer = active_buffer();
   const int leading = leading_column_for(row, column);
   const auto replacement = blank_cell();
   if (leading < 0 || leading >= columns_) {
     return;
   }
 
-  const auto width = buffer[offset(row, leading)].width;
-  buffer[offset(row, leading)] = replacement;
+  const auto width = cell_at(row, leading).width;
+  cell_at(row, leading) = replacement;
   if (width == TerminalCellWidth::WideLeading && leading + 1 < columns_) {
-    buffer[offset(row, leading + 1)] = replacement;
+    cell_at(row, leading + 1) = replacement;
   }
   if (column != leading) {
-    buffer[offset(row, column)] = replacement;
+    cell_at(row, column) = replacement;
   }
+  ++line_at(row).generation;
+  mark_dirty_row(row);
 }
 
-void TerminalGrid::repair_wide_cells_in_row(std::vector<TerminalCell>& buffer, int row) const {
-  if (row < 0 || row >= rows_) {
-    return;
+void TerminalGrid::reset_line(TerminalLine& line) {
+  const auto replacement = blank_cell();
+  if (line.cells.size() != static_cast<std::size_t>(columns_)) {
+    line.cells.assign(static_cast<std::size_t>(columns_), replacement);
+  } else {
+    std::fill(line.cells.begin(), line.cells.end(), replacement);
   }
+  line.wrapped = false;
+  ++line.generation;
+}
 
+void TerminalGrid::repair_wide_cells_in_row(TerminalLine& line) const {
   const auto replacement = blank_cell();
   for (int column = 0; column < columns_; ++column) {
-    auto& cell = buffer[offset(row, column)];
+    auto& cell = line.cells[static_cast<std::size_t>(column)];
     if (cell.width == TerminalCellWidth::WideContinuation) {
       if (column == 0 ||
-          buffer[offset(row, column - 1)].width != TerminalCellWidth::WideLeading) {
+          line.cells[static_cast<std::size_t>(column - 1)].width !=
+              TerminalCellWidth::WideLeading) {
         cell = replacement;
+        ++line.generation;
       }
       continue;
     }
 
     if (cell.width == TerminalCellWidth::WideLeading) {
       if (column + 1 >= columns_ ||
-          buffer[offset(row, column + 1)].width != TerminalCellWidth::WideContinuation) {
+          line.cells[static_cast<std::size_t>(column + 1)].width !=
+              TerminalCellWidth::WideContinuation) {
         cell = replacement;
+        ++line.generation;
       } else {
         ++column;
       }
@@ -412,15 +800,14 @@ void TerminalGrid::repair_wide_cells_in_row(std::vector<TerminalCell>& buffer, i
 
 void TerminalGrid::repair_wide_cells() {
   for (int row = 0; row < rows_; ++row) {
-    repair_wide_cells_in_row(normal_buffer_, row);
-    repair_wide_cells_in_row(alternate_buffer_, row);
+    repair_wide_cells_in_row(normal_lines_[static_cast<std::size_t>(row)]);
+    repair_wide_cells_in_row(alternate_lines_[static_cast<std::size_t>(row)]);
   }
 }
 
 bool TerminalGrid::append_codepoint_to_previous_grapheme(
     std::string_view glyph,
     std::uint32_t codepoint) {
-  auto& buffer = active_buffer();
   int row = cursor_row_;
   int column = pending_wrap_ ? columns_ - 1 : cursor_column_ - 1;
   if (column < 0 && row > 0) {
@@ -436,25 +823,32 @@ bool TerminalGrid::append_codepoint_to_previous_grapheme(
     return false;
   }
 
-  auto& cell = buffer[offset(row, leading)];
+  auto& cell = cell_at(row, leading);
   if (cell.width == TerminalCellWidth::WideContinuation ||
-      cell.glyph.empty() || cell.glyph == " ") {
+      (cell.extended.empty() && cell.codepoint == U' ')) {
     return false;
   }
 
-  if (!terminal_codepoint_extends_previous_grapheme(cell.glyph, codepoint)) {
+  auto current_glyph = cell_glyph(cell);
+  if (!terminal_codepoint_extends_previous_grapheme(current_glyph, codepoint)) {
     return false;
   }
 
-  cell.glyph.append(glyph);
-  if (terminal_grapheme_width(cell.glyph) == 2 &&
+  if (cell.extended.empty()) {
+    cell.extended = std::move(current_glyph);
+  }
+  cell.extended.append(glyph);
+  ++line_at(row).generation;
+  mark_dirty_row(row);
+  if (terminal_grapheme_width(cell.extended) == 2 &&
       cell.width == TerminalCellWidth::Narrow &&
       leading + 1 < columns_) {
     const auto attributes = cell.attributes;
     clear_cell_at(row, leading + 1);
-    buffer[offset(row, leading)].width = TerminalCellWidth::WideLeading;
-    buffer[offset(row, leading + 1)] =
-        TerminalCell{"", attributes, TerminalCellWidth::WideContinuation};
+    cell_at(row, leading).width = TerminalCellWidth::WideLeading;
+    cell_at(row, leading + 1) =
+        TerminalCell{U' ', {}, attributes, TerminalCellWidth::WideContinuation};
+    ++line_at(row).generation;
     if (row == cursor_row_ && cursor_column_ == leading + 1) {
       if (leading + 2 < columns_) {
         cursor_column_ = leading + 2;
@@ -467,7 +861,6 @@ bool TerminalGrid::append_codepoint_to_previous_grapheme(
 }
 
 void TerminalGrid::append_zero_width_to_previous_cell(std::string_view glyph) {
-  auto& buffer = active_buffer();
   int row = cursor_row_;
   int column = pending_wrap_ ? columns_ - 1 : cursor_column_ - 1;
   if (column < 0 && cursor_row_ > 0) {
@@ -478,20 +871,26 @@ void TerminalGrid::append_zero_width_to_previous_cell(std::string_view glyph) {
   for (; row >= 0; --row, column = columns_ - 1) {
     for (; column >= 0; --column) {
       const int leading = leading_column_for(row, column);
-      auto& cell = buffer[offset(row, leading)];
+      auto& cell = cell_at(row, leading);
       if (cell.width == TerminalCellWidth::WideContinuation) {
         continue;
       }
-      if (!cell.glyph.empty() && cell.glyph != " ") {
-        cell.glyph.append(glyph);
-        if (terminal_grapheme_width(cell.glyph) == 2 &&
+      if (!cell.extended.empty() || cell.codepoint != U' ') {
+        if (cell.extended.empty()) {
+          cell.extended = cell_glyph(cell);
+        }
+        cell.extended.append(glyph);
+        ++line_at(row).generation;
+        mark_dirty_row(row);
+        if (terminal_grapheme_width(cell.extended) == 2 &&
             cell.width == TerminalCellWidth::Narrow &&
             leading + 1 < columns_) {
           const auto attributes = cell.attributes;
           clear_cell_at(row, leading + 1);
-          buffer[offset(row, leading)].width = TerminalCellWidth::WideLeading;
-          buffer[offset(row, leading + 1)] =
-              TerminalCell{"", attributes, TerminalCellWidth::WideContinuation};
+          cell_at(row, leading).width = TerminalCellWidth::WideLeading;
+          cell_at(row, leading + 1) =
+              TerminalCell{U' ', {}, attributes, TerminalCellWidth::WideContinuation};
+          ++line_at(row).generation;
           if (row == cursor_row_ && cursor_column_ == leading + 1) {
             if (leading + 2 < columns_) {
               cursor_column_ = leading + 2;
@@ -555,36 +954,25 @@ void TerminalGrid::scroll_up_region(int top, int bottom, int count) {
     return;
   }
 
-  auto& buffer = active_buffer();
-  auto& wrapped_lines = active_wrapped_lines();
-  const auto columns = static_cast<std::size_t>(columns_);
+  count = std::min(count, bottom - top + 1);
+  auto& lines = active_lines();
   for (int step = 0; step < count; ++step) {
     if (!alternate_screen_ && top == 0 && bottom == rows_ - 1) {
-      const bool wrapped = !wrapped_lines.empty() && wrapped_lines.front();
-      append_scrollback_line(row_cells(buffer, 0), wrapped);
+      append_scrollback_row(lines[0]);
     }
 
     if (top == bottom) {
-      std::fill(
-          buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_),
-          buffer.begin() + static_cast<std::ptrdiff_t>((top + 1) * columns_),
-          blank_cell());
-      wrapped_lines[static_cast<std::size_t>(top)] = false;
+      reset_line(lines[static_cast<std::size_t>(top)]);
       continue;
     }
 
-    auto first = buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_);
-    auto second = first + static_cast<std::ptrdiff_t>(columns);
-    auto last = buffer.begin() + static_cast<std::ptrdiff_t>((bottom + 1) * columns_);
-    std::move(second, last, first);
-    std::fill(last - static_cast<std::ptrdiff_t>(columns), last, blank_cell());
-
-    std::move(
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top + 1),
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1),
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top));
-    wrapped_lines[static_cast<std::size_t>(bottom)] = false;
+    auto first = lines.begin() + static_cast<std::ptrdiff_t>(top);
+    auto second = first + 1;
+    auto last = lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1);
+    std::rotate(first, second, last);
+    reset_line(lines[static_cast<std::size_t>(bottom)]);
   }
+  mark_full_pane_dirty();
 }
 
 void TerminalGrid::scroll_down_region(int top, int bottom, int count) {
@@ -592,53 +980,29 @@ void TerminalGrid::scroll_down_region(int top, int bottom, int count) {
     return;
   }
 
-  auto& buffer = active_buffer();
-  auto& wrapped_lines = active_wrapped_lines();
-  const auto columns = static_cast<std::size_t>(columns_);
+  count = std::min(count, bottom - top + 1);
+  auto& lines = active_lines();
   for (int step = 0; step < count; ++step) {
     if (top == bottom) {
-      std::fill(
-          buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_),
-          buffer.begin() + static_cast<std::ptrdiff_t>((top + 1) * columns_),
-          blank_cell());
-      wrapped_lines[static_cast<std::size_t>(top)] = false;
+      reset_line(lines[static_cast<std::size_t>(top)]);
       continue;
     }
 
-    auto first = buffer.begin() + static_cast<std::ptrdiff_t>(top * columns_);
-    auto last = buffer.begin() + static_cast<std::ptrdiff_t>((bottom + 1) * columns_);
-    std::move_backward(
-        first,
-        last - static_cast<std::ptrdiff_t>(columns),
-        last);
-    std::fill(first, first + static_cast<std::ptrdiff_t>(columns), blank_cell());
-
-    std::move_backward(
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(top),
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom),
-        wrapped_lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1));
-    wrapped_lines[static_cast<std::size_t>(top)] = false;
+    auto first = lines.begin() + static_cast<std::ptrdiff_t>(top);
+    auto before_last = lines.begin() + static_cast<std::ptrdiff_t>(bottom);
+    auto last = lines.begin() + static_cast<std::ptrdiff_t>(bottom + 1);
+    std::rotate(first, before_last, last);
+    reset_line(lines[static_cast<std::size_t>(top)]);
   }
+  mark_full_pane_dirty();
 }
 
-void TerminalGrid::append_scrollback_line(std::vector<TerminalCell> line, bool wrapped) {
+void TerminalGrid::append_scrollback_row(const TerminalLine& line) {
   if (scrollback_capacity_ == 0) {
     return;
   }
 
-  TerminalLineSnapshot snapshot;
-  snapshot.text = row_text(line);
-  snapshot.wrapped = wrapped;
-  snapshot.attributes.reserve(line.size());
-  snapshot.cells.reserve(line.size());
-  snapshot.cell_widths.reserve(line.size());
-  for (const auto& cell : line) {
-    snapshot.attributes.push_back(cell.attributes);
-    snapshot.cells.push_back(
-        cell.width == TerminalCellWidth::WideContinuation ? std::string{} : cell.glyph);
-    snapshot.cell_widths.push_back(cell.width);
-  }
-  scrollback_.push_back(std::move(snapshot));
+  scrollback_.push_back(line);
   while (scrollback_.size() > scrollback_capacity_) {
     scrollback_.pop_front();
   }
@@ -649,8 +1013,10 @@ void TerminalGrid::clear_scrollback() {
 }
 
 void TerminalGrid::clear_all() {
-  std::fill(active_buffer().begin(), active_buffer().end(), blank_cell());
-  std::fill(active_wrapped_lines().begin(), active_wrapped_lines().end(), false);
+  for (auto& line : active_lines()) {
+    reset_line(line);
+  }
+  mark_all_dirty();
 }
 
 void TerminalGrid::clear_line(int mode) {
@@ -666,12 +1032,13 @@ void TerminalGrid::clear_line(int mode) {
     clear_cell_at(cursor_row_, column);
   }
   if (mode == 2 || last == columns_ - 1) {
-    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+    line_at(cursor_row_).wrapped = false;
+    ++line_at(cursor_row_).generation;
+    mark_dirty_row(cursor_row_);
   }
 }
 
 void TerminalGrid::clear_screen(int mode) {
-  auto& wrapped_lines = active_wrapped_lines();
   if (mode == 2 || mode == 3) {
     if (mode == 3 && !alternate_screen_) {
       clear_scrollback();
@@ -685,27 +1052,33 @@ void TerminalGrid::clear_screen(int mode) {
       for (int column = 0; column < columns_; ++column) {
         clear_cell_at(row, column);
       }
-      wrapped_lines[static_cast<std::size_t>(row)] = false;
+      line_at(row).wrapped = false;
+      ++line_at(row).generation;
     }
     for (int column = 0; column <= cursor_column_; ++column) {
       clear_cell_at(cursor_row_, column);
     }
     if (cursor_column_ == columns_ - 1) {
-      wrapped_lines[static_cast<std::size_t>(cursor_row_)] = false;
+      line_at(cursor_row_).wrapped = false;
+      ++line_at(cursor_row_).generation;
     }
+    mark_full_pane_dirty();
     return;
   }
 
   for (int column = cursor_column_; column < columns_; ++column) {
     clear_cell_at(cursor_row_, column);
   }
-  wrapped_lines[static_cast<std::size_t>(cursor_row_)] = false;
+  line_at(cursor_row_).wrapped = false;
+  ++line_at(cursor_row_).generation;
   for (int row = cursor_row_ + 1; row < rows_; ++row) {
     for (int column = 0; column < columns_; ++column) {
       clear_cell_at(row, column);
     }
-    wrapped_lines[static_cast<std::size_t>(row)] = false;
+    line_at(row).wrapped = false;
+    ++line_at(row).generation;
   }
+  mark_full_pane_dirty();
 }
 
 void TerminalGrid::erase_characters(int count) {
@@ -715,34 +1088,42 @@ void TerminalGrid::erase_characters(int count) {
     clear_cell_at(cursor_row_, column);
   }
   if (last == columns_ - 1) {
-    active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+    line_at(cursor_row_).wrapped = false;
+    ++line_at(cursor_row_).generation;
+    mark_dirty_row(cursor_row_);
   }
 }
 
 void TerminalGrid::insert_characters(int count) {
   count = std::min(std::max(1, count), columns_ - cursor_column_);
-  auto& buffer = active_buffer();
+  auto& line = line_at(cursor_row_);
   for (int column = columns_ - 1; column >= cursor_column_ + count; --column) {
-    buffer[offset(cursor_row_, column)] = buffer[offset(cursor_row_, column - count)];
+    line.cells[static_cast<std::size_t>(column)] =
+        line.cells[static_cast<std::size_t>(column - count)];
   }
   for (int column = cursor_column_; column < cursor_column_ + count; ++column) {
-    buffer[offset(cursor_row_, column)] = blank_cell();
+    line.cells[static_cast<std::size_t>(column)] = blank_cell();
   }
-  repair_wide_cells_in_row(buffer, cursor_row_);
-  active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+  repair_wide_cells_in_row(line);
+  line.wrapped = false;
+  ++line.generation;
+  mark_dirty_row(cursor_row_);
 }
 
 void TerminalGrid::delete_characters(int count) {
   count = std::min(std::max(1, count), columns_ - cursor_column_);
-  auto& buffer = active_buffer();
+  auto& line = line_at(cursor_row_);
   for (int column = cursor_column_; column + count < columns_; ++column) {
-    buffer[offset(cursor_row_, column)] = buffer[offset(cursor_row_, column + count)];
+    line.cells[static_cast<std::size_t>(column)] =
+        line.cells[static_cast<std::size_t>(column + count)];
   }
   for (int column = columns_ - count; column < columns_; ++column) {
-    buffer[offset(cursor_row_, column)] = blank_cell();
+    line.cells[static_cast<std::size_t>(column)] = blank_cell();
   }
-  repair_wide_cells_in_row(buffer, cursor_row_);
-  active_wrapped_lines()[static_cast<std::size_t>(cursor_row_)] = false;
+  repair_wide_cells_in_row(line);
+  line.wrapped = false;
+  ++line.generation;
+  mark_dirty_row(cursor_row_);
 }
 
 void TerminalGrid::move_cursor(int row, int column) {
@@ -767,16 +1148,14 @@ void TerminalGrid::move_cursor_relative(int row_delta, int column_delta) {
   pending_wrap_ = false;
   cursor_row_ = std::clamp(cursor_row_ + row_delta, 0, rows_ - 1);
   cursor_column_ = std::clamp(cursor_column_ + column_delta, 0, columns_ - 1);
-  if (active_buffer()[offset(cursor_row_, cursor_column_)].width ==
-      TerminalCellWidth::WideContinuation) {
+  if (cell_at(cursor_row_, cursor_column_).width == TerminalCellWidth::WideContinuation) {
     if (column_delta > 0) {
       while (cursor_column_ + 1 < columns_ &&
-             active_buffer()[offset(cursor_row_, cursor_column_)].width ==
+             cell_at(cursor_row_, cursor_column_).width ==
                  TerminalCellWidth::WideContinuation) {
         ++cursor_column_;
       }
-      if (active_buffer()[offset(cursor_row_, cursor_column_)].width ==
-          TerminalCellWidth::WideContinuation) {
+      if (cell_at(cursor_row_, cursor_column_).width == TerminalCellWidth::WideContinuation) {
         cursor_column_ = leading_column_for(cursor_row_, cursor_column_);
       }
     } else {
@@ -878,6 +1257,7 @@ void TerminalGrid::apply_escape(char final_byte) {
       origin_mode_ = false;
       wrap_mode_ = true;
       bracketed_paste_mode_ = false;
+      mark_all_dirty();
       break;
     default:
       record_unknown_sequence(
@@ -1143,11 +1523,13 @@ void TerminalGrid::set_alternate_screen(bool enabled) {
     clear_all();
   } else {
     move_cursor(normal_cursor_row_before_alternate_, normal_cursor_column_before_alternate_);
+    mark_all_dirty();
   }
 }
 
 void TerminalGrid::record_unknown_sequence(const TerminalVtUnknownOperation& unknown) {
   ++unknown_sequence_count_;
+  mark_full_pane_dirty();
   if (logged_unknown_sequence_count_ >= kMaxLoggedUnknownSequences) {
     return;
   }

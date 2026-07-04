@@ -29,12 +29,14 @@ struct RenderPane {
 
 struct ActiveWindowFrame {
   WindowId window_id{0};
+  std::uint64_t layout_generation{0};
   PaneId active_pane_id{0};
   std::string session_name;
   std::string window_name;
   std::size_t window_index{0};
   int columns{120};
   int rows{30};
+  int pane_rows{0};
   bool status_bar_enabled{true};
   std::vector<RenderPane> panes;
 };
@@ -50,7 +52,23 @@ struct RenderFrameOptions {
   bool clear_terminal{true};
   bool draw_borders{true};
   bool draw_status{true};
+  bool draw_pane_bodies{true};
   std::unordered_set<PaneId> dirty_panes;
+  bool force_body_repaint{false};
+  bool preserve_layout_cache{false};
+  bool repaint_body_on_geometry_change{false};
+};
+
+struct RenderFrameStats {
+  std::size_t visible_pane_rows{0};
+  std::size_t rows_considered{0};
+  std::size_t rows_emitted{0};
+  std::size_t rows_skipped_generation_cache{0};
+  std::size_t rows_skipped_empty_default{0};
+  std::size_t body_bytes_emitted{0};
+  std::size_t border_status_bytes_emitted{0};
+  std::size_t cursor_bytes_emitted{0};
+  std::size_t alternate_screen_panes{0};
 };
 
 struct RenderDiffCell {
@@ -60,6 +78,76 @@ struct RenderDiffCell {
   bool accent_overlay{false};
 };
 
+enum class SceneRowKind {
+  PaneBody,
+  Border,
+  Status,
+  Overlay,
+  EmptyOutside,
+};
+
+struct SceneSpan {
+  int column{0};
+  std::vector<RenderDiffCell> cells;
+};
+
+struct SceneRow {
+  SceneRowKind kind{SceneRowKind::PaneBody};
+  PaneId pane_id{0};
+  int row{0};
+  int column{0};
+  int width{0};
+  std::vector<SceneSpan> spans;
+};
+
+struct SceneCursor {
+  bool known{false};
+  bool visible{false};
+  PaneId pane_id{0};
+  int row{0};
+  int column{0};
+  int style{0};
+};
+
+struct ScenePane {
+  PaneId pane_id{0};
+  PaneLayoutRect rect;
+  bool active{false};
+  int body_left{0};
+  int body_top{0};
+  int body_width{0};
+  int body_height{0};
+  std::size_t first_visible_line{0};
+  std::size_t viewport_offset{0};
+  bool alternate_screen{false};
+  std::vector<SceneRow> body_rows;
+};
+
+struct SceneBorder {
+  std::vector<SceneRow> rows;
+};
+
+struct SceneStatus {
+  bool visible{false};
+  int row{0};
+  std::string text;
+  std::vector<SceneRow> rows;
+};
+
+struct VisibleScene {
+  WindowId window_id{0};
+  std::uint64_t layout_generation{0};
+  PaneId active_pane_id{0};
+  int columns{0};
+  int rows{0};
+  bool status_bar_enabled{true};
+  std::vector<ScenePane> panes;
+  SceneBorder borders;
+  SceneStatus status;
+  SceneCursor cursor;
+  std::vector<SceneRow> empty_rows;
+};
+
 struct RenderDiffRow {
   int row{0};
   int column{0};
@@ -67,27 +155,43 @@ struct RenderDiffRow {
   std::vector<RenderDiffCell> cells;
 };
 
+struct EncodedRowCache {
+  std::uint64_t generation{0};
+  std::uint64_t style_generation{0};
+  int width{0};
+  std::string encoded;
+};
+
 struct RenderDiffPane {
   PaneLayoutRect rect;
   std::size_t first_visible_line{0};
   std::size_t viewport_offset{0};
   std::vector<RenderDiffRow> body_rows;
+  std::vector<EncodedRowCache> encoded_rows;
 };
 
-struct RenderDiffState {
+struct ClientPhysicalBaseline {
+  WindowId window_id{0};
+  std::uint64_t layout_generation{0};
   int columns{0};
   int rows{0};
   bool status_bar_enabled{true};
+  bool baseline_valid{false};
   bool initialized{false};
+  bool scene_valid{false};
+  VisibleScene scene;
   std::unordered_map<PaneId, RenderDiffPane> panes;
   std::string status_line;
 };
+
+using RenderDiffState = ClientPhysicalBaseline;
 
 struct RenderStatus {
   StatusState state;
   StatusLineMode mode{StatusLineMode::Normal};
   bool mouse_enabled{false};
   bool mouse_drag_active{false};
+  bool synchronized_output_supported{false};
   UiTheme ui;
 };
 
@@ -107,6 +211,8 @@ struct CopyModeState {
 
 int body_width(const PaneLayoutRect& rect);
 int body_height(const PaneLayoutRect& rect);
+int body_width(const PaneLayoutRect& rect, int frame_columns);
+int body_height(const PaneLayoutRect& rect, int frame_rows);
 
 std::string render_frame(
     const ActiveWindowFrame& frame,
@@ -147,6 +253,16 @@ std::string render_frame_update(
     const RenderFrameOptions& options,
     RenderDiffState& diff_state);
 
+std::string render_live_frame_update(
+    const ActiveWindowFrame& frame,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status,
+    const RenderFrameOptions& options,
+    RenderDiffState& diff_state,
+    std::unordered_map<PaneId, std::uint64_t>& next_sequences,
+    RenderFrameStats* stats = nullptr);
+
 void reset_render_diff_state(RenderDiffState& diff_state);
 
 void update_viewport_states(
@@ -173,5 +289,12 @@ bool apply_copy_mode_action(
     CopyModeState& copy_mode,
     AttachCopyModeAction action,
     std::string& copied_text);
+
+VisibleScene build_visible_scene(
+    const ActiveWindowFrame& frame,
+    const std::unordered_map<PaneId, PtyOutputSnapshot>& snapshots,
+    const PaneViewportStates& viewport_states,
+    const CopyModeState& copy_mode,
+    const RenderStatus& status);
 
 }  // namespace wmux::daemon_internal

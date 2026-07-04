@@ -2,6 +2,9 @@
 
 #include "wmux/resource_limits.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -20,6 +23,37 @@ std::ofstream g_log_file;
 LogRole g_role = LogRole::Client;
 bool g_initialized = false;
 std::size_t g_max_file_bytes = kMaxLogFileBytes;
+std::atomic<int> g_min_log_level{1};
+
+int level_rank(LogLevel level) {
+  switch (level) {
+    case LogLevel::Debug:
+      return 0;
+    case LogLevel::Info:
+      return 1;
+    case LogLevel::Warn:
+      return 2;
+    case LogLevel::Error:
+      return 3;
+  }
+
+  return 1;
+}
+
+LogLevel level_from_rank(int rank) {
+  switch (rank) {
+    case 0:
+      return LogLevel::Debug;
+    case 1:
+      return LogLevel::Info;
+    case 2:
+      return LogLevel::Warn;
+    case 3:
+      return LogLevel::Error;
+    default:
+      return LogLevel::Info;
+  }
+}
 
 std::string role_name(LogRole role) {
   switch (role) {
@@ -68,7 +102,49 @@ std::string environment_variable(std::string_view name) {
   std::free(value);
   return result;
 }
+#else
+std::string environment_variable(std::string_view name) {
+  const auto* value = std::getenv(std::string{name}.c_str());
+  return value == nullptr ? std::string{} : std::string{value};
+}
 #endif
+
+bool parse_log_level(std::string_view value, LogLevel& out) {
+  std::string normalized{value};
+  std::ranges::transform(normalized, normalized.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+
+  if (normalized == "debug" || normalized == "trace") {
+    out = LogLevel::Debug;
+    return true;
+  }
+  if (normalized == "info") {
+    out = LogLevel::Info;
+    return true;
+  }
+  if (normalized == "warn" || normalized == "warning") {
+    out = LogLevel::Warn;
+    return true;
+  }
+  if (normalized == "error") {
+    out = LogLevel::Error;
+    return true;
+  }
+  return false;
+}
+
+void configure_log_level_from_environment() {
+  const auto configured = environment_variable("WMUX_LOG_LEVEL");
+  if (configured.empty()) {
+    return;
+  }
+
+  LogLevel level = LogLevel::Info;
+  if (parse_log_level(configured, level)) {
+    g_min_log_level.store(level_rank(level), std::memory_order_relaxed);
+  }
+}
 
 std::string timestamp() {
   const auto now = std::chrono::system_clock::now();
@@ -164,6 +240,7 @@ void rotate_log_file_locked(LogRole role, std::size_t pending_bytes) {
 void initialize_logging(LogRole role) {
   std::lock_guard lock(g_log_mutex);
   g_role = role;
+  configure_log_level_from_environment();
   if (!g_initialized || !g_log_file.is_open()) {
     open_log_file_locked(role);
   }
@@ -185,6 +262,18 @@ void configure_logging(std::size_t max_file_bytes) {
   if (g_initialized) {
     rotate_log_file_locked(g_role, 0);
   }
+}
+
+void set_log_level(LogLevel level) {
+  g_min_log_level.store(level_rank(level), std::memory_order_relaxed);
+}
+
+LogLevel current_log_level() {
+  return level_from_rank(g_min_log_level.load(std::memory_order_relaxed));
+}
+
+bool should_log(LogLevel level) {
+  return level_rank(level) >= g_min_log_level.load(std::memory_order_relaxed);
 }
 
 std::filesystem::path log_directory() {
@@ -211,6 +300,10 @@ void log_event(
     std::string_view component,
     std::string_view event,
     std::initializer_list<LogField> fields) {
+  if (!should_log(level)) {
+    return;
+  }
+
   std::lock_guard lock(g_log_mutex);
   if (!g_initialized) {
     open_log_file_locked(g_role);
@@ -240,7 +333,9 @@ void log_event(
   }
 
   g_log_file << text;
-  g_log_file.flush();
+  if (level == LogLevel::Warn || level == LogLevel::Error) {
+    g_log_file.flush();
+  }
 }
 
 }  // namespace wmux

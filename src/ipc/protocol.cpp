@@ -638,7 +638,8 @@ std::string make_command_request_json(const CommandLine& command) {
 std::string make_attach_request_json(
     const CommandLine& command,
     std::uint16_t terminal_columns,
-    std::uint16_t terminal_rows) {
+    std::uint16_t terminal_rows,
+    const TerminalCapabilities& terminal_capabilities) {
   std::ostringstream out;
   out << "{\"type\":\"AttachStart\"";
 
@@ -649,6 +650,24 @@ std::string make_attach_request_json(
     append_json_uint(out, "terminal_columns", terminal_columns);
     append_json_uint(out, "terminal_rows", terminal_rows);
   }
+  append_json_field(out, "terminal_host", terminal_host_name(terminal_capabilities.host));
+  append_json_bool(out, "terminal_truecolor", terminal_capabilities.supports_truecolor);
+  append_json_bool(out, "terminal_256_color", terminal_capabilities.supports_256_color);
+  append_json_bool(out, "terminal_sgr_mouse", terminal_capabilities.supports_sgr_mouse);
+  append_json_bool(out, "terminal_mouse_drag", terminal_capabilities.supports_mouse_drag);
+  append_json_bool(out, "terminal_mouse_wheel", terminal_capabilities.supports_mouse_wheel);
+  append_json_bool(
+      out, "terminal_bracketed_paste", terminal_capabilities.supports_bracketed_paste);
+  append_json_bool(out, "terminal_focus_events", terminal_capabilities.supports_focus_events);
+  append_json_bool(out, "terminal_cursor_style", terminal_capabilities.supports_cursor_style);
+  append_json_bool(out, "terminal_alt_screen", terminal_capabilities.supports_alt_screen);
+  append_json_bool(out, "terminal_extended_keys", terminal_capabilities.supports_extended_keys);
+  append_json_bool(
+      out, "terminal_osc52_clipboard", terminal_capabilities.supports_osc52_clipboard);
+  append_json_bool(
+      out,
+      "terminal_synchronized_output",
+      terminal_capabilities.supports_synchronized_output);
 
   out << "}\n";
   return out.str();
@@ -731,6 +750,41 @@ std::optional<IpcRequest> parse_request_json(std::string_view json) {
   if (const auto terminal_rows = find_json_uint(json, "terminal_rows")) {
     request.terminal_rows = *terminal_rows;
   }
+  if (const auto terminal_host = find_json_string(json, "terminal_host")) {
+    request.terminal_capabilities_provided = true;
+    request.terminal_capabilities.host =
+        parse_terminal_host(*terminal_host).value_or(TerminalHost::Unknown);
+  }
+  const auto apply_terminal_bool = [&](std::string_view field, bool& target) {
+    if (const auto value = find_json_bool(json, field)) {
+      request.terminal_capabilities_provided = true;
+      target = *value;
+    }
+  };
+  apply_terminal_bool("terminal_truecolor", request.terminal_capabilities.supports_truecolor);
+  apply_terminal_bool("terminal_256_color", request.terminal_capabilities.supports_256_color);
+  apply_terminal_bool("terminal_sgr_mouse", request.terminal_capabilities.supports_sgr_mouse);
+  apply_terminal_bool("terminal_mouse_drag", request.terminal_capabilities.supports_mouse_drag);
+  apply_terminal_bool("terminal_mouse_wheel", request.terminal_capabilities.supports_mouse_wheel);
+  apply_terminal_bool(
+      "terminal_bracketed_paste",
+      request.terminal_capabilities.supports_bracketed_paste);
+  apply_terminal_bool(
+      "terminal_focus_events",
+      request.terminal_capabilities.supports_focus_events);
+  apply_terminal_bool(
+      "terminal_cursor_style",
+      request.terminal_capabilities.supports_cursor_style);
+  apply_terminal_bool("terminal_alt_screen", request.terminal_capabilities.supports_alt_screen);
+  apply_terminal_bool(
+      "terminal_extended_keys",
+      request.terminal_capabilities.supports_extended_keys);
+  apply_terminal_bool(
+      "terminal_osc52_clipboard",
+      request.terminal_capabilities.supports_osc52_clipboard);
+  apply_terminal_bool(
+      "terminal_synchronized_output",
+      request.terminal_capabilities.supports_synchronized_output);
 
   return request;
 }

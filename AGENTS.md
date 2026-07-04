@@ -22,6 +22,78 @@ attached clients
 
 Clients render, collect input, and send typed messages.
 
+## Redraw Work Freeze
+
+Do not continue fixing renderer symptoms with isolated tweaks. TerminalEngineV2
+can stay, but further work on the Codex/Claude UI box, scroll jank, resize
+refresh, split/close refresh, or attach inconsistency must be done through the
+tmux-style client-scene redraw model.
+
+Before changing redraw behavior, verify which invariant the change implements.
+If the change cannot be described as one of the invariants below, do not make
+it.
+
+Permitted while the redraw model is being rebuilt:
+
+```text
+documentation
+diagnostics and traces
+tests and captured fixtures
+small correctness fixes tied to an explicit invariant
+```
+
+Forbidden as standalone fixes:
+
+```text
+Codex/Claude/application-specific rendering branches
+raw PTY replay to repair a client screen
+host-terminal scroll operations as a substitute for rendering from grid state
+global render-cache assumptions for a newly attached client
+advancing render baselines for skipped/failed/coalesced frames
+separate clear/body/cursor writes that can visibly present partial frames
+```
+
+## Tmux-Style Redraw Invariants
+
+wmux must match tmux's redraw architecture at the invariant level:
+
+```text
+The daemon's pane screen/grid is authoritative.
+PTY output mutates server-side pane terminal state.
+Clients never reconstruct screen contents by replaying raw pane history.
+Each client owns a separate physical-terminal baseline.
+New attach, resize, layout change, reattach, and window switch render the
+current scene from the authoritative model.
+Client-scoped caches may only suppress output when that exact client baseline
+is known valid.
+Cache/baseline updates happen only after the frame write succeeds.
+Dropped, skipped, coalesced, or failed writes do not update baseline state.
+Styled blanks, cursor state, terminal modes, borders, status, overlays, and
+alternate-screen contents are part of the scene.
+```
+
+A correct redraw flow is:
+
+```text
+daemon/window/pane model
+-> current client-visible scene
+-> optional diff against that client's committed baseline
+-> single ordered frame
+-> successful client write
+-> commit new baseline
+```
+
+An incorrect redraw flow is:
+
+```text
+raw output backlog
+-> replay/skip/coalesce history
+-> guess what the client should see
+```
+
+When in doubt, prefer a coherent current-scene materialization over a partial
+update. Performance optimizations must preserve this baseline contract.
+
 ## Platform Boundary
 
 wmux is Windows-first, not Windows-entangled. Core multiplexer logic must model
@@ -108,6 +180,49 @@ wmux                   executable entry point
 Add new files to the narrowest correct target. Do not paste implementation
 sources directly into `wmux` or `wmux_tests` when they already belong to one of
 the libraries.
+
+Terminal-engine work is core work. The intended long-term source layout is:
+
+```text
+src/platform/
+  windows_pty_process.cpp
+  unix_pty_process.cpp       future backend
+src/core/
+  terminal_engine_legacy.cpp
+  terminal_engine_v2.cpp
+  vt_parser_v2.cpp
+  screen_writer_v2.cpp
+  grid_core_v2.cpp
+src/daemon/
+  sessions, windows, panes, layout, render scheduling
+src/client/
+  attach UI and input
+```
+
+Forbidden in terminal engine, parser, grid, and render-core code:
+
+```text
+Win32 console hacks
+ConPTY assumptions
+Windows handles
+raw PTY replay as the rendering model
+```
+
+Allowed inside the platform-neutral terminal engine:
+
+```text
+packed cells
+line pools
+style interning
+VT parser replacement
+screen-writer / print-run collection
+render-view replacement
+queue-friendly ingestion APIs
+```
+
+Keep the robust legacy engine available as a fallback while V2 is opt-in and
+measured. Do not trade correctness for speed by weakening damage invalidation,
+scrollback rules, copy-mode semantics, or platform boundaries.
 
 ## Core Model
 
@@ -245,6 +360,12 @@ No layout rectangles as source of truth.
 No process-kill path without explicit cleanup ownership.
 No process waits, pipe writes, or PTY teardown while holding daemon state locks.
 ```
+
+Host-terminal scroll-region optimization is disabled while the V2 terminal
+engine is being built. Child PTY scrolls must mutate the authoritative terminal
+grid and force pane/window damage as needed; do not emit host-terminal scroll
+commands or move render-cache rows from child scroll events until the engine
+and line-view renderer are fast and covered by focused corruption tests.
 
 Pane processes are owned through `PtyProcess`. `PtyProcess::terminate()` is
 idempotent and must be called after the shell has been removed from daemon

@@ -2,6 +2,7 @@
 
 #include "wmux/commands.hpp"
 #include "wmux/resource_limits.hpp"
+#include "wmux/terminal_capabilities.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -25,6 +26,8 @@ struct IpcRequest {
   std::string key_action;
   std::uint16_t terminal_columns{0};
   std::uint16_t terminal_rows{0};
+  bool terminal_capabilities_provided{false};
+  TerminalCapabilities terminal_capabilities;
   bool force{false};
 };
 
@@ -163,7 +166,8 @@ std::string make_command_request_json(const CommandLine& command);
 std::string make_attach_request_json(
     const CommandLine& command,
     std::uint16_t terminal_columns,
-    std::uint16_t terminal_rows);
+    std::uint16_t terminal_rows,
+    const TerminalCapabilities& terminal_capabilities);
 std::optional<IpcRequest> parse_request_json(std::string_view json);
 std::string make_response_json(bool ok, std::string_view message);
 std::string make_response_json(bool ok, std::string_view message, bool mouse_enabled);

@@ -2,14 +2,18 @@
 
 #include "wmux/logging.hpp"
 #include "wmux/resource_limits.hpp"
+#include "wmux/terminal_engine.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,6 +32,55 @@ namespace wmux {
 namespace {
 
 #ifdef _WIN32
+
+constexpr std::size_t kConPtyReadBufferBytes = 64 * 1024;
+constexpr std::size_t kPtyIngestBatchTargetBytes = 128 * 1024;
+constexpr auto kPtyIngestCoalesceWindow = std::chrono::milliseconds{1};
+
+std::uint64_t elapsed_microseconds(std::chrono::steady_clock::time_point started_at) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - started_at)
+          .count());
+}
+
+void update_peak(std::atomic<std::uint64_t>& peak, std::uint64_t value) {
+  auto observed = peak.load(std::memory_order_relaxed);
+  while (value > observed &&
+         !peak.compare_exchange_weak(
+             observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+  }
+}
+
+std::string environment_value(const char* name) {
+#if defined(_MSC_VER)
+  char* raw = nullptr;
+  std::size_t size = 0;
+  if (_dupenv_s(&raw, &size, name) != 0 || raw == nullptr) {
+    return {};
+  }
+  std::string value{raw};
+  std::free(raw);
+  return value;
+#else
+  if (const char* raw = std::getenv(name)) {
+    return raw;
+  }
+  return {};
+#endif
+}
+
+std::size_t environment_size(const char* name, std::size_t fallback) {
+  const auto value = environment_value(name);
+  if (value.empty()) {
+    return fallback;
+  }
+  try {
+    return std::max<std::size_t>(1, static_cast<std::size_t>(std::stoull(value)));
+  } catch (...) {
+    return fallback;
+  }
+}
 
 class UniqueHandle {
  public:
@@ -207,6 +260,10 @@ struct StoredOutputChunk {
   std::string bytes;
 };
 
+struct PendingOutputChunk {
+  std::string bytes;
+};
+
 #ifdef _WIN32
 struct ChildProcessEntry {
   DWORD process_id{0};
@@ -354,63 +411,295 @@ struct PtyProcess::Impl {
   mutable std::mutex output_mutex;
   mutable std::condition_variable output_cv;
   std::deque<StoredOutputChunk> output_chunks;
-  TerminalGrid screen;
+  mutable std::mutex screen_mutex;
+  std::unique_ptr<ITerminalEngine> screen{make_terminal_engine()};
   std::size_t max_raw_output_bytes{kMaxPaneRawOutputBytes};
   std::uint64_t next_sequence{1};
   std::uint64_t dropped_raw_chunks{0};
   std::size_t buffered_bytes{0};
   bool reader_done{false};
+  std::mutex ingest_mutex;
+  std::condition_variable ingest_cv;
+  std::deque<PendingOutputChunk> ingest_queue;
+  std::size_t ingest_pending_bytes{0};
+  std::mutex capture_mutex;
+  std::ofstream capture_stream;
+  std::string capture_path{environment_value("WMUX_PTY_CAPTURE_FILE")};
+  std::size_t capture_max_bytes{
+      environment_size("WMUX_PTY_CAPTURE_MAX_BYTES", 256u * 1024u * 1024u)};
+  std::size_t capture_written_bytes{0};
+  bool capture_open_failed{false};
+  bool capture_logged{false};
+  bool reader_eof{false};
+  std::atomic<std::uint64_t> output_read_chunks{0};
+  std::atomic<std::uint64_t> output_read_bytes{0};
+  std::atomic<std::uint64_t> output_feed_duration_us{0};
+  std::atomic<std::uint64_t> max_output_feed_duration_us{0};
+  std::atomic<std::uint64_t> output_lock_wait_duration_us{0};
+  std::atomic<std::uint64_t> max_output_lock_wait_duration_us{0};
+  std::atomic<std::uint64_t> output_grid_feed_duration_us{0};
+  std::atomic<std::uint64_t> max_output_grid_feed_duration_us{0};
+  std::atomic<std::uint64_t> output_buffer_duration_us{0};
+  std::atomic<std::uint64_t> max_output_buffer_duration_us{0};
 
   mutable std::mutex write_mutex;
   mutable std::mutex console_mutex;
   std::thread reader_thread;
+  std::thread ingest_thread;
   std::atomic_bool terminating{false};
 
   ~Impl() {
     terminate();
   }
 
-  void append_output(std::string bytes) {
+  void enqueue_output(std::string bytes) {
     if (bytes.empty()) {
       return;
     }
 
-    std::lock_guard lock(output_mutex);
-    screen.feed(bytes);
-    buffered_bytes += bytes.size();
-    output_chunks.push_back(StoredOutputChunk{next_sequence++, std::move(bytes)});
+    {
+      std::unique_lock lock(ingest_mutex);
+      const auto max_pending_bytes = std::max<std::size_t>(max_raw_output_bytes, bytes.size());
+      ingest_cv.wait(lock, [&] {
+        return terminating.load(std::memory_order_acquire) ||
+               ingest_pending_bytes + bytes.size() <= max_pending_bytes;
+      });
+      if (terminating.load(std::memory_order_acquire)) {
+        return;
+      }
+      ingest_pending_bytes += bytes.size();
+      ingest_queue.push_back(PendingOutputChunk{std::move(bytes)});
+    }
+    ingest_cv.notify_one();
+  }
 
-    while (buffered_bytes > max_raw_output_bytes && !output_chunks.empty()) {
-      buffered_bytes -= output_chunks.front().bytes.size();
-      output_chunks.pop_front();
-      ++dropped_raw_chunks;
+  void mark_reader_eof() {
+    {
+      std::lock_guard lock(ingest_mutex);
+      reader_eof = true;
+    }
+    ingest_cv.notify_all();
+  }
+
+  void ingest_output(std::string bytes) {
+    if (bytes.empty()) {
+      return;
     }
 
+    const auto byte_count = bytes.size();
+    const auto feed_started_at = std::chrono::steady_clock::now();
+    std::uint64_t lock_wait_micros = 0;
+
+    capture_output(bytes);
+
+    const auto grid_feed_started_at = std::chrono::steady_clock::now();
+    {
+      const auto lock_wait_started_at = std::chrono::steady_clock::now();
+      std::lock_guard lock(screen_mutex);
+      lock_wait_micros = elapsed_microseconds(lock_wait_started_at);
+      const auto* data = reinterpret_cast<const std::byte*>(bytes.data());
+      screen->feed(std::span<const std::byte>{data, bytes.size()});
+    }
+    const auto grid_feed_micros = elapsed_microseconds(grid_feed_started_at);
+
+    const auto buffer_started_at = std::chrono::steady_clock::now();
+    {
+      std::unique_lock lock(output_mutex);
+      buffered_bytes += byte_count;
+      output_chunks.push_back(StoredOutputChunk{next_sequence++, std::move(bytes)});
+
+      while (buffered_bytes > max_raw_output_bytes && !output_chunks.empty()) {
+        buffered_bytes -= output_chunks.front().bytes.size();
+        output_chunks.pop_front();
+        ++dropped_raw_chunks;
+      }
+    }
+    const auto buffer_micros = elapsed_microseconds(buffer_started_at);
+
+    const auto feed_micros = elapsed_microseconds(feed_started_at);
+    output_read_chunks.fetch_add(1, std::memory_order_relaxed);
+    output_read_bytes.fetch_add(byte_count, std::memory_order_relaxed);
+    output_feed_duration_us.fetch_add(feed_micros, std::memory_order_relaxed);
+    update_peak(max_output_feed_duration_us, feed_micros);
+    output_lock_wait_duration_us.fetch_add(lock_wait_micros, std::memory_order_relaxed);
+    update_peak(max_output_lock_wait_duration_us, lock_wait_micros);
+    output_grid_feed_duration_us.fetch_add(grid_feed_micros, std::memory_order_relaxed);
+    update_peak(max_output_grid_feed_duration_us, grid_feed_micros);
+    output_buffer_duration_us.fetch_add(buffer_micros, std::memory_order_relaxed);
+    update_peak(max_output_buffer_duration_us, buffer_micros);
     output_cv.notify_all();
+  }
+
+  std::string process_id_for_log() const {
+#ifdef _WIN32
+    return std::to_string(process_id);
+#else
+    return "0";
+#endif
+  }
+
+  void capture_output(const std::string& bytes) {
+    if (capture_path.empty() || capture_written_bytes >= capture_max_bytes) {
+      return;
+    }
+
+    std::lock_guard lock(capture_mutex);
+    if (capture_written_bytes >= capture_max_bytes || capture_open_failed) {
+      return;
+    }
+
+    if (!capture_stream.is_open()) {
+      capture_stream.open(capture_path, std::ios::binary | std::ios::app);
+      if (!capture_stream) {
+        capture_open_failed = true;
+        log_event(
+            LogLevel::Warn,
+            "pty",
+            "capture_open_failed",
+            {{"path", capture_path}, {"process_id", process_id_for_log()}});
+        return;
+      }
+      if (!capture_logged) {
+        capture_logged = true;
+        log_event(
+            LogLevel::Info,
+            "pty",
+            "capture_enabled",
+            {{"path", capture_path},
+             {"process_id", process_id_for_log()},
+             {"max_bytes", std::to_string(capture_max_bytes)}});
+      }
+    }
+
+    const auto remaining = capture_max_bytes - capture_written_bytes;
+    const auto count = std::min<std::size_t>(remaining, bytes.size());
+    capture_stream.write(bytes.data(), static_cast<std::streamsize>(count));
+    capture_stream.flush();
+    capture_written_bytes += count;
+  }
+
+  void ingest_loop() {
+    std::deque<PendingOutputChunk> local_queue;
+    for (;;) {
+      {
+        std::unique_lock lock(ingest_mutex);
+        ingest_cv.wait(lock, [&] {
+          return reader_eof || terminating.load(std::memory_order_acquire) || !ingest_queue.empty();
+        });
+
+        if (ingest_queue.empty() &&
+            (reader_eof || terminating.load(std::memory_order_acquire))) {
+          break;
+        }
+
+        if (!reader_eof && !terminating.load(std::memory_order_acquire) &&
+            ingest_pending_bytes < kPtyIngestBatchTargetBytes) {
+          ingest_cv.wait_for(lock, kPtyIngestCoalesceWindow, [&] {
+            return reader_eof || terminating.load(std::memory_order_acquire) ||
+                   ingest_pending_bytes >= kPtyIngestBatchTargetBytes;
+          });
+        }
+
+        local_queue.swap(ingest_queue);
+      }
+
+      while (!local_queue.empty()) {
+        std::string batch = std::move(local_queue.front().bytes);
+        local_queue.pop_front();
+        std::size_t byte_count = batch.size();
+        while (!local_queue.empty() &&
+               batch.size() + local_queue.front().bytes.size() <= kPtyIngestBatchTargetBytes) {
+          byte_count += local_queue.front().bytes.size();
+          batch += local_queue.front().bytes;
+          local_queue.pop_front();
+        }
+
+        ingest_output(std::move(batch));
+        {
+          std::lock_guard lock(ingest_mutex);
+          ingest_pending_bytes =
+              byte_count >= ingest_pending_bytes ? 0 : ingest_pending_bytes - byte_count;
+        }
+        ingest_cv.notify_all();
+      }
+    }
+
+    mark_reader_done();
   }
 
   void mark_reader_done() {
-    std::lock_guard lock(output_mutex);
-    reader_done = true;
+    {
+      std::lock_guard lock(output_mutex);
+      reader_done = true;
+    }
     output_cv.notify_all();
   }
 
-  PtyOutputSnapshot snapshot() const {
-    std::lock_guard lock(output_mutex);
-
+  PtyOutputSnapshot snapshot(
+      PtyOutputSnapshotMode mode,
+      bool consume_dirty,
+      bool dirty_rows_only,
+      std::optional<PtyOutputScrollbackRange> scrollback_range = std::nullopt) const {
     PtyOutputSnapshot snapshot;
-    snapshot.next_sequence = next_sequence;
-    snapshot.alive = !reader_done;
-    snapshot.buffered_raw_bytes = buffered_bytes;
-    snapshot.dropped_raw_chunks = dropped_raw_chunks;
-    snapshot.screen = screen.snapshot();
-    snapshot.scrollback = screen.scrollback_snapshot();
-    snapshot.bytes.reserve(buffered_bytes);
-    for (const auto& chunk : output_chunks) {
-      snapshot.bytes += chunk.bytes;
+    {
+      std::lock_guard screen_lock(screen_mutex);
+      snapshot.screen = screen->snapshot(consume_dirty, dirty_rows_only);
+      snapshot.scrollback.total_lines = snapshot.screen.scrollback_line_count;
+      snapshot.scrollback.first_line_index = 0;
+      snapshot.scrollback_included = mode == PtyOutputSnapshotMode::FullHistory;
+      snapshot.raw_bytes_included = mode == PtyOutputSnapshotMode::FullHistory;
+      if (mode == PtyOutputSnapshotMode::FullHistory) {
+        if (scrollback_range) {
+          snapshot.scrollback =
+              screen->scrollback_snapshot_range(
+                  scrollback_range->first_line,
+                  scrollback_range->line_count);
+        } else {
+          snapshot.scrollback = screen->scrollback_snapshot();
+        }
+      }
+    }
+
+    {
+      std::lock_guard output_lock(output_mutex);
+      snapshot.next_sequence = next_sequence;
+      snapshot.alive = !reader_done;
+      snapshot.buffered_raw_bytes = buffered_bytes;
+      snapshot.dropped_raw_chunks = dropped_raw_chunks;
+      if (mode == PtyOutputSnapshotMode::FullHistory) {
+        snapshot.bytes.reserve(buffered_bytes);
+        for (const auto& chunk : output_chunks) {
+          snapshot.bytes += chunk.bytes;
+        }
+      }
     }
 
     return snapshot;
+  }
+
+  void with_screen_render_view(
+      bool consume_damage,
+      const PtyScreenRenderCallback& callback) const {
+    PtyScreenRenderView view;
+    {
+      std::lock_guard screen_lock(screen_mutex);
+      view.cursor = screen->cursor();
+      view.columns = screen->columns();
+      view.rows = screen->rows();
+      view.scrollback_line_count = screen->scrollback_view(0, 0).total_lines;
+      view.damage = consume_damage ? screen->consume_damage() : TerminalDamage{};
+      view.engine = screen.get();
+
+      {
+        std::lock_guard output_lock(output_mutex);
+        view.next_sequence = next_sequence;
+        view.alive = !reader_done;
+        view.buffered_raw_bytes = buffered_bytes;
+        view.dropped_raw_chunks = dropped_raw_chunks;
+      }
+
+      callback(view);
+    }
   }
 
   PtyOutputChunk wait_for_output(
@@ -437,6 +726,36 @@ struct PtyProcess::Impl {
       output.bytes.reserve(buffered_bytes);
       for (auto chunk = it; chunk != output_chunks.end(); ++chunk) {
         output.bytes += chunk->bytes;
+        output.next_sequence = chunk->sequence + 1;
+      }
+    }
+
+    return output;
+  }
+
+  PtyOutputDrain wait_for_output_drain(
+      std::uint64_t requested_sequence,
+      std::chrono::milliseconds timeout) const {
+    std::unique_lock lock(output_mutex);
+    output_cv.wait_for(lock, timeout, [&] {
+      return reader_done || std::ranges::any_of(output_chunks, [&](const auto& chunk) {
+               return chunk.sequence >= requested_sequence;
+             });
+    });
+
+    PtyOutputDrain output;
+    output.next_sequence = requested_sequence;
+    output.alive = !reader_done;
+
+    const auto it = std::ranges::find_if(output_chunks, [&](const auto& chunk) {
+      return chunk.sequence >= requested_sequence;
+    });
+    if (it != output_chunks.end() && it->sequence > requested_sequence) {
+      output.sequence_compacted = true;
+    }
+    if (it != output_chunks.end()) {
+      for (auto chunk = it; chunk != output_chunks.end(); ++chunk) {
+        output.bytes += chunk->bytes.size();
         output.next_sequence = chunk->sequence + 1;
       }
     }
@@ -480,24 +799,25 @@ struct PtyProcess::Impl {
   }
 
   void start_reader() {
+    ingest_thread = std::thread([this] { ingest_loop(); });
     reader_thread = std::thread([this] { read_loop(); });
   }
 
   void read_loop() {
-    char buffer[4096];
+    std::array<char, kConPtyReadBufferBytes> buffer{};
     while (!terminating && output_read.valid()) {
       DWORD bytes_read = 0;
       const BOOL ok = ReadFile(
           output_read.get(),
-          buffer,
-          static_cast<DWORD>(sizeof(buffer)),
+          buffer.data(),
+          static_cast<DWORD>(buffer.size()),
           &bytes_read,
           nullptr);
       if (!ok || bytes_read == 0) {
         break;
       }
 
-      append_output(std::string{buffer, buffer + bytes_read});
+      enqueue_output(std::string{buffer.data(), buffer.data() + bytes_read});
     }
 
     log_event(
@@ -505,7 +825,7 @@ struct PtyProcess::Impl {
         "pty",
         "reader_exit",
         {{"process_id", std::to_string(process_id)}});
-    mark_reader_done();
+    mark_reader_eof();
   }
 
   bool write(std::string_view bytes) {
@@ -572,8 +892,8 @@ struct PtyProcess::Impl {
     }
 
     {
-      std::lock_guard output_lock(output_mutex);
-      screen.resize(columns, rows);
+      std::lock_guard screen_lock(screen_mutex);
+      screen->resize(columns, rows);
     }
     log_event(
         LogLevel::Info,
@@ -602,6 +922,24 @@ struct PtyProcess::Impl {
     lifecycle.primary_thread_handle_open =
         primary_thread_handle_open.load(std::memory_order_relaxed);
     lifecycle.job_object_handle_open = job_object_handle_open.load(std::memory_order_relaxed);
+    lifecycle.output_read_chunks = output_read_chunks.load(std::memory_order_relaxed);
+    lifecycle.output_read_bytes = output_read_bytes.load(std::memory_order_relaxed);
+    lifecycle.output_feed_duration_us =
+        output_feed_duration_us.load(std::memory_order_relaxed);
+    lifecycle.max_output_feed_duration_us =
+        max_output_feed_duration_us.load(std::memory_order_relaxed);
+    lifecycle.output_lock_wait_duration_us =
+        output_lock_wait_duration_us.load(std::memory_order_relaxed);
+    lifecycle.max_output_lock_wait_duration_us =
+        max_output_lock_wait_duration_us.load(std::memory_order_relaxed);
+    lifecycle.output_grid_feed_duration_us =
+        output_grid_feed_duration_us.load(std::memory_order_relaxed);
+    lifecycle.max_output_grid_feed_duration_us =
+        max_output_grid_feed_duration_us.load(std::memory_order_relaxed);
+    lifecycle.output_buffer_duration_us =
+        output_buffer_duration_us.load(std::memory_order_relaxed);
+    lifecycle.max_output_buffer_duration_us =
+        max_output_buffer_duration_us.load(std::memory_order_relaxed);
     return lifecycle;
   }
 
@@ -677,7 +1015,12 @@ struct PtyProcess::Impl {
       reader_thread.join();
     }
 
-    mark_reader_done();
+    mark_reader_eof();
+    if (ingest_thread.joinable()) {
+      ingest_thread.join();
+    } else {
+      mark_reader_done();
+    }
     close_handle(input_read, input_pipe_read_open, "input_read");
     close_handle(output_read, output_pipe_read_open, "output_read");
     close_handle(primary_thread, primary_thread_handle_open, "primary_thread");
@@ -719,7 +1062,12 @@ struct PtyProcess::Impl {
     if (!terminating.compare_exchange_strong(expected, true)) {
       return false;
     }
-    mark_reader_done();
+    mark_reader_eof();
+    if (ingest_thread.joinable()) {
+      ingest_thread.join();
+    } else {
+      mark_reader_done();
+    }
     return true;
   }
 #endif
@@ -915,8 +1263,8 @@ PtyProcessResult PtyProcess::start(const PtySpawnOptions& options, short columns
   impl->job_assigned = job_assigned;
   impl->console = std::move(console);
   impl->max_raw_output_bytes = options.limits.max_pane_raw_output_bytes;
-  impl->screen.set_scrollback_capacity(options.limits.max_pane_scrollback_lines);
-  impl->screen.resize(columns, rows);
+  impl->screen->set_scrollback_capacity(options.limits.max_pane_scrollback_lines);
+  impl->screen->resize(columns, rows);
   impl->mark_runtime_handles_open();
 
   auto pty = std::shared_ptr<PtyProcess>(new PtyProcess(std::move(impl)));
@@ -968,14 +1316,30 @@ PtyProcessLifecycle PtyProcess::lifecycle() const {
   return impl_->lifecycle();
 }
 
-PtyOutputSnapshot PtyProcess::output_snapshot() const {
-  return impl_->snapshot();
+PtyOutputSnapshot PtyProcess::output_snapshot(
+    PtyOutputSnapshotMode mode,
+    bool consume_dirty,
+    bool dirty_rows_only,
+    std::optional<PtyOutputScrollbackRange> scrollback_range) const {
+  return impl_->snapshot(mode, consume_dirty, dirty_rows_only, scrollback_range);
+}
+
+void PtyProcess::with_screen_render_view(
+    bool consume_damage,
+    const PtyScreenRenderCallback& callback) const {
+  impl_->with_screen_render_view(consume_damage, callback);
 }
 
 PtyOutputChunk PtyProcess::wait_for_output(
     std::uint64_t next_sequence,
     std::chrono::milliseconds timeout) const {
   return impl_->wait_for_output(next_sequence, timeout);
+}
+
+PtyOutputDrain PtyProcess::wait_for_output_drain(
+    std::uint64_t next_sequence,
+    std::chrono::milliseconds timeout) const {
+  return impl_->wait_for_output_drain(next_sequence, timeout);
 }
 
 bool PtyProcess::terminate() {

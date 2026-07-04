@@ -1,6 +1,7 @@
 #include "wmux/commands.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,6 +14,7 @@ void run_command_engine_tests();
 void run_config_tests();
 void run_copy_selection_tests();
 void run_daemon_event_tests();
+void run_daemon_render_benchmark_tests();
 void run_daemon_render_tests();
 void run_mouse_input_tests();
 void run_paste_buffer_tests();
@@ -22,10 +24,30 @@ void run_session_manager_tests();
 void run_status_line_tests();
 void run_terminal_capabilities_tests();
 void run_terminal_control_tests();
+void run_terminal_engine_benchmark_tests();
+void run_terminal_engine_tests();
 void run_terminal_input_tests();
 void run_terminal_grid_tests();
 void run_terminal_vt_tests();
 void run_windows_clipboard_tests();
+
+std::string test_only_filter() {
+#if defined(_MSC_VER)
+  char* value = nullptr;
+  std::size_t size = 0;
+  if (_dupenv_s(&value, &size, "WMUX_TEST_ONLY") != 0 || value == nullptr) {
+    return {};
+  }
+  std::string filter{value};
+  std::free(value);
+  return filter;
+#else
+  if (const char* value = std::getenv("WMUX_TEST_ONLY")) {
+    return value;
+  }
+  return {};
+#endif
+}
 
 namespace {
 
@@ -480,6 +502,21 @@ void expects_unknown_command_error() {
 }  // namespace
 
 int main() {
+  if (test_only_filter() == "terminal-engine-benchmark") {
+    run_terminal_engine_benchmark_tests();
+    return 0;
+  }
+
+  if (test_only_filter() == "daemon-render-benchmark") {
+    run_daemon_render_benchmark_tests();
+    return 0;
+  }
+
+  if (test_only_filter() == "terminal-engine") {
+    run_terminal_engine_tests();
+    return 0;
+  }
+
   expects_default_for_empty_args();
   expects_help_flag();
   expects_version_command();
@@ -553,6 +590,7 @@ int main() {
   run_status_line_tests();
   run_terminal_capabilities_tests();
   run_terminal_control_tests();
+  run_terminal_engine_tests();
   run_terminal_input_tests();
   run_terminal_grid_tests();
   run_terminal_vt_tests();

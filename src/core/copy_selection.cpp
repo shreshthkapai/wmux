@@ -21,7 +21,9 @@ std::size_t total_line_count(const PtyOutputSnapshot& snapshot) {
     return std::max(snapshot.screen.line_snapshots.size(), snapshot.screen.lines.size());
   }
 
-  return std::max(snapshot.scrollback.line_snapshots.size(), snapshot.scrollback.lines.size()) +
+  return std::max(
+             snapshot.scrollback.total_lines,
+             std::max(snapshot.scrollback.line_snapshots.size(), snapshot.scrollback.lines.size())) +
          std::max(snapshot.screen.line_snapshots.size(), snapshot.screen.lines.size());
 }
 
@@ -36,13 +38,21 @@ TerminalLineSnapshot line_snapshot_at(const PtyOutputSnapshot& snapshot, std::si
     return {};
   }
 
-  const auto scrollback_count =
-      std::max(snapshot.scrollback.line_snapshots.size(), snapshot.scrollback.lines.size());
+  const auto scrollback_count = std::max(
+      snapshot.scrollback.total_lines,
+      std::max(snapshot.scrollback.line_snapshots.size(), snapshot.scrollback.lines.size()));
   if (index < scrollback_count) {
-    if (index < snapshot.scrollback.line_snapshots.size()) {
-      return snapshot.scrollback.line_snapshots[index];
+    if (index < snapshot.scrollback.first_line_index) {
+      return {};
     }
-    return TerminalLineSnapshot{snapshot.scrollback.lines[index], false};
+    const auto local_index = index - snapshot.scrollback.first_line_index;
+    if (local_index < snapshot.scrollback.line_snapshots.size()) {
+      return snapshot.scrollback.line_snapshots[local_index];
+    }
+    if (local_index < snapshot.scrollback.lines.size()) {
+      return TerminalLineSnapshot{snapshot.scrollback.lines[local_index], false};
+    }
+    return {};
   }
 
   const auto screen_index = index - scrollback_count;

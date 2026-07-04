@@ -87,6 +87,7 @@ TerminalCapabilities capabilities_for_host(TerminalHost host) {
       capabilities.supports_cursor_style = true;
       capabilities.supports_alt_screen = true;
       capabilities.supports_extended_keys = true;
+      capabilities.supports_synchronized_output = true;
       add_quirk(capabilities, TerminalQuirk::NoOsc52Clipboard);
       break;
 
@@ -100,6 +101,7 @@ TerminalCapabilities capabilities_for_host(TerminalHost host) {
       capabilities.supports_cursor_style = true;
       capabilities.supports_alt_screen = true;
       capabilities.supports_extended_keys = true;
+      capabilities.supports_synchronized_output = true;
       add_quirk(capabilities, TerminalQuirk::VscodeKeyTranslation);
       add_quirk(capabilities, TerminalQuirk::NoOsc52Clipboard);
       break;
@@ -116,6 +118,7 @@ TerminalCapabilities capabilities_for_host(TerminalHost host) {
       capabilities.supports_alt_screen = true;
       capabilities.supports_extended_keys = true;
       capabilities.supports_osc52_clipboard = true;
+      capabilities.supports_synchronized_output = true;
       break;
 
     case TerminalHost::Alacritty:
@@ -130,6 +133,7 @@ TerminalCapabilities capabilities_for_host(TerminalHost host) {
       capabilities.supports_alt_screen = true;
       capabilities.supports_extended_keys = true;
       capabilities.supports_osc52_clipboard = true;
+      capabilities.supports_synchronized_output = true;
       break;
 
     case TerminalHost::Conhost:
@@ -166,7 +170,9 @@ TerminalHost detect_host_from_environment(
     return TerminalHost::WezTerm;
   }
 
-  if (term_program == "alacritty" || has_environment_value(environment, "ALACRITTY_SOCKET") ||
+  const auto term = ascii_lower(environment_value(environment, "TERM"));
+  if (term_program == "alacritty" || term == "alacritty" ||
+      has_environment_value(environment, "ALACRITTY_SOCKET") ||
       has_environment_value(environment, "ALACRITTY_LOG")) {
     return TerminalHost::Alacritty;
   }
@@ -194,6 +200,7 @@ void capture_environment_value(EnvironmentSnapshot& environment, const char* nam
 TerminalCapabilities detect_terminal_capabilities() {
   EnvironmentSnapshot environment;
   capture_environment_value(environment, "WT_SESSION");
+  capture_environment_value(environment, "TERM");
   capture_environment_value(environment, "TERM_PROGRAM");
   capture_environment_value(environment, "VSCODE_PID");
   capture_environment_value(environment, "WEZTERM_PANE");

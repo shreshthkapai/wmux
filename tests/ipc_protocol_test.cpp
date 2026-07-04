@@ -130,13 +130,22 @@ void expects_attach_request_json_with_terminal_size() {
   wmux::CommandLine command;
   command.kind = wmux::CommandKind::AttachSession;
   command.session_name = "finance";
+  wmux::TerminalCapabilities capabilities;
+  capabilities.host = wmux::TerminalHost::Alacritty;
+  capabilities.supports_truecolor = true;
+  capabilities.supports_sgr_mouse = true;
 
-  const auto request = wmux::parse_request_json(wmux::make_attach_request_json(command, 132, 43));
+  const auto request =
+      wmux::parse_request_json(wmux::make_attach_request_json(command, 132, 43, capabilities));
   assert(request);
   assert(request->type == "AttachStart");
   assert(request->session_name == "finance");
   assert(request->terminal_columns == 132);
   assert(request->terminal_rows == 43);
+  assert(request->terminal_capabilities_provided);
+  assert(request->terminal_capabilities.host == wmux::TerminalHost::Alacritty);
+  assert(request->terminal_capabilities.supports_truecolor);
+  assert(request->terminal_capabilities.supports_sgr_mouse);
 }
 
 void expects_json_escaping() {

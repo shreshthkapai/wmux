@@ -8,6 +8,7 @@
 #include "wmux/mouse_input.hpp"
 #include "wmux/resource_limits.hpp"
 #include "wmux/platform/terminal_control.hpp"
+#include "wmux/terminal_capabilities.hpp"
 #include "wmux/terminal_input.hpp"
 
 #include <algorithm>
@@ -35,6 +36,8 @@ namespace {
 
 constexpr auto kAttachConnectAttempts = 40;
 constexpr auto kAttachConnectSleep = std::chrono::milliseconds{50};
+constexpr std::size_t kAttachOutputCoalesceBytes = 1024 * 1024;
+constexpr std::size_t kAttachOutputCoalesceFrames = 128;
 
 std::atomic<HANDLE> g_attach_stop_event{nullptr};
 std::atomic<DWORD> g_attach_console_control_type{0};
@@ -426,9 +429,52 @@ std::wstring widen(std::string_view value) {
   return wide;
 }
 
-bool write_all(HANDLE handle, std::string_view bytes) {
-  DWORD console_mode = 0;
-  if (GetConsoleMode(handle, &console_mode) != 0) {
+bool is_utf8_continuation_byte(char byte) {
+  return (static_cast<unsigned char>(byte) & 0xc0u) == 0x80u;
+}
+
+std::size_t utf8_safe_prefix_size(std::string_view bytes, std::size_t max_bytes) {
+  if (bytes.size() <= max_bytes) {
+    return bytes.size();
+  }
+
+  std::size_t end = max_bytes;
+  while (end > 0 && is_utf8_continuation_byte(bytes[end])) {
+    --end;
+  }
+  return end == 0 ? max_bytes : end;
+}
+
+bool write_console_utf8_raw(HANDLE handle, std::string_view bytes, bool& wrote_any) {
+  wrote_any = false;
+  if (bytes.empty()) {
+    return true;
+  }
+  if (GetConsoleOutputCP() != CP_UTF8) {
+    return false;
+  }
+
+  constexpr std::size_t kConsoleUtf8ChunkBytes = 256 * 1024;
+  while (!bytes.empty()) {
+    const auto chunk_size = utf8_safe_prefix_size(bytes, kConsoleUtf8ChunkBytes);
+    const auto bytes_to_write = static_cast<DWORD>(chunk_size);
+    DWORD bytes_written = 0;
+    const BOOL ok = WriteFile(handle, bytes.data(), bytes_to_write, &bytes_written, nullptr);
+    if (!ok || bytes_written == 0) {
+      return false;
+    }
+    wrote_any = true;
+    if (bytes_written != bytes_to_write) {
+      return false;
+    }
+
+    bytes.remove_prefix(bytes_written);
+  }
+
+  return true;
+}
+
+bool write_console_wide(HANDLE handle, std::string_view bytes) {
     if (bytes.empty()) {
       return true;
     }
@@ -471,6 +517,19 @@ bool write_all(HANDLE handle, std::string_view bytes) {
     }
 
     return true;
+}
+
+bool write_all(HANDLE handle, std::string_view bytes) {
+  DWORD console_mode = 0;
+  if (GetConsoleMode(handle, &console_mode) != 0) {
+    bool wrote_raw = false;
+    if (write_console_utf8_raw(handle, bytes, wrote_raw)) {
+      return true;
+    }
+    if (wrote_raw) {
+      return false;
+    }
+    return write_console_wide(handle, bytes);
   }
 
   while (!bytes.empty()) {
@@ -647,6 +706,36 @@ bool read_ipc_frame(
       frame.payload.size(),
       stop_requested,
       stop_event);
+}
+
+std::optional<IpcFrameHeader> peek_next_complete_attach_output_frame(HANDLE pipe) {
+  std::array<char, kIpcFrameHeaderSize> raw_header{};
+  DWORD bytes_peeked = 0;
+  DWORD total_available = 0;
+  if (PeekNamedPipe(
+          pipe,
+          raw_header.data(),
+          static_cast<DWORD>(raw_header.size()),
+          &bytes_peeked,
+          &total_available,
+          nullptr) == 0) {
+    return std::nullopt;
+  }
+  if (bytes_peeked < raw_header.size() || total_available < raw_header.size()) {
+    return std::nullopt;
+  }
+
+  auto parsed = parse_ipc_frame_header(std::string_view{raw_header.data(), raw_header.size()});
+  if (!parsed.ok || parsed.header.kind != IpcFrameKind::AttachOutput) {
+    return std::nullopt;
+  }
+
+  const auto total_frame_size = kIpcFrameHeaderSize + parsed.header.payload_size;
+  if (total_available < total_frame_size) {
+    return std::nullopt;
+  }
+
+  return parsed.header;
 }
 
 bool read_response_frame(HANDLE pipe, std::uint64_t request_id, IpcResponse& response) {
@@ -1055,9 +1144,6 @@ void stream_output(
     MouseReportingGuard& mouse_reporting,
     std::atomic_bool& stop_requested,
     HANDLE stop_event) {
-  DWORD output_mode = 0;
-  const bool output_is_console = GetConsoleMode(output, &output_mode) != 0;
-  std::string pending_utf8;
   while (!stop_requested) {
     IpcFrameParseResult frame;
     if (!read_ipc_frame(pipe, frame, &stop_requested, stop_event)) {
@@ -1121,9 +1207,37 @@ void stream_output(
       break;
     }
 
-    const std::string_view bytes{frame.payload};
-    const bool written = output_is_console ? write_console_utf8_all(output, bytes, pending_utf8)
-                                           : write_all(output, bytes);
+    std::string bytes = std::move(frame.payload);
+    std::size_t coalesced_frames = 1;
+    while (coalesced_frames < kAttachOutputCoalesceFrames &&
+           bytes.size() < kAttachOutputCoalesceBytes) {
+      const auto next_header = peek_next_complete_attach_output_frame(pipe);
+      if (!next_header) {
+        break;
+      }
+      if (bytes.size() + next_header->payload_size > kAttachOutputCoalesceBytes) {
+        break;
+      }
+
+      IpcFrameParseResult next_frame;
+      if (!read_ipc_frame(pipe, next_frame, &stop_requested, stop_event)) {
+        stop_requested = true;
+        break;
+      }
+      if (!next_frame.ok || next_frame.header.kind != IpcFrameKind::AttachOutput) {
+        stop_requested = true;
+        break;
+      }
+
+      bytes.append(next_frame.payload);
+      ++coalesced_frames;
+    }
+
+    if (stop_requested) {
+      break;
+    }
+
+    const bool written = write_all(output, bytes);
     if (!written) {
       break;
     }
@@ -1257,6 +1371,7 @@ int run_attach_client(const CommandLine& command) {
   }
 
   const auto size = current_terminal_size(output);
+  const auto terminal_capabilities = detect_terminal_capabilities();
 
   UniqueHandle pipe;
   if (!connect_pipe(pipe)) {
@@ -1279,7 +1394,7 @@ int run_attach_client(const CommandLine& command) {
   const auto attach_request = make_ipc_frame(
       IpcFrameKind::Control,
       attach_request_id,
-      make_attach_request_json(command, size.columns, size.rows));
+      make_attach_request_json(command, size.columns, size.rows, terminal_capabilities));
   if (!write_pipe_all(pipe.get(), attach_request)) {
     log_event(
         LogLevel::Error,

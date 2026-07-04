@@ -65,6 +65,7 @@ class TerminalVtParser final {
  public:
   void reset();
   void feed(std::string_view bytes, std::vector<TerminalVtOperation>& operations);
+  bool fast_path_ready() const;
 
  private:
   enum class State {

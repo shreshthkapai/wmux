@@ -82,9 +82,14 @@ set(WMUX_CORE_SOURCES
   src/core/session_manager.cpp
   src/core/status_line.cpp
   src/core/terminal_capabilities.cpp
+  src/core/grid_core_v2.cpp
+  src/core/screen_writer_v2.cpp
+  src/core/terminal_engine_legacy.cpp
+  src/core/terminal_engine_v2.cpp
   src/core/terminal_input.cpp
   src/core/terminal_grid.cpp
   src/core/terminal_vt.cpp
+  src/core/vt_parser_v2.cpp
   src/core/ui_theme.cpp
   src/core/unicode_width.cpp
   src/core/version.cpp
@@ -183,6 +188,8 @@ if(WMUX_BUILD_TESTS)
     tests/status_line_test.cpp
     tests/terminal_capabilities_test.cpp
     tests/terminal_control_test.cpp
+    tests/terminal_engine_benchmark_test.cpp
+    tests/terminal_engine_test.cpp
     tests/terminal_input_test.cpp
     tests/terminal_grid_test.cpp
     tests/terminal_vt_test.cpp
@@ -199,4 +206,12 @@ if(WMUX_BUILD_TESTS)
   wmux_apply_common_target_settings(wmux_tests)
 
   add_test(NAME wmux.command_parser COMMAND wmux_tests)
+  add_test(NAME wmux.terminal_engine_benchmarks COMMAND wmux_tests)
+  set_tests_properties(
+    wmux.terminal_engine_benchmarks
+    PROPERTIES
+      DISABLED TRUE
+      LABELS benchmark
+      ENVIRONMENT "WMUX_TEST_ONLY=terminal-engine-benchmark;WMUX_BENCHMARK_ENGINE=v2"
+  )
 endif()

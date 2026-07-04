@@ -224,6 +224,10 @@ void TerminalVtParser::feed(
   }
 }
 
+bool TerminalVtParser::fast_path_ready() const {
+  return state_ == State::Ground && utf8_remaining_ == 0;
+}
+
 void TerminalVtParser::emit_pending_utf8_replacement(
     std::vector<TerminalVtOperation>& operations) {
   if (utf8_remaining_ == 0) {

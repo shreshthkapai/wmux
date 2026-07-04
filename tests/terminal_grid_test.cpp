@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -92,6 +93,25 @@ void bounds_scrollback_capacity() {
   assert(scrollback.lines.size() == 2);
   assert(scrollback.lines[0] == "tri ");
   assert(scrollback.lines[1] == "for ");
+}
+
+void exposes_bounded_scrollback_ranges() {
+  wmux::TerminalGrid grid{4, 2};
+
+  grid.feed("one\r\ntwo\r\ntri\r\nfor\r\nfiv");
+
+  const auto full = grid.scrollback_snapshot();
+  assert(full.total_lines == 3);
+  assert(!full.partial);
+  assert(full.lines[0] == "one ");
+  assert(full.lines[2] == "tri ");
+
+  const auto range = grid.scrollback_snapshot_range(1, 1);
+  assert(range.total_lines == 3);
+  assert(range.partial);
+  assert(range.first_line_index == 1);
+  assert(range.lines.size() == 1);
+  assert(range.lines[0] == "two ");
 }
 
 void preserves_scrollback_across_resize() {
@@ -526,6 +546,39 @@ void golden_alternate_screen_snapshot() {
   assert(screen.lines[0] == "viewer    ");
 }
 
+void tracks_and_consumes_dirty_rows() {
+  wmux::TerminalGrid grid{8, 3};
+
+  auto screen = grid.snapshot(true);
+  assert((screen.dirty_rows == std::vector<int>{0, 1, 2}));
+  assert(screen.damage == wmux::DamageKind::FullPane);
+
+  screen = grid.snapshot(true);
+  assert(screen.dirty_rows.empty());
+  assert(screen.damage == wmux::DamageKind::None);
+
+  grid.feed("\x1b[2;1Hhello");
+  screen = grid.snapshot(true);
+  assert((screen.dirty_rows == std::vector<int>{1}));
+  assert(screen.damage == wmux::DamageKind::DirtyRows);
+  assert(screen.lines[1] == "hello   ");
+
+  screen = grid.snapshot(true);
+  assert(screen.dirty_rows.empty());
+  assert(screen.damage == wmux::DamageKind::None);
+}
+
+void marks_scroll_region_full_pane_damage() {
+  wmux::TerminalGrid grid{4, 3};
+
+  (void)grid.snapshot(true);
+  grid.feed("aaaa\r\nbbbb\r\ncccc\r\n");
+  const auto screen = grid.snapshot(true);
+  assert((screen.dirty_rows == std::vector<int>{0, 1, 2}));
+  assert(screen.damage == wmux::DamageKind::FullPane);
+  assert(screen.scroll_events.empty());
+}
+
 }  // namespace
 
 void run_terminal_grid_tests() {
@@ -536,6 +589,7 @@ void run_terminal_grid_tests() {
   exposes_line_snapshots_for_copy_mode();
   stores_wrapped_scrollback_metadata();
   bounds_scrollback_capacity();
+  exposes_bounded_scrollback_ranges();
   preserves_scrollback_across_resize();
   does_not_store_alternate_screen_scrolls();
   csi_3j_clears_scrollback();
@@ -567,4 +621,6 @@ void run_terminal_grid_tests() {
   golden_git_diff_color_snapshot();
   golden_progress_bar_snapshot();
   golden_alternate_screen_snapshot();
+  tracks_and_consumes_dirty_rows();
+  marks_scroll_region_full_pane_damage();
 }

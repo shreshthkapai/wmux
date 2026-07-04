@@ -33,6 +33,84 @@ Daemon
 The daemon owns all persistent runtime objects. Clients render frames, collect
 input, and send typed messages. A closed terminal must not imply a killed shell.
 
+## Redraw Model Freeze
+
+The current TerminalEngineV2 work may remain in place, but renderer behavior
+must not be changed through one-off symptom patches. Do not add another
+special case for a specific shell, agent, terminal application, escape sequence,
+or Windows Terminal quirk until the redraw model described below is rebuilt as
+a coherent client-scene system.
+
+Allowed before that rebuild:
+
+```text
+documentation
+diagnostics that prove model/scene/output ordering
+tests that capture current failures
+small correctness fixes with a clear invariant
+```
+
+Not allowed:
+
+```text
+raw output replay as a rendering fix
+app-specific Codex/Claude detection
+renderer cache tweaks without a client-scene invariant
+host-terminal scroll hacks that bypass authoritative grid state
+staged clear/body/cursor writes that can present partial frames
+```
+
+## Tmux-Style Redraw Invariants
+
+wmux should copy tmux's architectural redraw invariants, not Unix-specific
+implementation details. The server-side terminal model is authoritative, and
+clients are disposable views of that model.
+
+Required invariants:
+
+```text
+1. The daemon/server screen grid is the source of truth.
+2. PTY bytes mutate pane terminal state; clients do not replay raw pane history.
+3. Each attached client has its own physical-terminal baseline.
+4. A new or invalid client baseline means "the client terminal is unknown."
+5. Attach, resize, layout change, window switch, and reattach render the current
+   scene from the authoritative model, not incremental guesses.
+6. Renderer caches are client-scoped. A cache valid for one client is not proof
+   that another client already has those bytes on screen.
+7. Cache/baseline state is committed only after the frame was successfully
+   written to that client.
+8. Dropped, skipped, coalesced, or failed frames must not advance a client's
+   physical-terminal baseline.
+9. Styled blanks, cursor visibility/shape/position, terminal modes, pane
+   borders, active-pane indicators, status line, overlays, and alternate-screen
+   contents are part of the rendered scene.
+10. Full-scene materialization must emit a coherent frame: initialize/reset,
+    draw body/borders/status/overlays, then place/show the cursor.
+```
+
+This means the renderer's primary job is:
+
+```text
+authoritative daemon/window/pane state
+-> current client-visible scene
+-> diff against that client's physical baseline when safe
+-> one ordered frame written to that client
+-> commit the new baseline only after write success
+```
+
+It must not be:
+
+```text
+raw PTY history
+-> replay/coalesce/skip decisions
+-> guessed visible terminal state
+```
+
+The practical consequence is that correctness comes before clever damage
+tracking. If the renderer cannot prove that a partial update is valid for a
+specific client baseline, it must render a coherent current scene from the
+server model.
+
 ## Platform Boundary
 
 wmux is Windows-first, but the core architecture is not Windows-only. Core code
@@ -126,6 +204,50 @@ wmux                   CLI executable entry point
 New source files should be added to the narrowest correct target. Do not add
 Windows-specific code to `wmux_core` or duplicate implementation sources in
 the executable/test targets.
+
+The final cross-OS source boundary is explicit:
+
+```text
+src/platform/
+  windows_pty_process.cpp        Windows ConPTY backend
+  unix_pty_process.cpp           future Unix PTY backend
+
+src/core/
+  terminal_engine.hpp            engine interface
+  terminal_engine_legacy.cpp     correctness fallback
+  terminal_engine_v2.cpp         opt-in fast engine facade
+  vt_parser_v2.cpp               platform-neutral VT parser
+  screen_writer_v2.cpp           print collection and terminal operations
+  grid_core_v2.cpp               packed cells, line pools, style interning
+
+src/daemon/
+  sessions, windows, panes, layout, render scheduling
+
+src/client/
+  attach UI and input
+```
+
+Forbidden in `src/core/terminal_engine*`, `src/core/vt_parser*`,
+`src/core/screen_writer*`, `src/core/grid_core*`, and daemon render core:
+
+```text
+Win32 console hacks
+ConPTY assumptions
+Windows handles
+raw PTY replay as the rendering model
+```
+
+Allowed inside the platform-neutral terminal engine:
+
+```text
+internal terminal engine rewrites
+packed cells
+line pools
+style interning
+VTE/VT parser replacement
+render-view replacement
+queue-based ingestion APIs
+```
 
 Correct boundary:
 
@@ -576,17 +698,22 @@ ConPTY output must move through explicit layers:
 
 ```text
 bytes from ConPTY
--> TerminalVtParser
--> TerminalVtOperation values
--> TerminalGrid mutation
--> TerminalScreenSnapshot / TerminalScrollbackSnapshot
+-> terminal engine
+-> VT parser / print collector
+-> screen grid mutation
+-> line views or snapshots
 -> daemon renderer
 -> attach output frame
 ```
 
 Do not combine byte parsing, grid mutation, and rendering in one function. The
-parser owns VT byte framing, UTF-8 decoding, CSI/OSC framing, and safe unknown
-sequence handling. The grid owns terminal state:
+legacy engine is preserved as the correctness fallback. The V2 engine parses
+PTY chunks directly into screen-writer operations without allocating operation
+objects in the printable hot path. A virtual call per PTY chunk is acceptable;
+virtual dispatch per byte, cell, or parser operation is forbidden.
+
+The parser owns VT byte framing, UTF-8 decoding, CSI/OSC framing, and safe
+unknown sequence handling. The grid owns terminal state:
 
 ```text
 cursor position
@@ -601,6 +728,20 @@ terminal title
 
 Unknown or oversized terminal sequences are ignored safely and counted/logged
 without writing raw control bytes into the visible grid.
+
+Host-terminal scroll-region rendering is intentionally disabled during the
+engine replacement. Child PTY scrolls must be treated as authoritative grid
+mutation plus `FullPane` damage, not translated into host-terminal scroll
+commands. The correct order is:
+
+```text
+1. Make the terminal engine fast.
+2. Make render from line views fast.
+3. Only then consider carefully verified host scroll-region render ops.
+```
+
+This preserves the corruption fix for large scroll-heavy applications and pane
+split/close redraws while V2 performance work continues.
 
 ## Rendering And Backpressure
 

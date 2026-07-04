@@ -13,6 +13,7 @@ void detects_windows_terminal() {
   assert(capabilities.supports_truecolor);
   assert(capabilities.supports_sgr_mouse);
   assert(capabilities.supports_bracketed_paste);
+  assert(capabilities.supports_synchronized_output);
 }
 
 void detects_vscode_before_conhost() {
@@ -32,11 +33,19 @@ void detects_modern_third_party_terminals() {
   const auto alacritty = wmux::detect_terminal_capabilities_from_environment(
       {{"ALACRITTY_SOCKET", "socket"}},
       true);
+  const auto alacritty_from_term = wmux::detect_terminal_capabilities_from_environment(
+      {{"TERM", "alacritty"}},
+      true);
 
   assert(wezterm.host == wmux::TerminalHost::WezTerm);
   assert(wezterm.supports_osc52_clipboard);
+  assert(wezterm.supports_synchronized_output);
   assert(alacritty.host == wmux::TerminalHost::Alacritty);
   assert(alacritty.supports_truecolor);
+  assert(alacritty.supports_synchronized_output);
+  assert(alacritty_from_term.host == wmux::TerminalHost::Alacritty);
+  assert(alacritty_from_term.supports_truecolor);
+  assert(alacritty_from_term.supports_synchronized_output);
 }
 
 void falls_back_to_conhost_for_plain_console() {

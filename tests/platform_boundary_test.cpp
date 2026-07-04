@@ -233,10 +233,94 @@ void cmake_target_split_stays_explicit() {
   }
 }
 
+std::string read_text_file(const std::filesystem::path& path) {
+  std::ifstream input{path, std::ios::binary};
+  return {
+      std::istreambuf_iterator<char>{input},
+      std::istreambuf_iterator<char>{}};
+}
+
+std::string cmake_list_body(std::string_view cmake, std::string_view list_name) {
+  const std::string start = "set(" + std::string{list_name};
+  const auto start_pos = cmake.find(start);
+  if (start_pos == std::string_view::npos) {
+    return {};
+  }
+  const auto body_start = cmake.find('\n', start_pos);
+  if (body_start == std::string_view::npos) {
+    return {};
+  }
+  const auto body_end = cmake.find("\n)", body_start);
+  if (body_end == std::string_view::npos) {
+    return {};
+  }
+  return std::string{cmake.substr(body_start, body_end - body_start)};
+}
+
+void terminal_engine_v2_stays_platform_neutral_core_code() {
+  const auto root = find_repo_root();
+  assert(!root.empty());
+
+  const std::vector<std::string> engine_files{
+      "include/wmux/terminal_engine.hpp",
+      "src/core/terminal_engine_legacy.cpp",
+      "src/core/terminal_engine_v2.cpp",
+      "src/core/terminal_engine_v2_internal.hpp",
+      "src/core/vt_parser_v2.cpp",
+      "src/core/screen_writer_v2.cpp",
+      "src/core/grid_core_v2.cpp",
+  };
+
+  const auto cmake = read_text_file(root / "CMakeLists.txt");
+  const auto core_sources = cmake_list_body(cmake, "WMUX_CORE_SOURCES");
+  const auto platform_sources = cmake_list_body(cmake, "WMUX_PLATFORM_WINDOWS_SOURCES");
+  const auto runtime_sources = cmake_list_body(cmake, "WMUX_WINDOWS_RUNTIME_SOURCES");
+
+  for (const auto& relative : engine_files) {
+    const auto path = root / relative;
+    if (!std::filesystem::exists(path)) {
+      std::cerr << relative << ": terminal engine boundary file is missing\n";
+      assert(false);
+    }
+
+    if (relative.ends_with(".cpp") && core_sources.find(relative) == std::string::npos) {
+      std::cerr << relative << ": terminal engine implementation must belong to WMUX_CORE_SOURCES\n";
+      assert(false);
+    }
+    if (platform_sources.find(relative) != std::string::npos ||
+        runtime_sources.find(relative) != std::string::npos) {
+      std::cerr << relative << ": terminal engine implementation must not belong to a Windows target\n";
+      assert(false);
+    }
+
+    const auto text = read_text_file(path);
+    for (const auto& forbidden : {
+             "#include <windows.h>",
+             "#include <Windows.h>",
+             "wmux/platform/",
+             "HANDLE",
+             "HPCON",
+             "ConPTY",
+             "ReadFile",
+             "WriteFile",
+             "CreatePseudoConsole",
+             "ResizePseudoConsole",
+             "ClosePseudoConsole",
+         }) {
+      if (text.find(forbidden) != std::string::npos) {
+        std::cerr << relative << ": V2 terminal engine core leaked platform detail "
+                  << forbidden << "\n";
+        assert(false);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 void run_platform_boundary_tests() {
   platform_boundary_keeps_win32_out_of_core_sources();
   removed_platform_shim_headers_stay_removed();
   cmake_target_split_stays_explicit();
+  terminal_engine_v2_stays_platform_neutral_core_code();
 }
