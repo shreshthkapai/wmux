@@ -1,5 +1,12 @@
 use std::{env, fs::File, io, path::PathBuf};
 
+// Windows documents a 256-character named-pipe limit. Reserve sixteen
+// characters below it so callers do not rely on a transport boundary limit.
+const PIPE_NAME_LIMIT: usize = 240;
+const PIPE_PREFIX: &str = r"\\.\pipe\";
+const ENDPOINT_PREFIX: &str = "wmux-clean-";
+const LOCK_PATH_LIMIT: usize = 260;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSid {
     bytes: Vec<u8>,
@@ -38,15 +45,29 @@ impl Endpoint {
     }
 
     fn from_owner_sid(owner_sid: UserSid, instance: Option<&str>) -> io::Result<Self> {
+        let instance = instance.filter(|value| !value.is_empty());
+        let base_name = format!("{ENDPOINT_PREFIX}{}", owner_sid.as_str());
         let suffix = instance
-            .filter(|value| !value.is_empty())
-            .map(instance_suffix)
-            .map(|value| format!("-{value}"))
+            .map(|value| instance_suffix(value, PIPE_PREFIX.len() + base_name.len()))
+            .transpose()?
             .unwrap_or_default();
-        let name = format!("wmux-clean-{}{suffix}", owner_sid.as_str());
+        let pipe_name = format!("{PIPE_PREFIX}{base_name}{suffix}");
+        if pipe_name.len() > PIPE_NAME_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wmux named-pipe endpoint exceeds the 240-character safety limit",
+            ));
+        }
+        let lock_path = env::temp_dir().join(lock_file_name(&owner_sid, instance));
+        if lock_path.to_string_lossy().encode_utf16().count() + 1 > LOCK_PATH_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wmux lock path exceeds the Windows MAX_PATH safety limit",
+            ));
+        }
         Ok(Self {
-            pipe_name: format!(r"\\.\pipe\{name}"),
-            lock_path: env::temp_dir().join(format!("{name}.lock")),
+            pipe_name,
+            lock_path,
             owner_sid,
         })
     }
@@ -100,11 +121,37 @@ fn sanitize(value: &str) -> String {
     }
 }
 
-fn instance_suffix(value: &str) -> String {
-    const MAX_PREFIX_BYTES: usize = 64;
+fn instance_suffix(value: &str, pipe_name_len_before_suffix: usize) -> io::Result<String> {
+    const DIGEST_HEX_BYTES: usize = 16;
+    const DIGEST_ONLY_SUFFIX_BYTES: usize = 1 + DIGEST_HEX_BYTES;
+    const PREFIXED_SUFFIX_FIXED_BYTES: usize = 2 + DIGEST_HEX_BYTES;
+    let available = PIPE_NAME_LIMIT
+        .checked_sub(pipe_name_len_before_suffix)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wmux named-pipe endpoint exceeds the 240-character safety limit",
+            )
+        })?;
+    let digest = format!("{:016x}", stable_hash(value.as_bytes()));
+    if available < DIGEST_ONLY_SUFFIX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wmux named-pipe endpoint leaves no room for an instance digest",
+        ));
+    }
+    if available == DIGEST_ONLY_SUFFIX_BYTES {
+        return Ok(format!("-{digest}"));
+    }
     let mut prefix = sanitize(value);
-    prefix.truncate(MAX_PREFIX_BYTES);
-    format!("{prefix}-{:016x}", stable_hash(value.as_bytes()))
+    prefix.truncate(available - PREFIXED_SUFFIX_FIXED_BYTES);
+    Ok(format!("-{prefix}-{digest}"))
+}
+
+fn lock_file_name(owner_sid: &UserSid, instance: Option<&str>) -> String {
+    let owner_key = stable_hash(&owner_sid.bytes);
+    let instance_key = stable_hash(instance.unwrap_or_default().as_bytes());
+    format!("wmux-clean-lock-{owner_key:016x}-{instance_key:016x}.lock")
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
@@ -514,10 +561,10 @@ mod tests {
     fn endpoint_instance_suffix_is_sanitized_and_has_a_unique_lock_path() {
         let endpoint = Endpoint::for_instance("one/two:three").unwrap();
         assert!(endpoint.pipe_name().contains("one_two_three-"));
-        assert!(endpoint
-            .lock_path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains("one_two_three-")));
+        assert!(endpoint.lock_path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("wmux-clean-lock-") && name.ends_with(".lock")
+        }));
     }
 
     #[test]
@@ -528,6 +575,26 @@ mod tests {
         let colon = Endpoint::for_instance("a:b").unwrap();
         assert_ne!(slash.pipe_name(), colon.pipe_name());
         assert_ne!(slash.lock_path, colon.lock_path);
+    }
+
+    #[test]
+    fn endpoint_bounds_maximal_sid_names_without_losing_instance_identity() {
+        // Mutation caught: budgeting the instance suffix alone and allowing a
+        // maximal valid SID to overflow the pipe or lock-file limits.
+        let owner = maximal_sid_for_test();
+        let first_instance = "x".repeat(1_000);
+        let second_instance = format!("{}y", "x".repeat(999));
+        let first = Endpoint::from_owner_sid(owner.clone(), Some(&first_instance)).unwrap();
+        let second = Endpoint::from_owner_sid(owner, Some(&second_instance)).unwrap();
+
+        assert!(first.pipe_name().len() <= 240);
+        assert!(first
+            .lock_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().len() <= 255));
+        assert!(first.lock_path.to_string_lossy().encode_utf16().count() < 260);
+        assert_ne!(first.pipe_name(), second.pipe_name());
+        assert_ne!(first.lock_path, second.lock_path);
     }
 
     #[test]
@@ -616,6 +683,16 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         )
+    }
+
+    fn maximal_sid_for_test() -> UserSid {
+        let subauthorities = std::iter::repeat_n("4294967295", 15)
+            .collect::<Vec<_>>()
+            .join("-");
+        UserSid {
+            bytes: vec![0; 68],
+            text: format!("S-1-281474976710655-{subauthorities}"),
+        }
     }
 
     fn with_username_env<T>(value: &str, action: impl FnOnce() -> T) -> T {
