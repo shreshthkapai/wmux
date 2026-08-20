@@ -9,7 +9,7 @@ use wmux_protocol::{encode_frame, read_message, Message};
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x0340_7628_c53b_7958;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x77b6_3207_8fd0_ab8b;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -32,6 +32,9 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         malformed_input_case()?,
         key_and_paste_case(),
         mouse_routing_case(),
+        unicode_terminal_text_case()?,
+        terminal_modes_and_title_case()?,
+        bounded_control_recovery_case()?,
     ];
     let mut suite_fingerprint = Fnv64::new();
     for case in &cases {
@@ -250,6 +253,115 @@ fn key_and_paste_case() -> CaseResult {
     }
 }
 
+fn unicode_terminal_text_case() -> Result<CaseResult, String> {
+    let fixture = "\u{3bb}> cafe\u{301} \u{2764}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} \u{1f1ec}\u{1f1e7} \u{754c}";
+    let mut screen = Screen::new(48, 4);
+    let mut terminal = TerminalEngine::new();
+    for chunk in fixture.as_bytes().chunks(2) {
+        terminal.feed(&mut screen, chunk);
+    }
+
+    let line = screen
+        .grid()
+        .line(0)
+        .ok_or("Unicode fixture row missing")?;
+    if line.text() != fixture {
+        return Err(format!(
+            "Unicode fixture changed: expected {fixture:?}, got {:?}",
+            line.text()
+        ));
+    }
+    for (column, text) in [
+        (6, "e\u{301}"),
+        (8, "\u{2764}\u{fe0f}"),
+        (11, "\u{1f469}\u{200d}\u{1f4bb}"),
+        (14, "\u{1f1ec}\u{1f1e7}"),
+        (17, "\u{754c}"),
+    ] {
+        let cell = line.cell(column).ok_or("Unicode fixture cell missing")?;
+        if cell.text().to_string() != text {
+            return Err(format!("Unicode cell {column} lost complete text"));
+        }
+    }
+    for column in [8, 11, 14, 17] {
+        if line.width_at(column) != 2 || line.width_at(column + 1) != 0 {
+            return Err(format!("Unicode cell {column} lost its wide-cell invariant"));
+        }
+    }
+
+    Ok(CaseResult {
+        name: "unicode-terminal-text",
+        fingerprint: hash_screen(&screen),
+    })
+}
+
+fn terminal_modes_and_title_case() -> Result<CaseResult, String> {
+    let fixture = b"primary\x1b]2;wmux;portable\x1b\\\x1b[?1049halt\x1b[?1049l\x1b[1;8H\x1b[?2026hdone\x1b[?2026l\x1b[?2004h";
+    let mut screen = Screen::new(32, 4);
+    let mut terminal = TerminalEngine::new();
+    for chunk in fixture.chunks(3) {
+        terminal.feed(&mut screen, chunk);
+    }
+
+    if screen.title() != "wmux;portable" {
+        return Err("OSC title was not preserved".to_string());
+    }
+    if screen.alternate_active() {
+        return Err("alternate-screen exit did not restore primary state".to_string());
+    }
+    if screen.grid().line(0).map(|line| line.text()).as_deref() != Some("primarydone") {
+        return Err("alternate-screen transition changed primary text".to_string());
+    }
+    if !screen.bracketed_paste() || screen.synchronized_output() {
+        return Err("terminal modes did not settle to the expected state".to_string());
+    }
+
+    Ok(CaseResult {
+        name: "terminal-modes-and-title",
+        fingerprint: hash_screen(&screen),
+    })
+}
+
+fn bounded_control_recovery_case() -> Result<CaseResult, String> {
+    let mut cases = vec![
+        ("DCS", b"\x1bPq".to_vec(), b"\x1b\\".to_vec()),
+        ("SOS", b"\x1bX".to_vec(), b"\x1b\\".to_vec()),
+        ("PM", b"\x1b^".to_vec(), b"\x1b\\".to_vec()),
+        ("APC", b"\x1b_".to_vec(), b"\x1b\\".to_vec()),
+        ("OSC", b"\x1b]0;".to_vec(), b"\x07".to_vec()),
+    ];
+    let mut over_parameterized_csi = b"\x1b[".to_vec();
+    over_parameterized_csi.extend_from_slice("1;".repeat(40).as_bytes());
+    over_parameterized_csi.extend_from_slice(b"1m");
+    cases.push(("CSI", over_parameterized_csi, Vec::new()));
+
+    let mut hash = Fnv64::new();
+    for (name, introducer, terminator) in cases {
+        let mut fixture = Vec::with_capacity(introducer.len() + terminator.len() + 4101);
+        fixture.extend_from_slice(&introducer);
+        if name != "CSI" {
+            fixture.extend(std::iter::repeat_n(b'x', 4096));
+        }
+        fixture.extend_from_slice(&terminator);
+        fixture.extend_from_slice(b"after");
+
+        let mut screen = Screen::new(16, 2);
+        let mut terminal = TerminalEngine::new();
+        for chunk in fixture.chunks(7) {
+            terminal.feed(&mut screen, chunk);
+        }
+        if screen.grid().line(0).map(|line| line.text()).as_deref() != Some("after") {
+            return Err(format!("{name} did not recover to printable ground state"));
+        }
+        hash.u64(hash_screen(&screen));
+    }
+
+    Ok(CaseResult {
+        name: "bounded-control-recovery",
+        fingerprint: hash.finish(),
+    })
+}
+
 fn hash_screen(screen: &Screen) -> u64 {
     let mut hash = Fnv64::new();
     hash.u16(screen.cols());
@@ -261,6 +373,10 @@ fn hash_screen(screen: &Screen) -> u64 {
     hash.byte(u8::from(screen.cursor_visible()));
     hash.byte(screen.cursor_style().decscusr());
     hash.byte(u8::from(screen.alternate_active()));
+    hash.byte(u8::from(screen.synchronized_output()));
+    hash.u64(screen.synchronized_output_epoch());
+    hash.u16(screen.title().len() as u16);
+    hash.bytes(screen.title().as_bytes());
     for row in 0..screen.rows() {
         for cell in screen
             .render_line_cells(row)
@@ -361,7 +477,7 @@ mod tests {
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 7);
+        assert_eq!(report.cases.len(), 10);
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 

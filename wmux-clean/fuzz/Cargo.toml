@@ -1,0 +1,30 @@
+[package]
+name = "wmux-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+wmux-core = { path = "../crates/wmux-core" }
+wmux-protocol = { path = "../crates/wmux-protocol" }
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_bytes"
+path = "fuzz_targets/terminal_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -398,28 +398,29 @@ git commit -m "feat(core): bound terminal control strings"
 - Create: `wmux-clean/fuzz/corpus/terminal_bytes/malformed-controls`
 - Create: `wmux-clean/fuzz/README.md`
 - Create: `wmux-clean/fuzz/Cargo.lock`
+- Create: `wmux-clean/fuzz/.gitignore`
 
 **Interfaces:**
 - Consumes: public core/protocol parser entry points and the Task 1-4 invariants.
 - Produces: deterministic `unicode-terminal-text`, `terminal-modes-and-title`, and `bounded-control-recovery` conformance cases plus `protocol_frame` and `terminal_bytes` libFuzzer binaries.
 
-- [ ] **Step 1: Add failing conformance cases**
+- [x] **Step 1: Add failing conformance cases**
 
   Extend `run_portable_suite` with cases whose literal fixtures cover multilingual prompts, decomposed accents, variation selectors, ZWJ emoji, flags, wide text, alternate-screen transitions, synchronized output, OSC titles, split chunks, and malformed control strings. Assert semantic invariants inside each case before hashing, then leave the old aggregate fingerprint unchanged for the first RED run.
 
-- [ ] **Step 2: Run conformance and observe RED**
+- [x] **Step 2: Run conformance and observe RED**
 
 ```powershell
 cargo test -p wmux-conformance -- --nocapture
 ```
 
-  Expected: `portable_semantic_suite_passes` reports the newly computed fingerprint instead of the old `feb48e6303354e80` value.
+  Expected: `portable_semantic_suite_passes` reports the newly computed fingerprint instead of the pre-fixture `03407628c53b7958` value.
 
-- [ ] **Step 3: Hash complete text and accept the intentional fingerprint**
+- [x] **Step 3: Hash complete text and accept the intentional fingerprint**
 
   Hash `CellText` UTF-8 bytes with a byte-length prefix, then width, continuation, and exact style including `Color::Default`. Update `EXPECTED_PORTABLE_FINGERPRINT` only after all per-case semantic assertions pass twice and produce identical results.
 
-- [ ] **Step 4: Create the independent cargo-fuzz package and targets**
+- [x] **Step 4: Create the independent cargo-fuzz package and targets**
 
   Use this manifest shape so fuzz tooling does not enter the production workspace dependency graph:
 
@@ -458,7 +459,7 @@ members = ["."]
 
   `protocol_frame` copies at most the fixed header, calls `decode_frame_header`, and calls `decode_frame_payload` only when the declared payload length exactly matches the remaining input. `terminal_bytes` derives dimensions in bounded ranges, feeds the input in varying bounded chunks, resizes once, materializes copy lines, and runs full rendering. Neither target asserts a particular arbitrary-input screen; crashes, panics, and sanitizer findings are failures.
 
-- [ ] **Step 5: Check in small semantic seed corpora and instructions**
+- [x] **Step 5: Check in small semantic seed corpora and instructions**
 
   Keep corpus inputs immutable and small. The terminal corpus contains real multilingual/emoji text and malformed control-like data derived from the conformance fixtures; the protocol corpus contains bad magic and truncated headers. Document supported nightly Unix commands:
 
@@ -467,7 +468,7 @@ cargo +nightly fuzz run terminal_bytes -- -max_total_time=60
 cargo +nightly fuzz run protocol_frame -- -max_total_time=60
 ```
 
-- [ ] **Step 6: Verify targets and conformance**
+- [x] **Step 6: Verify targets and conformance**
 
 ```powershell
 cargo test -p wmux-conformance -- --nocapture
@@ -477,10 +478,10 @@ cargo check --manifest-path fuzz/Cargo.toml --bins
 
   Expected: conformance passes deterministically, metadata lists exactly two fuzz binaries, and both targets compile on the current toolchain. Do not claim a sanitizer-backed fuzz run on Windows.
 
-- [ ] **Step 7: Commit conformance and fuzzing**
+- [x] **Step 7: Commit conformance and fuzzing**
 
 ```powershell
-git add wmux-clean/crates/wmux-conformance/src/lib.rs wmux-clean/fuzz
+git add docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md wmux-clean/crates/wmux-conformance/src/lib.rs wmux-clean/fuzz
 git commit -m "test: add terminal and protocol fuzz coverage"
 ```
 
