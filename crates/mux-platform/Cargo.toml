@@ -1,0 +1,17 @@
+[package]
+name = "mux-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "mux_platform"
+path = "src/lib.rs"
+
+[dependencies]
+mux-core = { path = "../mux-core", package = "mux-core" }
+mux-protocol = { path = "../mux-protocol", package = "mux-protocol" }
+
+[lints]
+workspace = true

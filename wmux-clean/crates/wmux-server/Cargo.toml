@@ -1,0 +1,20 @@
+[package]
+name = "wmux-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wmux-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+wmux-config = { path = "../wmux-config" }
+wmux-core = { path = "../wmux-core" }
+wmux-platform = { path = "../wmux-platform" }
+wmux-protocol = { path = "../wmux-protocol" }
+wmux-windows = { path = "../wmux-windows" }
+
+[lints]
+workspace = true

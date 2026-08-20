@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "crates/mux-cli",
+  "crates/mux-client",
+  "crates/mux-core",
+  "crates/mux-platform",
+  "crates/mux-platform-unix",
+  "crates/mux-platform-windows",
+  "crates/mux-protocol",
+  "crates/mux-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/shreshthkapai/wmux"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

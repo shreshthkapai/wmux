@@ -1,0 +1,13 @@
+[package]
+name = "wmux-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wmux-core = { path = "../wmux-core" }
+wmux-platform = { path = "../wmux-platform" }
+wmux-protocol = { path = "../wmux-protocol" }
+
+[lints]
+workspace = true

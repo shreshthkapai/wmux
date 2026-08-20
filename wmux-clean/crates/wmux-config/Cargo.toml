@@ -1,0 +1,12 @@
+[package]
+name = "wmux-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wmux_config"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

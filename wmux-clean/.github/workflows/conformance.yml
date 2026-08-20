@@ -1,0 +1,30 @@
+name: conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  portable-semantics:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run portable semantic conformance
+        run: cargo run -p wmux-conformance --release
+      - name: Test portable crates
+        run: cargo test -p wmux-core -p wmux-platform -p wmux-protocol -p wmux-conformance
+
+  windows-native-and-performance:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Windows workspace
+        run: cargo test --workspace
+      - name: Enforce release performance gate
+        run: cargo run -p wmux-bench --release -- --suite full --gate

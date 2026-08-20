@@ -1,0 +1,17 @@
+[package]
+name = "wmux-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wmux-bench"
+path = "src/main.rs"
+
+[dependencies]
+wmux-core = { path = "../wmux-core" }
+wmux-protocol = { path = "../wmux-protocol" }
+
+[lints]
+workspace = true

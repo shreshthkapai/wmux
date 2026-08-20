@@ -1,0 +1,3 @@
+pub const PROTOCOL_MAJOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_VERSION: u32 = ((PROTOCOL_MAJOR as u32) << 16) | PROTOCOL_MINOR as u32;

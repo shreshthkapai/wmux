@@ -1,0 +1,17 @@
+[package]
+name = "wmux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wmux_core"
+path = "src/lib.rs"
+
+[dependencies]
+smallvec.workspace = true
+vte.workspace = true
+wmux-platform = { path = "../wmux-platform" }
+
+[lints]
+workspace = true

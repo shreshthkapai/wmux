@@ -1,0 +1,12 @@
+[package]
+name = "wmux-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wmux_platform"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

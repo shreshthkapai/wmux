@@ -1,0 +1,18 @@
+[package]
+name = "mux-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "mux_platform_windows"
+path = "src/lib.rs"
+
+[dependencies]
+crossterm = { version = "0.28", default-features = false, features = ["events", "bracketed-paste", "windows"] }
+mux-core = { path = "../mux-core", package = "mux-core" }
+mux-platform = { path = "../mux-platform", package = "mux-platform" }
+
+[lints.rust]
+unsafe_code = "allow"

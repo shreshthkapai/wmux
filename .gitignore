@@ -1,0 +1,18 @@
+# Cargo outputs (including phase-specific benchmark/verification targets).
+**/target/
+**/target-*/
+
+# Transient diagnostics and runtime state.
+*.log
+*.log.*
+*.pid
+*.tmp
+wmux*.lock
+
+# Generated packages and CI artifacts.
+/dist/
+/artifacts/
+/packages/
+
+# Local isolated worktrees.
+/.worktrees/

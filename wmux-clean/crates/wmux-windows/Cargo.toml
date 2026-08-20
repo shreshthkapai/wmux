@@ -1,0 +1,17 @@
+[package]
+name = "wmux-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wmux_windows"
+path = "src/lib.rs"
+
+[dependencies]
+crossterm.workspace = true
+tokio.workspace = true
+wmux-platform = { path = "../wmux-platform" }
+
+[lints]
+workspace = true
