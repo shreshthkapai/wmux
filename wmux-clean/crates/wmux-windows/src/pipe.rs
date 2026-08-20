@@ -1,9 +1,4 @@
-use std::{
-    env,
-    fs::{File, OpenOptions},
-    io,
-    path::PathBuf,
-};
+use std::{env, fs::File, io, path::PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserSid {
@@ -45,7 +40,7 @@ impl Endpoint {
     fn from_owner_sid(owner_sid: UserSid, instance: Option<&str>) -> io::Result<Self> {
         let suffix = instance
             .filter(|value| !value.is_empty())
-            .map(sanitize)
+            .map(instance_suffix)
             .map(|value| format!("-{value}"))
             .unwrap_or_default();
         let name = format!("wmux-clean-{}{suffix}", owner_sid.as_str());
@@ -67,47 +62,21 @@ impl Endpoint {
 
 #[derive(Debug)]
 pub struct ServerLock {
-    path: PathBuf,
     _file: File,
 }
 
 impl ServerLock {
     pub fn acquire(endpoint: &Endpoint) -> io::Result<Self> {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&endpoint.lock_path)
-        {
-            Ok(file) => Ok(Self {
-                path: endpoint.lock_path.clone(),
-                _file: file,
-            }),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if connect(endpoint).is_ok() {
-                    Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "wmux clean server is already running",
-                    ))
-                } else {
-                    std::fs::remove_file(&endpoint.lock_path)?;
-                    let file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&endpoint.lock_path)?;
-                    Ok(Self {
-                        path: endpoint.lock_path.clone(),
-                        _file: file,
-                    })
-                }
-            }
-            Err(error) => Err(error),
-        }
+        let file = imp::acquire_lock(&endpoint.lock_path)?;
+        Ok(Self { _file: file })
     }
 }
 
 impl Drop for ServerLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // The held lock handle is opened with DELETE_ON_CLOSE. The OS removes
+        // exactly this handle's file when `_file` closes; it never unlinks a
+        // later replacement by pathname.
     }
 }
 
@@ -131,18 +100,33 @@ fn sanitize(value: &str) -> String {
     }
 }
 
+fn instance_suffix(value: &str) -> String {
+    const MAX_PREFIX_BYTES: usize = 64;
+    let mut prefix = sanitize(value);
+    prefix.truncate(MAX_PREFIX_BYTES);
+    format!("{prefix}-{:016x}", stable_hash(value.as_bytes()))
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{Endpoint, UserSid};
     use std::{
         ffi::{c_void, OsStr},
-        fs::File,
+        fs::{File, OpenOptions},
         io,
         mem::size_of,
         os::windows::{
             ffi::OsStrExt,
+            fs::OpenOptionsExt,
             io::{AsRawHandle, FromRawHandle},
         },
+        path::Path,
         ptr,
     };
     use tokio::net::windows::named_pipe::{
@@ -168,6 +152,8 @@ mod imp {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -214,11 +200,18 @@ mod imp {
             }
             let token_user = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
             let sid = token_user.User.Sid;
-            let sid_len = unsafe { GetLengthSid(sid) };
-            if sid.is_null() || sid_len == 0 {
+            if sid.is_null() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "token has no user SID",
+                ));
+            }
+            // `GetLengthSid` requires a valid non-null SID pointer.
+            let sid_len = unsafe { GetLengthSid(sid) };
+            if sid_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "token has an invalid user SID",
                 ));
             }
             let bytes =
@@ -339,6 +332,40 @@ mod imp {
         ClientOptions::new().open(endpoint.pipe_name())
     }
 
+    pub fn acquire_lock(path: &Path) -> io::Result<File> {
+        match open_lock(path, true) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // A live wmux lock is share-mode-zero and this open fails. A
+                // stale file has no owner, can be opened exclusively, and is
+                // atomically scheduled for deletion with this new ownership
+                // handle. No connection failure is treated as stale evidence.
+                open_lock(path, false).map_err(|error| {
+                    if matches!(error.raw_os_error(), Some(5 | 32)) {
+                        io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "wmux clean server lock is held",
+                        )
+                    } else {
+                        error
+                    }
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_lock(path: &Path, create_new: bool) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(create_new)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+        options.open(path)
+    }
+
     pub fn connect(endpoint: &Endpoint) -> io::Result<File> {
         let name = wide_null(endpoint.pipe_name());
         let handle = unsafe {
@@ -426,7 +453,7 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::{Endpoint, UserSid};
-    use std::{fs::File, io};
+    use std::{fs::File, io, path::Path};
 
     impl UserSid {
         pub(super) fn current_process() -> io::Result<Self> {
@@ -435,6 +462,10 @@ mod imp {
     }
 
     pub fn connect(_endpoint: &Endpoint) -> io::Result<File> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
+    }
+
+    pub fn acquire_lock(_path: &Path) -> io::Result<File> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
     }
 }
@@ -482,11 +513,21 @@ mod tests {
     #[test]
     fn endpoint_instance_suffix_is_sanitized_and_has_a_unique_lock_path() {
         let endpoint = Endpoint::for_instance("one/two:three").unwrap();
-        assert!(endpoint.pipe_name().ends_with("one_two_three"));
+        assert!(endpoint.pipe_name().contains("one_two_three-"));
         assert!(endpoint
             .lock_path
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().ends_with("one_two_three.lock")));
+            .is_some_and(|name| name.to_string_lossy().contains("one_two_three-")));
+    }
+
+    #[test]
+    fn endpoint_instance_encoding_distinguishes_previously_colliding_values() {
+        // Mutation caught: collapsing distinct WMUX_INSTANCE values into the
+        // same endpoint and server-lock namespace.
+        let slash = Endpoint::for_instance("a/b").unwrap();
+        let colon = Endpoint::for_instance("a:b").unwrap();
+        assert_ne!(slash.pipe_name(), colon.pipe_name());
+        assert_ne!(slash.lock_path, colon.lock_path);
     }
 
     #[test]
@@ -497,6 +538,32 @@ mod tests {
         assert!(endpoint.lock_path.exists());
         drop(lock);
         assert!(!endpoint.lock_path.exists());
+    }
+
+    #[test]
+    fn server_lock_rejects_a_second_live_owner() {
+        // Mutation caught: treating any failed pipe connection as a stale lock
+        // and deleting an active server's marker.
+        let endpoint = Endpoint::for_instance(&unique("live-lock")).unwrap();
+        let first = ServerLock::acquire(&endpoint).unwrap();
+        let error = ServerLock::acquire(&endpoint).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(endpoint.lock_path.exists());
+        drop(first);
+        assert!(!endpoint.lock_path.exists());
+    }
+
+    #[test]
+    fn server_lock_prevents_replacement_while_its_owner_is_live() {
+        // Mutation caught: allowing an active lock pathname to be replaced, so
+        // its later Drop can unlink another owner's lock.
+        let endpoint = Endpoint::for_instance(&unique("lock-replacement")).unwrap();
+        let lock = ServerLock::acquire(&endpoint).unwrap();
+        assert!(std::fs::remove_file(&endpoint.lock_path).is_err());
+        drop(lock);
+        std::fs::write(&endpoint.lock_path, b"replacement").unwrap();
+        assert!(endpoint.lock_path.exists());
+        std::fs::remove_file(&endpoint.lock_path).unwrap();
     }
 
     #[test]
