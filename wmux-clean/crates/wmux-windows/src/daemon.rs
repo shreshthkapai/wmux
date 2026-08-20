@@ -1,12 +1,13 @@
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Read},
-    os::windows::{ffi::OsStrExt, process::CommandExt},
+    os::windows::{ffi::OsStrExt, io::AsRawHandle, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+use windows_sys::Win32::{Foundation::ERROR_BROKEN_PIPE, System::Pipes::PeekNamedPipe};
 
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -14,7 +15,9 @@ const WMI_CREATE_FLAGS: u32 = 134_219_264;
 const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = MAX_DIAGNOSTIC_BYTES * 2;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+const BOOTSTRAP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_DRAIN_BYTES_PER_POLL: usize = 16 * 1024;
 
 /// The server command and working directory that the local WMI provider must
 /// launch independently from the disposable client process.
@@ -185,86 +188,136 @@ pub(crate) fn run_bounded_command(
     timeout: Duration,
 ) -> io::Result<BootstrapOutput> {
     let mut child = command.spawn()?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "wmux daemon bootstrap stdout was not captured",
-        )
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "wmux daemon bootstrap stderr was not captured",
-        )
-    })?;
-    let stdout_reader = thread::spawn(move || drain_limited(stdout));
-    let stderr_reader = thread::spawn(move || drain_limited(stderr));
+    let mut pipes = BootstrapPipes::from_child(&mut child)?;
     let started = Instant::now();
 
     loop {
+        pipes.drain_once()?;
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Ok(BootstrapOutput {
-                    status,
-                    stdout: join_drain(stdout_reader)?,
-                    stderr: join_drain(stderr_reader)?,
-                });
+                return Ok(pipes.finish(status));
             }
             Ok(None) if started.elapsed() < timeout => thread::sleep(BOOTSTRAP_POLL_INTERVAL),
             Ok(None) => {
-                let output = kill_reap_and_collect(&mut child, stdout_reader, stderr_reader);
-                let diagnostic = output
-                    .as_ref()
-                    .map(|output| output_diagnostic(&output.stderr))
-                    .unwrap_or_default();
+                let _ = child.kill();
+                let _ = wait_for_exit_until(
+                    &mut child,
+                    &mut pipes,
+                    Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT,
+                );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
                         "wmux daemon bootstrap timed out after {} ms and was terminated{}",
                         timeout.as_millis(),
-                        diagnostic
+                        output_diagnostic(&pipes.stderr_capture)
                     ),
                 ));
             }
             Err(error) => {
-                let _ = kill_reap_and_collect(&mut child, stdout_reader, stderr_reader);
+                let _ = child.kill();
+                let _ = wait_for_exit_until(
+                    &mut child,
+                    &mut pipes,
+                    Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT,
+                );
                 return Err(error);
             }
         }
     }
 }
 
-fn kill_reap_and_collect(
+fn wait_for_exit_until(
     child: &mut Child,
-    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-) -> io::Result<BootstrapOutput> {
-    let _ = child.kill();
-    let status = child.wait()?;
-    Ok(BootstrapOutput {
-        status,
-        stdout: join_drain(stdout_reader)?,
-        stderr: join_drain(stderr_reader)?,
-    })
-}
-
-fn drain_limited(mut reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut captured = Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES);
-    let mut buffer = [0_u8; 8_192];
+    pipes: &mut BootstrapPipes,
+    deadline: Instant,
+) -> io::Result<Option<ExitStatus>> {
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(captured);
+        pipes.drain_once()?;
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
         }
-        let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(captured.len());
-        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(BOOTSTRAP_POLL_INTERVAL);
     }
 }
 
-fn join_drain(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other("wmux daemon bootstrap output reader panicked"))?
+struct BootstrapPipes {
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    stdout_capture: Vec<u8>,
+    stderr_capture: Vec<u8>,
+}
+
+impl BootstrapPipes {
+    fn from_child(child: &mut Child) -> io::Result<Self> {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wmux daemon bootstrap stdout was not captured",
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wmux daemon bootstrap stderr was not captured",
+            )
+        })?;
+        Ok(Self {
+            stdout,
+            stderr,
+            stdout_capture: Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES),
+            stderr_capture: Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES),
+        })
+    }
+
+    fn drain_once(&mut self) -> io::Result<()> {
+        drain_available(&mut self.stdout, &mut self.stdout_capture)?;
+        drain_available(&mut self.stderr, &mut self.stderr_capture)
+    }
+
+    fn finish(self, status: ExitStatus) -> BootstrapOutput {
+        BootstrapOutput {
+            status,
+            stdout: self.stdout_capture,
+            stderr: self.stderr_capture,
+        }
+    }
+}
+
+fn drain_available(
+    reader: &mut (impl Read + AsRawHandle),
+    capture: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut available = 0_u32;
+    if unsafe {
+        PeekNamedPipe(
+            reader.as_raw_handle().cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let to_read = (available as usize).min(MAX_DRAIN_BYTES_PER_POLL);
+    if to_read == 0 {
+        return Ok(());
+    }
+    let mut buffer = [0_u8; MAX_DRAIN_BYTES_PER_POLL];
+    let read = reader.read(&mut buffer[..to_read])?;
+    let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(capture.len());
+    capture.extend_from_slice(&buffer[..read.min(remaining)]);
+    Ok(())
 }
 
 fn encode_base64(bytes: &[u8]) -> String {

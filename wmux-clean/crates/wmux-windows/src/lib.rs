@@ -13,6 +13,8 @@ mod daemon_tests {
         ffi::OsString,
         path::PathBuf,
         process::{Command, Stdio},
+        sync::mpsc,
+        thread,
         time::{Duration, Instant},
     };
 
@@ -94,6 +96,50 @@ mod daemon_tests {
     }
 
     #[test]
+    fn daemon_bootstrap_does_not_wait_for_descendant_held_output_handles() {
+        // Mutation caught: output collection waits for EOF after the bootstrap
+        // exits, even though a descendant still owns the inherited write ends.
+        let pid_path = std::env::temp_dir().join(format!(
+            "wmux-daemon-descendant-{}-{}.pid",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let descendant = windows_powershell();
+        let script = format!(
+            "$psi = [Diagnostics.ProcessStartInfo]::new(); \
+             $psi.FileName = {}; \
+             $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"'; \
+             $psi.UseShellExecute = $false; \
+             $child = [Diagnostics.Process]::Start($psi); \
+             [IO.File]::WriteAllText({}, [string]$child.Id)",
+            powershell_literal(&descendant.display().to_string()),
+            powershell_literal(&pid_path.display().to_string()),
+        );
+        let mut command = Command::new(windows_powershell());
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = result_tx.send(run_bounded_command(&mut command, Duration::from_secs(1)));
+        });
+
+        let mut descendant = ProcessCleanup::new(wait_for_pid(&pid_path));
+        let result = result_rx.recv_timeout(Duration::from_millis(750));
+        descendant.terminate_and_wait().unwrap();
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(&pid_path);
+
+        assert!(
+            result.is_ok(),
+            "bootstrap waited for a descendant-held output handle: {result:?}"
+        );
+    }
+
+    #[test]
     fn daemon_spawn_leaves_the_wmi_created_process_alive_until_cleaned_up() {
         // Mutation caught: replacing WMI with an ordinary child process ties
         // daemon lifetime to the transient PowerShell bootstrap.
@@ -125,6 +171,21 @@ mod daemon_tests {
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe")
+    }
+
+    fn wait_for_pid(path: &std::path::Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path).and_then(|text| {
+                text.trim()
+                    .parse()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            }) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "descendant PID was not written");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     struct ProcessCleanup {
