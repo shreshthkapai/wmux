@@ -8,6 +8,7 @@ pub mod render;
 pub mod screen;
 pub mod state;
 pub mod terminal;
+pub mod text;
 
 pub use command::{
     execute, parse_command, resolve_command_name, Command, CommandParseError, CommandQueue,
@@ -31,3 +32,4 @@ pub use screen::{
 };
 pub use state::{Client, Pane, PaneResize, ServerState, Session, SessionGroup, Window, Winlink};
 pub use terminal::{CsiParams, TerminalBatch, TerminalEngine, TerminalEvent, TerminalOperation};
+pub use text::{extends_grapheme, scalar_width, CellText, MAX_CELL_TEXT_BYTES};

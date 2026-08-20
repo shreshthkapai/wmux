@@ -10,6 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 smallvec.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 vte.workspace = true
 wmux-platform = { path = "../wmux-platform" }
 

@@ -40,7 +40,7 @@
 - Consumes: Rust `char`, existing `smallvec`, tmux's 32-byte UTF-8 cell limit, and UAX #29/UAX #11 table crates.
 - Produces: `CellText`, `MAX_CELL_TEXT_BYTES`, `scalar_width(char) -> u8`, `extends_grapheme(&CellText, char) -> bool`, `CellText::try_append(char) -> bool`, `CellText::display_width() -> u8`, `CellText::push_to(&mut String)`, and `CellText::write_utf8(&mut Vec<u8>)`.
 
-- [ ] **Step 1: Add failing `CellText` tests**
+- [x] **Step 1: Add failing `CellText` tests**
 
   Create `text.rs` with tests that name the exact regressions: a scalar must need no owned overflow, `e + U+0301` must remain one text value, `U+2764 + U+FE0F` must have width 2, `woman + ZWJ + laptop` must remain one extended grapheme, two regional indicators must form one flag while a third starts another grapheme, and a 33-byte extension must be rejected without changing the existing text.
 
@@ -75,7 +75,7 @@ fn cell_text_rejects_extensions_past_tmux_compatible_limit_atomically() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and observe RED**
+- [x] **Step 2: Run the focused tests and observe RED**
 
   Run from `wmux-clean/`:
 
@@ -85,7 +85,7 @@ cargo test -p wmux-core text::tests -- --nocapture
 
   Expected: compilation fails because the planned `CellText` API and Unicode dependencies do not exist.
 
-- [ ] **Step 3: Add pinned Unicode dependencies and minimal implementation**
+- [x] **Step 3: Add pinned Unicode dependencies and minimal implementation**
 
   Add exact workspace dependencies and consume them only in `wmux-core`:
 
@@ -124,7 +124,7 @@ pub fn extends_grapheme(text: &CellText, next: char) -> bool;
 
   Build candidate graphemes in `SmallVec<[u8; 32]>`, validate them with `str::from_utf8`, use `UnicodeSegmentation::graphemes(candidate, true)`, and derive widths through `UnicodeWidthChar`/`UnicodeWidthStr`. Do not normalize or rewrite application text.
 
-- [ ] **Step 4: Run focused tests and observe GREEN**
+- [x] **Step 4: Run focused tests and observe GREEN**
 
 ```powershell
 cargo test -p wmux-core text::tests -- --nocapture
@@ -132,11 +132,11 @@ cargo test -p wmux-core text::tests -- --nocapture
 
   Expected: every new text-model test passes with no warnings.
 
-- [ ] **Step 5: Record the researched model**
+- [x] **Step 5: Record the researched model**
 
   In `terminal-text-model.md`, record the exact local references (`tmux/tmux.h`, `tmux/utf8-combined.c`, `tmux/screen-write.c`, Zellij `terminal_character.rs` and `grid.rs`), the selected 32-byte limit, dependency versions/Unicode rules, zero-width-at-column-zero behavior, style inheritance, width-change behavior, default-colour rule, and fuzz/benchmark gates.
 
-- [ ] **Step 6: Commit the text primitive**
+- [x] **Step 6: Commit the text primitive**
 
 ```powershell
 git add wmux-clean/Cargo.toml wmux-clean/Cargo.lock wmux-clean/crates/wmux-core/Cargo.toml wmux-clean/crates/wmux-core/src/lib.rs wmux-clean/crates/wmux-core/src/text.rs wmux-clean/docs/terminal-text-model.md
