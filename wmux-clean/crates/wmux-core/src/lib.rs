@@ -28,8 +28,10 @@ pub use render::{
 };
 pub use screen::{
     CursorStyle, DamageBatch, DamageOperation, DamageStatus, InsertDeleteKind, MouseTrackingMode,
-    Screen,
+    Screen, MAX_TITLE_BYTES,
 };
 pub use state::{Client, Pane, PaneResize, ServerState, Session, SessionGroup, Window, Winlink};
-pub use terminal::{CsiParams, TerminalBatch, TerminalEngine, TerminalEvent, TerminalOperation};
+pub use terminal::{
+    CsiParams, TerminalBatch, TerminalEngine, TerminalEvent, TerminalOperation, MAX_OSC_BYTES,
+};
 pub use text::{extends_grapheme, scalar_width, CellText, MAX_CELL_TEXT_BYTES};

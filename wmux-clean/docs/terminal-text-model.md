@@ -61,10 +61,12 @@ state rather than replaying pane output.
 
 ## Limits and Verification
 
-The `vte` parser already bounds CSI parameters at 32, intermediates at two,
-and OSC raw storage at 1 KiB. wmux makes those limits explicit, stores titles
-under a smaller application-state limit, and never accumulates DCS/SOS/PM/APC
-payloads. Malformed input must return to printable ground state without panic.
+The pinned `vte` parser bounds CSI parameters at 32 and intermediates at two.
+wmux declares its parser as `vte::Parser<1024>` and constructs it through the
+fixed-capacity feature path, making the 1 KiB OSC allocation explicit. OSC 0
+and 2 update an authoritative screen title capped at 512 UTF-8 bytes without
+splitting a scalar. DCS/SOS/PM/APC payloads remain discard-only. Malformed or
+oversized input must return to printable ground state without panic.
 
 The Phase 2 gate runs focused Unicode tests, the complete workspace suite,
 deterministic cross-OS conformance, protocol/terminal fuzz-target compilation,

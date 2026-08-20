@@ -320,6 +320,7 @@ git commit -m "feat(core): retain cell text across rendering and copy"
 ### Task 4: Make Parser Bounds and OSC Titles Explicit
 
 **Files:**
+- Modify: `wmux-clean/crates/wmux-core/src/lib.rs`
 - Modify: `wmux-clean/crates/wmux-core/src/screen.rs`
 - Modify: `wmux-clean/crates/wmux-core/src/terminal.rs`
 - Modify: `wmux-clean/docs/terminal-text-model.md`
@@ -328,7 +329,7 @@ git commit -m "feat(core): retain cell text across rendering and copy"
 - Consumes: `vte::Parser` fixed CSI/intermediate/OSC storage and the existing `TerminalBatch` operation queue.
 - Produces: explicit `MAX_OSC_BYTES = 1024`, `MAX_TITLE_BYTES = 512`, bounded `Screen::title()`, `TerminalOperation::SetTitle(String)`, and recovery guarantees for oversized CSI, OSC, DCS, SOS, PM, and APC input.
 
-- [ ] **Step 1: Add failing title and malformed-control tests**
+- [x] **Step 1: Add failing title and malformed-control tests**
 
 ```rust
 #[test]
@@ -355,7 +356,7 @@ fn oversized_control_strings_recover_to_printable_ground_state() {
 
   Add equivalent recovery cases for an over-parameterized CSI, oversized OSC, and the SOS/PM/APC string-control introducers.
 
-- [ ] **Step 2: Run tests and observe RED**
+- [x] **Step 2: Run tests and observe RED**
 
 ```powershell
 cargo test -p wmux-core terminal::tests -- --nocapture
@@ -363,11 +364,11 @@ cargo test -p wmux-core terminal::tests -- --nocapture
 
   Expected: the title test fails because OSC is currently ignored; recovery tests then define the accepted parser behavior.
 
-- [ ] **Step 3: Implement bounded title dispatch and explicit parser type**
+- [x] **Step 3: Implement bounded title dispatch and explicit parser type**
 
   Store `title: String` in `Screen`, truncate only at UTF-8 scalar boundaries to 512 bytes, and add an OSC handler for commands 0 and 2. Declare `TerminalEngine.parser` as `vte::Parser<MAX_OSC_BYTES>` so the 1 KiB parser allocation cannot silently change with a dependency default. Keep DCS and other string controls discard-only: `Perform::put` must not accumulate bytes.
 
-- [ ] **Step 4: Run focused and malformed-input tests**
+- [x] **Step 4: Run focused and malformed-input tests**
 
 ```powershell
 cargo test -p wmux-core terminal::tests -- --nocapture
@@ -375,10 +376,10 @@ cargo test -p wmux-core terminal::tests -- --nocapture
 
   Expected: title updates and every malformed/oversized sequence recover without panic or unbounded storage.
 
-- [ ] **Step 5: Commit parser bounds**
+- [x] **Step 5: Commit parser bounds**
 
 ```powershell
-git add wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs wmux-clean/docs/terminal-text-model.md
+git add docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md wmux-clean/crates/wmux-core/src/lib.rs wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs wmux-clean/docs/terminal-text-model.md
 git commit -m "feat(core): bound terminal control strings"
 ```
 

@@ -3,10 +3,12 @@ use std::fmt;
 use smallvec::SmallVec;
 use vte::{Params, Perform};
 
-use crate::screen::{DamageOperation, InsertDeleteKind};
+use crate::screen::{DamageOperation, InsertDeleteKind, MAX_TITLE_BYTES};
 use crate::{Color, CursorStyle, Screen};
 
 const MAX_CSI_PARAMS: usize = 32;
+pub const MAX_OSC_BYTES: usize = 1024;
+const _: () = assert!(MAX_TITLE_BYTES < MAX_OSC_BYTES);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CsiParams {
@@ -80,6 +82,7 @@ pub enum TerminalOperation {
     },
     SaveCursor,
     RestoreCursor,
+    SetTitle(String),
     Reset,
 }
 
@@ -198,10 +201,35 @@ impl Perform for TerminalBatch {
         };
         self.push(operation);
     }
+
+    fn put(&mut self, _byte: u8) {
+        // DCS payloads are intentionally discard-only. The core does not
+        // accumulate platform/device control strings it does not implement.
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if !params
+            .first()
+            .is_some_and(|command| matches!(*command, b"0" | b"2"))
+        {
+            return;
+        }
+
+        let mut raw = Vec::new();
+        for (index, part) in params.iter().skip(1).enumerate() {
+            if index > 0 {
+                raw.push(b';');
+            }
+            raw.extend_from_slice(part);
+        }
+        let mut title = String::from_utf8_lossy(&raw).into_owned();
+        truncate_utf8(&mut title, MAX_TITLE_BYTES);
+        self.push(TerminalOperation::SetTitle(title));
+    }
 }
 
 pub struct TerminalEngine {
-    parser: vte::Parser,
+    parser: vte::Parser<MAX_OSC_BYTES>,
     batch: TerminalBatch,
 }
 
@@ -216,7 +244,7 @@ impl fmt::Debug for TerminalEngine {
 impl TerminalEngine {
     pub fn new() -> Self {
         Self {
-            parser: vte::Parser::new(),
+            parser: vte::Parser::new_with_size(),
             batch: TerminalBatch::default(),
         }
     }
@@ -238,6 +266,17 @@ impl Default for TerminalEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 fn param(params: &[u16], index: usize, default: u16) -> u16 {
@@ -321,6 +360,7 @@ fn apply_batch(screen: &mut Screen, batch: &TerminalBatch) -> Option<u64> {
             }
             TerminalOperation::SaveCursor => screen.save_cursor(),
             TerminalOperation::RestoreCursor => screen.restore_cursor(),
+            TerminalOperation::SetTitle(title) => screen.set_title(title),
             TerminalOperation::Reset => {
                 screen.clear_screen_mode(2);
                 screen.set_cursor_visible(true);
@@ -418,6 +458,7 @@ fn record_operation_damage(screen: &mut Screen, operation: &TerminalOperation, b
                 enabled: true,
             }
         }
+        TerminalOperation::SetTitle(_) => DamageOperation::TitleChange,
         _ => DamageOperation::CursorMove {
             from: before,
             to: after,
@@ -502,7 +543,7 @@ fn parse_sgr_color(params: &[u16]) -> Option<(Color, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{TerminalEngine, TerminalOperation};
-    use crate::{Color, CursorStyle, Screen};
+    use crate::{Color, CursorStyle, Screen, MAX_TITLE_BYTES};
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
     fn run(bytes: &[u8]) -> Screen {
@@ -558,6 +599,51 @@ mod tests {
 
         assert_eq!(screen.grid().line(0).unwrap().text(), "he");
         assert_eq!(screen.cursor(), (0, 2));
+        assert_eq!(screen.title(), "ignored");
+    }
+
+    #[test]
+    fn osc_zero_and_two_update_a_bounded_authoritative_title() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 2);
+        engine.feed(&mut screen, b"\x1b]0;first;section\x07");
+        assert_eq!(screen.title(), "first;section");
+
+        let long = format!("\x1b]2;{}\x1b\\", "x".repeat(MAX_TITLE_BYTES + 40));
+        engine.feed(&mut screen, long.as_bytes());
+        assert_eq!(screen.title().len(), MAX_TITLE_BYTES);
+        assert_eq!(screen.title(), "x".repeat(MAX_TITLE_BYTES));
+
+        let unicode = format!("\x1b]2;{}\x07", "\u{754c}".repeat(200));
+        engine.feed(&mut screen, unicode.as_bytes());
+        assert_eq!(screen.title(), "\u{754c}".repeat(MAX_TITLE_BYTES / 3));
+        assert_eq!(screen.title().len(), 510);
+    }
+
+    #[test]
+    fn oversized_control_strings_recover_to_printable_ground_state() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("DCS", b"\x1bPq", b"\x1b\\"),
+            ("SOS", b"\x1bX", b"\x1b\\"),
+            ("PM", b"\x1b^", b"\x1b\\"),
+            ("APC", b"\x1b_", b"\x1b\\"),
+            ("OSC", b"\x1b]0;", b"\x07"),
+        ];
+
+        for (name, introducer, terminator) in cases {
+            let mut bytes = Vec::with_capacity(16 * 1024 + introducer.len() + terminator.len() + 5);
+            bytes.extend_from_slice(introducer);
+            bytes.extend(std::iter::repeat_n(b'x', 16 * 1024));
+            bytes.extend_from_slice(terminator);
+            bytes.extend_from_slice(b"after");
+
+            let screen = run(&bytes);
+            assert_eq!(
+                screen.grid().line(0).unwrap().text(),
+                "after",
+                "{name} did not return to ground state"
+            );
+        }
     }
 
     #[test]

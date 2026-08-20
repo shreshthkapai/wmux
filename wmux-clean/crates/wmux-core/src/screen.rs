@@ -5,6 +5,7 @@ use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
 const DAMAGE_JOURNAL_CAPACITY: usize = 512;
 const MAX_DAMAGE_OPERATIONS_PER_BATCH: usize = 256;
+pub const MAX_TITLE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InsertDeleteKind {
@@ -118,6 +119,7 @@ pub enum DamageOperation {
         mode: u16,
         enabled: bool,
     },
+    TitleChange,
     Full,
 }
 
@@ -158,6 +160,7 @@ pub struct Screen {
     cursor_style: CursorStyle,
     pending_wrap: bool,
     current_style: Style,
+    title: String,
 }
 
 impl Screen {
@@ -186,6 +189,7 @@ impl Screen {
             cursor_style: CursorStyle::Default,
             pending_wrap: false,
             current_style: Style::default(),
+            title: String::new(),
         }
     }
 
@@ -215,6 +219,19 @@ impl Screen {
 
     pub const fn cursor(&self) -> (u16, u16) {
         (self.cursor_row, self.cursor_col)
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn set_title(&mut self, title: &str) {
+        let mut end = title.len().min(MAX_TITLE_BYTES);
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.title.clear();
+        self.title.push_str(&title[..end]);
     }
 
     pub fn render_cursor(&self) -> (u16, u16) {
