@@ -2,7 +2,7 @@ use std::io::{self, IoSlice, Read, Write};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
 pub const VERSION: u32 = 5;
-const MAGIC: &[u8; 4] = b"WMX5";
+pub const MAGIC: [u8; 4] = *b"WMX5";
 pub const FRAME_HEADER_LEN: usize = 9;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -99,7 +99,7 @@ impl EncodedFrame {
         let tag = message.tag();
         let payload = EncodedPayload::from_message(message);
         let mut header = [0; FRAME_HEADER_LEN];
-        header[..MAGIC.len()].copy_from_slice(MAGIC);
+        header[..MAGIC.len()].copy_from_slice(&MAGIC);
         header[4] = tag;
         header[5..].copy_from_slice(&(payload.as_slice().len() as u32).to_le_bytes());
         Self { header, payload }
@@ -190,7 +190,7 @@ pub fn encode_frame(message: &Message) -> Vec<u8> {
 pub fn encode_frame_into(message: &Message, frame: &mut Vec<u8>) {
     frame.clear();
     frame.reserve(message.wire_len());
-    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(&MAGIC);
     frame.push(message.tag());
     frame.extend_from_slice(&(payload_len(message) as u32).to_le_bytes());
     encode_payload_into(message, frame);
@@ -198,7 +198,7 @@ pub fn encode_frame_into(message: &Message, frame: &mut Vec<u8>) {
 
 fn frame_header(tag: u8, payload_len: usize) -> [u8; FRAME_HEADER_LEN] {
     let mut header = [0; FRAME_HEADER_LEN];
-    header[..MAGIC.len()].copy_from_slice(MAGIC);
+    header[..MAGIC.len()].copy_from_slice(&MAGIC);
     header[4] = tag;
     header[5..].copy_from_slice(&(payload_len as u32).to_le_bytes());
     header
@@ -270,7 +270,7 @@ fn write_vectored_all(writer: &mut impl Write, header: &[u8], payload: &[u8]) ->
 
 /// Validate a frame header and return its tag and payload length.
 pub fn decode_frame_header(header: &[u8; FRAME_HEADER_LEN]) -> io::Result<(u8, usize)> {
-    if &header[..MAGIC.len()] != MAGIC {
+    if header[..MAGIC.len()] != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
@@ -299,7 +299,7 @@ pub fn read_message(mut reader: impl Read) -> io::Result<Option<Message>> {
     if read_or_eof(&mut reader, &mut magic)? {
         return Ok(None);
     }
-    if &magic != MAGIC {
+    if magic != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let mut tag = [0; 1];
@@ -526,13 +526,14 @@ mod tests {
     use super::{
         decode_frame_header, decode_frame_payload, decode_frame_payload_owned, encode_frame,
         read_message, write_message, EncodedFrame, Message, TerminalCapabilities, FRAME_HEADER_LEN,
-        VERSION,
+        MAGIC, VERSION,
     };
     use std::io;
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
     #[test]
     fn roundtrips_all_basics() {
+        assert_eq!(MAGIC, *b"WMX5");
         let messages = [
             Message::Hello {
                 version: VERSION,

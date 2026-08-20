@@ -1,5 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
+    future::Future,
     io::{self, IoSlice, Write},
     process,
     sync::{
@@ -15,18 +16,20 @@ use tokio::{
     sync::mpsc as async_mpsc,
     time::MissedTickBehavior,
 };
-use wmux_cli::{ConfigAction, Invocation, StartupPolicy};
+use wmux_cli::{ConfigAction, Invocation, ServerInvocation, StartupPolicy};
 use wmux_config::{config_path, WmuxConfig};
 use wmux_protocol::{
-    decode_frame_header, decode_frame_payload_owned, read_message, write_message, EncodedFrame,
-    Message, TerminalCapabilities, FRAME_HEADER_LEN, VERSION,
+    decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
+    FRAME_HEADER_LEN, VERSION,
 };
 use wmux_windows::{
     console,
     console::ConsoleInput,
     daemon::{spawn_user_daemon, DaemonSpec},
-    pipe::{connect, connect_async, is_running, Endpoint, NamedPipeClient},
+    pipe::{connect_async, Endpoint, NamedPipeClient},
 };
+
+const ERROR_PIPE_BUSY_RAW: i32 = 231;
 
 fn main() {
     if let Err(error) = run() {
@@ -51,19 +54,10 @@ fn run() -> io::Result<()> {
         Invocation::Config(ConfigAction::Path) => show_config_path(),
         Invocation::Config(ConfigAction::Show) => show_config(),
         Invocation::Config(ConfigAction::Effective) => show_effective_config(),
-        Invocation::Server(invocation) => {
-            if invocation.startup == StartupPolicy::StartIfMissing {
-                ensure_server()?;
-            }
-            if invocation.attached {
-                RuntimeBuilder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(attached_command(invocation.argv.join(" ")))
-            } else {
-                send_command(invocation.argv.join(" "))
-            }
-        }
+        Invocation::Server(invocation) => RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_server_invocation(invocation)),
     }
 }
 
@@ -88,15 +82,6 @@ fn show_effective_config() -> io::Result<()> {
     Ok(())
 }
 
-fn ensure_server() -> io::Result<()> {
-    let endpoint = Endpoint::current_user()?;
-    if is_running(&endpoint) {
-        return Ok(());
-    }
-    spawn_server()?;
-    Ok(())
-}
-
 fn spawn_server() -> io::Result<()> {
     let executable = std::env::current_exe()?.with_file_name("wmux-server.exe");
     let _ = spawn_user_daemon(&DaemonSpec {
@@ -107,14 +92,20 @@ fn spawn_server() -> io::Result<()> {
     Ok(())
 }
 
-fn send_command(command: String) -> io::Result<()> {
-    let mut pipe = connect_handshake()?;
-    write_message(&mut pipe, &Message::Command(command))?;
-    print_response(&mut pipe)
+async fn run_server_invocation(invocation: ServerInvocation) -> io::Result<()> {
+    let capabilities = terminal_capabilities();
+    let pipe = connect_for_invocation(&invocation, capabilities).await?;
+    let command = invocation.argv.join(" ");
+    if invocation.attached {
+        attached_command(pipe, command, capabilities).await
+    } else {
+        send_command(pipe, command).await
+    }
 }
 
-fn print_response(pipe: &mut File) -> io::Result<()> {
-    match read_message(pipe)? {
+async fn send_command(mut pipe: NamedPipeClient, command: String) -> io::Result<()> {
+    write_async_message(&mut pipe, Message::Command(command)).await?;
+    match read_async_message(&mut pipe).await? {
         Some(Message::CommandOk(message)) => {
             if !message.is_empty() {
                 println!("{message}");
@@ -133,9 +124,11 @@ fn print_response(pipe: &mut File) -> io::Result<()> {
     }
 }
 
-async fn attached_command(command: String) -> io::Result<()> {
-    let capabilities = terminal_capabilities();
-    let pipe = connect_async_handshake(capabilities).await?;
+async fn attached_command(
+    pipe: NamedPipeClient,
+    command: String,
+    capabilities: TerminalCapabilities,
+) -> io::Result<()> {
     let _console = console::ConsoleGuard::enter()?;
     console::write_output(b"\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25h\x1b[H\x1b[2J")?;
 
@@ -576,19 +569,45 @@ fn text(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn connect_handshake() -> io::Result<File> {
+async fn connect_for_invocation(
+    invocation: &ServerInvocation,
+    capabilities: TerminalCapabilities,
+) -> io::Result<NamedPipeClient> {
     let endpoint = Endpoint::current_user()?;
-    let mut pipe = connect_retry(&endpoint)?;
-    write_message(
+    let endpoint_name = endpoint.pipe_name().to_string();
+    connect_with_startup_policy(
+        invocation.startup,
+        &endpoint_name,
+        || connect_async_handshake_once(&endpoint, capabilities),
+        spawn_server,
+        tokio::time::sleep,
+    )
+    .await
+}
+
+async fn connect_async_handshake_once(
+    endpoint: &Endpoint,
+    capabilities: TerminalCapabilities,
+) -> io::Result<NamedPipeClient> {
+    let mut pipe = connect_async(endpoint)?;
+    write_async_message(
         &mut pipe,
-        &Message::Hello {
+        Message::Hello {
             version: VERSION,
             pid: process::id(),
-            capabilities: terminal_capabilities(),
+            capabilities,
         },
-    )?;
-    match read_message(&mut pipe)? {
+    )
+    .await?;
+    let response = read_async_message(&mut pipe)
+        .await
+        .map_err(|error| handshake_read_error(endpoint.pipe_name(), error))?;
+    match response {
         Some(Message::HelloOk { version, .. }) if version == VERSION => Ok(pipe),
+        Some(Message::HelloOk { version, .. }) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            protocol_error(version),
+        )),
         Some(Message::CommandErr(message)) => Err(io::Error::other(message)),
         Some(other) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -601,31 +620,116 @@ fn connect_handshake() -> io::Result<File> {
     }
 }
 
-async fn connect_async_handshake(
-    capabilities: TerminalCapabilities,
-) -> io::Result<NamedPipeClient> {
-    let endpoint = Endpoint::current_user()?;
-    let mut pipe = connect_async_retry(&endpoint).await?;
-    write_async_message(
-        &mut pipe,
-        Message::Hello {
-            version: VERSION,
-            pid: process::id(),
-            capabilities,
-        },
+async fn connect_with_startup_policy<T, Connect, ConnectFuture, Spawn, Sleep, SleepFuture>(
+    startup: StartupPolicy,
+    endpoint_name: &str,
+    mut connect: Connect,
+    mut spawn: Spawn,
+    mut sleep: Sleep,
+) -> io::Result<T>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: Future<Output = io::Result<T>>,
+    Spawn: FnMut() -> io::Result<()>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+{
+    let first_error = match connect().await {
+        Ok(connection) => return Ok(connection),
+        Err(error) => error,
+    };
+    match classify_connection_failure(&first_error) {
+        ConnectionFailure::Terminal => return Err(first_error),
+        ConnectionFailure::Absent if startup == StartupPolicy::RequireExisting => {
+            return Err(no_server_error(endpoint_name));
+        }
+        ConnectionFailure::Retryable if startup == StartupPolicy::RequireExisting => {
+            return Err(connection_error(endpoint_name, first_error));
+        }
+        ConnectionFailure::Absent => spawn().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to start wmux server: {error}"),
+            )
+        })?,
+        ConnectionFailure::Retryable => {}
+    }
+
+    let mut last_error = first_error;
+    for delay in retry_delays() {
+        sleep(delay).await;
+        match connect().await {
+            Ok(connection) => return Ok(connection),
+            Err(error) if classify_connection_failure(&error) == ConnectionFailure::Terminal => {
+                return Err(error);
+            }
+            Err(error) => last_error = error,
+        }
+    }
+
+    if classify_connection_failure(&last_error) == ConnectionFailure::Absent {
+        Err(no_server_error(endpoint_name))
+    } else {
+        Err(connection_error(endpoint_name, last_error))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionFailure {
+    Absent,
+    Retryable,
+    Terminal,
+}
+
+fn classify_connection_failure(error: &io::Error) -> ConnectionFailure {
+    if error.kind() == io::ErrorKind::NotFound || matches!(error.raw_os_error(), Some(2 | 3)) {
+        ConnectionFailure::Absent
+    } else if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused
+    ) || error.raw_os_error() == Some(ERROR_PIPE_BUSY_RAW)
+    {
+        ConnectionFailure::Retryable
+    } else {
+        ConnectionFailure::Terminal
+    }
+}
+
+fn retry_delays() -> [Duration; 20] {
+    [Duration::from_millis(50); 20]
+}
+
+fn no_server_message(endpoint_name: &str) -> String {
+    format!("no wmux server running for this user ({endpoint_name})")
+}
+
+fn no_server_error(endpoint_name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, no_server_message(endpoint_name))
+}
+
+fn connection_error(endpoint_name: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("could not connect to wmux server ({endpoint_name}): {error}"),
     )
-    .await?;
-    match read_async_message(&mut pipe).await? {
-        Some(Message::HelloOk { version, .. }) if version == VERSION => Ok(pipe),
-        Some(Message::CommandErr(message)) => Err(io::Error::other(message)),
-        Some(other) => Err(io::Error::new(
+}
+
+fn protocol_error(server_version: u32) -> String {
+    format!("wmux protocol mismatch: client protocol {VERSION}, server protocol {server_version}")
+}
+
+fn incompatible_server_message(endpoint_name: &str) -> String {
+    format!("an incompatible wmux server owns endpoint ({endpoint_name}); stop it before retrying")
+}
+
+fn handshake_read_error(endpoint_name: &str, error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::InvalidData && error.to_string() == "bad magic" {
+        io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("bad hello response: {other:?}"),
-        )),
-        None => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "server closed during handshake",
-        )),
+            incompatible_server_message(endpoint_name),
+        )
+    } else {
+        error
     }
 }
 
@@ -647,41 +751,123 @@ fn terminal_capabilities() -> TerminalCapabilities {
     TerminalCapabilities::new(bits)
 }
 
-async fn connect_async_retry(endpoint: &Endpoint) -> io::Result<NamedPipeClient> {
-    let mut last = None;
-    for _ in 0..20 {
-        match connect_async(endpoint) {
-            Ok(pipe) => return Ok(pipe),
-            Err(error) => {
-                last = Some(error);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| io::Error::other("connect failed")))
-}
-
-fn connect_retry(endpoint: &Endpoint) -> io::Result<File> {
-    let mut last = None;
-    for _ in 0..20 {
-        match connect(endpoint) {
-            Ok(pipe) => return Ok(pipe),
-            Err(error) => {
-                last = Some(error);
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| io::Error::other("connect failed")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_attached_inbound, prefix_command_sequence, read_inbound_messages,
-        write_async_message, AttachedInbound,
+        classify_attached_inbound, connect_with_startup_policy, handshake_read_error,
+        no_server_message, prefix_command_sequence, protocol_error, read_inbound_messages,
+        retry_delays, write_async_message, AttachedInbound,
     };
+    use std::{cell::Cell, future::ready, io};
+    use wmux_cli::StartupPolicy;
     use wmux_protocol::Message;
+
+    #[test]
+    fn connection_diagnostics_name_the_endpoint_and_protocol_versions() {
+        assert_eq!(
+            no_server_message(r"\\.\pipe\wmux-S-1-5-21-x"),
+            r"no wmux server running for this user (\\.\pipe\wmux-S-1-5-21-x)"
+        );
+        assert!(protocol_error(wmux_protocol::VERSION - 1).contains("client protocol 5"));
+        assert!(protocol_error(wmux_protocol::VERSION - 1).contains("server protocol 4"));
+        assert_eq!(retry_delays().len(), 20);
+
+        let incompatible = handshake_read_error(
+            r"\\.\pipe\wmux-test",
+            io::Error::new(io::ErrorKind::InvalidData, "bad magic"),
+        );
+        assert!(incompatible
+            .to_string()
+            .contains("incompatible wmux server"));
+        assert!(incompatible.to_string().contains("stop it"));
+    }
+
+    #[tokio::test]
+    async fn connection_require_existing_attempts_once_without_spawning() {
+        let attempts = Cell::new(0);
+        let spawns = Cell::new(0);
+        let error = connect_with_startup_policy(
+            StartupPolicy::RequireExisting,
+            r"\\.\pipe\wmux-test",
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(Err::<(), _>(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "missing",
+                )))
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            |_| ready(()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(spawns.get(), 0);
+        assert_eq!(
+            error.to_string(),
+            r"no wmux server running for this user (\\.\pipe\wmux-test)"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_start_if_missing_spawns_once_then_retries() {
+        let attempts = Cell::new(0);
+        let spawns = Cell::new(0);
+        connect_with_startup_policy(
+            StartupPolicy::StartIfMissing,
+            r"\\.\pipe\wmux-test",
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(if attempts.get() == 1 {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+                } else {
+                    Ok(())
+                })
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            |_| ready(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(spawns.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_security_and_protocol_failures_are_terminal() {
+        let attempts = Cell::new(0);
+        let spawns = Cell::new(0);
+        let error = connect_with_startup_policy(
+            StartupPolicy::StartIfMissing,
+            r"\\.\pipe\wmux-test",
+            || {
+                attempts.set(attempts.get() + 1);
+                ready(Err::<(), _>(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "endpoint owner mismatch",
+                )))
+            },
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(())
+            },
+            |_| ready(()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(spawns.get(), 0);
+    }
 
     #[test]
     fn prefix_numbers_select_windows_by_index() {
