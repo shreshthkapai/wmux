@@ -15,8 +15,8 @@ use tokio::{
     sync::mpsc as async_mpsc,
     time::MissedTickBehavior,
 };
+use wmux_cli::{ConfigAction, Invocation, StartupPolicy};
 use wmux_config::{config_path, WmuxConfig};
-use wmux_core::resolve_command_name;
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, read_message, write_message, EncodedFrame,
     Message, TerminalCapabilities, FRAME_HEADER_LEN, VERSION,
@@ -36,63 +36,33 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    match classify_invocation(&args)? {
-        Invocation::ConfigPath => show_config_path(),
-        Invocation::ConfigShow => show_config(),
-        Invocation::ConfigEffective => show_effective_config(),
-        Invocation::StartServer => {
-            ensure_server()?;
-            send_command("start-server".to_string())
+    match wmux_cli::parse(&args)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+    {
+        Invocation::Help => {
+            print!("{}", wmux_cli::HELP);
+            Ok(())
         }
-        Invocation::KillServer => send_command("kill-server".to_string()),
-        Invocation::Attached(command) => {
-            ensure_server()?;
-            RuntimeBuilder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(attached_command(command.join(" ")))
+        Invocation::Version => {
+            println!("{}", wmux_cli::version_line());
+            Ok(())
         }
-        Invocation::Command(command) => send_command(command.join(" ")),
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum Invocation {
-    ConfigPath,
-    ConfigShow,
-    ConfigEffective,
-    StartServer,
-    KillServer,
-    Attached(Vec<String>),
-    Command(Vec<String>),
-}
-
-fn classify_invocation(args: &[String]) -> io::Result<Invocation> {
-    match args {
-        [] => return Ok(Invocation::Attached(vec!["new-session".to_string()])),
-        [config, command] if config == "config" && command == "path" => {
-            return Ok(Invocation::ConfigPath)
+        Invocation::Config(ConfigAction::Path) => show_config_path(),
+        Invocation::Config(ConfigAction::Show) => show_config(),
+        Invocation::Config(ConfigAction::Effective) => show_effective_config(),
+        Invocation::Server(invocation) => {
+            if invocation.startup == StartupPolicy::StartIfMissing {
+                ensure_server()?;
+            }
+            if invocation.attached {
+                RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(attached_command(invocation.argv.join(" ")))
+            } else {
+                send_command(invocation.argv.join(" "))
+            }
         }
-        [config, command] if config == "config" && command == "show" => {
-            return Ok(Invocation::ConfigShow)
-        }
-        [config, command] if config == "config" && command == "effective" => {
-            return Ok(Invocation::ConfigEffective)
-        }
-        _ => {}
-    }
-
-    let canonical = resolve_command_name(&args[0])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.0))?;
-    let mut command = args.to_vec();
-    command[0] = canonical.to_string();
-
-    match canonical {
-        "start-server" => Ok(Invocation::StartServer),
-        "kill-server" => Ok(Invocation::KillServer),
-        "attach-session" => Ok(Invocation::Attached(command)),
-        "new-session" if !args.iter().any(|arg| arg == "-d") => Ok(Invocation::Attached(command)),
-        _ => Ok(Invocation::Command(command)),
     }
 }
 
@@ -715,52 +685,10 @@ fn log_file(name: &str) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_attached_inbound, classify_invocation, prefix_command_sequence,
-        read_inbound_messages, write_async_message, AttachedInbound, Invocation,
+        classify_attached_inbound, prefix_command_sequence, read_inbound_messages,
+        write_async_message, AttachedInbound,
     };
     use wmux_protocol::Message;
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn bare_wmux_runs_tmux_default_command() {
-        assert_eq!(
-            classify_invocation(&[]).unwrap(),
-            Invocation::Attached(args(&["new-session"]))
-        );
-    }
-
-    #[test]
-    fn tmux_aliases_and_prefixes_are_canonicalized_before_dispatch() {
-        assert_eq!(
-            classify_invocation(&args(&["new", "-s", "work"])).unwrap(),
-            Invocation::Attached(args(&["new-session", "-s", "work"]))
-        );
-        assert_eq!(
-            classify_invocation(&args(&["a", "-t", "work"])).unwrap(),
-            Invocation::Attached(args(&["attach-session", "-t", "work"]))
-        );
-        assert_eq!(
-            classify_invocation(&args(&["ls"])).unwrap(),
-            Invocation::Command(args(&["list-sessions"]))
-        );
-    }
-
-    #[test]
-    fn server_lifecycle_uses_tmux_command_names() {
-        assert_eq!(
-            classify_invocation(&args(&["start"])).unwrap(),
-            Invocation::StartServer
-        );
-        assert_eq!(
-            classify_invocation(&args(&["kill-server"])).unwrap(),
-            Invocation::KillServer
-        );
-        assert!(classify_invocation(&args(&["server", "stop"])).is_err());
-        assert!(classify_invocation(&args(&["status"])).is_err());
-    }
 
     #[test]
     fn prefix_numbers_select_windows_by_index() {

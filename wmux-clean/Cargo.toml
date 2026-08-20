@@ -6,6 +6,7 @@ members = [
     "crates/wmux-protocol",
     "crates/wmux-windows",
     "crates/wmux-server",
+    "crates/wmux-cli",
     "crates/wmux-client",
     "crates/wmux-bench",
     "crates/wmux-conformance",

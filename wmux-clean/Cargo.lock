@@ -414,8 +414,8 @@ name = "wmux"
 version = "0.1.0"
 dependencies = [
  "tokio",
+ "wmux-cli",
  "wmux-config",
- "wmux-core",
  "wmux-platform",
  "wmux-protocol",
  "wmux-windows",
@@ -427,6 +427,13 @@ version = "0.1.0"
 dependencies = [
  "wmux-core",
  "wmux-protocol",
+]
+
+[[package]]
+name = "wmux-cli"
+version = "0.1.0"
+dependencies = [
+ "wmux-core",
 ]
 
 [[package]]
