@@ -526,7 +526,7 @@ mod tests {
     use super::{
         decode_frame_header, decode_frame_payload, decode_frame_payload_owned, encode_frame,
         read_message, write_message, EncodedFrame, Message, TerminalCapabilities, FRAME_HEADER_LEN,
-        MAGIC, VERSION,
+        MAGIC, MAX_FRAME, VERSION,
     };
     use std::io;
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
@@ -609,5 +609,19 @@ mod tests {
             decode_frame_payload_owned(9, vec![1]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn protocol_documentation_matches_wire_constants() {
+        let documentation = include_str!("../../../docs/ipc-protocol.md");
+        assert!(documentation
+            .lines()
+            .any(|line| line == format!("Protocol version: {VERSION}")));
+        assert!(documentation
+            .lines()
+            .any(|line| line == format!("Wire magic: {}", String::from_utf8_lossy(&MAGIC))));
+        assert!(documentation
+            .lines()
+            .any(|line| line == format!("Maximum frame payload: {MAX_FRAME} bytes")));
     }
 }

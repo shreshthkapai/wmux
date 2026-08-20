@@ -74,6 +74,14 @@ impl ConptyPane {
         let _ = unsafe { TerminateJobObject(self.job.raw, exit_code) };
         self.pseudo_console.take();
     }
+
+    /// Close the server-owned ConPTY endpoints after the process waiter has
+    /// observed exit. The output reader remains in forwarding mode so bytes
+    /// already buffered by ConPTY are delivered before EOF closes its sender.
+    pub fn finish_after_process_exit(&mut self) {
+        self.input.take();
+        self.pseudo_console.take();
+    }
 }
 
 impl Drop for ConptyPane {
@@ -944,6 +952,43 @@ mod tests {
             !process_is_running(child),
             "descendant process {child} survived pane termination"
         );
+    }
+
+    #[test]
+    fn process_exit_and_conpty_eof_close_the_event_stream_once() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let notify: PlatformNotifier = Arc::new(|_| {});
+        let pane_id = PlatformPaneId::new(99_003);
+        let (mut pane, mut events) = spawn_shell(
+            pane_id,
+            TerminalSize::new(80, 24),
+            &[],
+            runtime.handle(),
+            notify,
+        )
+        .unwrap();
+        pane.write_input(b"exit 23\r".to_vec()).unwrap();
+
+        let exits = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut exits = Vec::new();
+                while let Some(event) = events.recv().await {
+                    if let PlatformEvent::PtyExited { exit_code, .. } = event {
+                        exits.push(exit_code);
+                        pane.finish_after_process_exit();
+                    }
+                }
+                exits
+            })
+            .await
+            .expect("ConPTY event stream remained open after process exit and EOF")
+        });
+
+        assert_eq!(exits, vec![Some(23)]);
     }
 
     fn marker_pid(bytes: &[u8], marker: &[u8]) -> Option<u32> {

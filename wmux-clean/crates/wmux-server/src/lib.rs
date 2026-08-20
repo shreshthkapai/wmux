@@ -696,6 +696,9 @@ impl Runtime {
         let Some(pane) = self.state.pane_mut(pane_id) else {
             return false;
         };
+        if pane.dead {
+            return false;
+        }
         pane.dead = true;
         let status = match exit_code {
             Some(code) => format!("\r\n[wmux pane exited code={code}]\r\n"),
@@ -779,7 +782,7 @@ impl Runtime {
                     budget.per_pane_time,
                 )
             };
-            let (still_polling, first_exit) = {
+            let (still_polling, completed) = {
                 let platform = self
                     .platform_panes
                     .get_mut(&pane_id)
@@ -790,8 +793,16 @@ impl Runtime {
                 let first_exit = collected.exit_code.is_some() && !platform.exited;
                 if first_exit {
                     platform.exited = true;
+                    if let Some(conpty) = platform.conpty.as_mut() {
+                        if collected.exit_code.flatten().is_some() {
+                            conpty.finish_after_process_exit();
+                        } else {
+                            conpty.terminate(1);
+                        }
+                    }
                 }
-                (!(platform.disconnected && platform.exited), first_exit)
+                let completed = platform.disconnected && platform.exited;
+                (!completed, completed)
             };
             if still_polling {
                 self.output_ring.push_back(pane_id);
@@ -800,10 +811,20 @@ impl Runtime {
             result.changed |= applied.changed;
             result.publishable |= applied.publishable;
             result.synchronized_commit |= applied.synchronized_commit;
-            if let Some(exit_code) = collected.exit_code.filter(|_| first_exit) {
+            let exit_to_apply = match collected.exit_code {
+                Some(Some(exit_code)) => Some(Some(exit_code)),
+                Some(None) if collected.disconnected => Some(None),
+                _ => None,
+            };
+            if let Some(exit_code) = exit_to_apply {
                 if self.apply_pty_exit(pane_id, exit_code) {
                     result.changed = true;
                 }
+            }
+            if completed {
+                self.platform_panes.remove(&pane_id);
+                self.sync_started_at.remove(&pane_id);
+                self.resize_repaint_holds.remove(&pane_id);
             }
         }
         result
@@ -875,10 +896,17 @@ fn collect_pane_events(
     while collected.bytes.len() < byte_budget && started.elapsed() < time_budget {
         match rx.try_recv() {
             Ok(PlatformEvent::PtyOutput { bytes, .. }) => collected.bytes.extend_from_slice(&bytes),
-            Ok(PlatformEvent::PtyExited { exit_code, .. }) => collected.exit_code = Some(exit_code),
+            Ok(PlatformEvent::PtyExited { exit_code, .. }) => {
+                if collected.exit_code.is_none() || exit_code.is_some() {
+                    collected.exit_code = Some(exit_code);
+                }
+            }
             Err(AsyncTryRecvError::Empty) => break,
             Err(AsyncTryRecvError::Disconnected) => {
                 collected.disconnected = true;
+                if collected.exit_code.is_none() {
+                    collected.exit_code = Some(None);
+                }
                 break;
             }
         }
@@ -2278,6 +2306,57 @@ mod tests {
         assert!(!endpoint.lock_path().exists());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_after_hello_preserves_detached_session() {
+        let endpoint = Endpoint::for_instance(&unique_instance("hello-disconnect")).unwrap();
+        let (server_thread, server_done) = start_test_server(endpoint.clone());
+
+        let mut controller = connect_test_client(&endpoint).await;
+        write_async_message(
+            &mut controller,
+            Message::Command("new-session -d -s durable".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_until(&mut controller, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+
+        let disposable = connect_test_client(&endpoint).await;
+        drop(disposable);
+
+        write_async_message(
+            &mut controller,
+            Message::Command("list-sessions".to_string()),
+        )
+        .await
+        .unwrap();
+        let listed = read_until(&mut controller, |message| {
+            matches!(message, Message::CommandOk(_))
+        })
+        .await;
+        assert!(matches!(listed, Message::CommandOk(text) if text.contains("durable:")));
+
+        write_async_message(&mut controller, Message::Command("kill-server".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_until(&mut controller, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+        drop(controller);
+        await_test_server(server_thread, server_done).await;
+    }
+
     fn start_test_server(
         endpoint: Endpoint,
     ) -> (
@@ -2608,6 +2687,51 @@ mod tests {
         let collected = collect_pane_events(&mut rx, 64, PER_PANE_OUTPUT_TIME);
 
         assert_eq!(collected.bytes, b"abcdef");
+    }
+
+    #[test]
+    fn exit_and_eof_are_coalesced_and_release_the_platform_pane() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("exit-race", 80, 24);
+        let (tx, rx) = mpsc::channel(4);
+        runtime.platform_panes.insert(
+            created.pane,
+            PlatformPane::test(rx, TerminalSize::new(80, 24)),
+        );
+        runtime.output_ring.push_back(created.pane);
+        let pane = PlatformPaneId::new(created.pane.raw());
+        tx.try_send(PlatformEvent::PtyExited {
+            pane,
+            exit_code: None,
+        })
+        .unwrap();
+        assert!(
+            !runtime
+                .process_output_round(OutputBudget::default())
+                .changed
+        );
+        assert!(runtime.platform_panes.contains_key(&created.pane));
+
+        tx.try_send(PlatformEvent::PtyExited {
+            pane,
+            exit_code: Some(23),
+        })
+        .unwrap();
+        drop(tx);
+
+        assert!(
+            runtime
+                .process_output_round(OutputBudget::default())
+                .changed
+        );
+        let screen = runtime.state.pane(created.pane).unwrap().screen.grid();
+        let text = (0..screen.rows())
+            .filter_map(|row| screen.line(row))
+            .map(|line| line.text())
+            .collect::<String>();
+        assert_eq!(text.matches("[wmux pane exited code=23]").count(), 1);
+        assert!(!runtime.platform_panes.contains_key(&created.pane));
+        assert!(!runtime.output_ring.contains(&created.pane));
     }
 
     #[test]

@@ -95,6 +95,15 @@ transaction:
 No worker calls `process::exit`. Client disconnection remains a detach event and
 does not enter this sequence.
 
+Process exit and ConPTY output completion are also ordered explicitly. The
+process waiter is the authoritative source of the exit code. On its first exit
+event, the server closes the process-facing ConPTY endpoints while leaving the
+output reader in forwarding mode. Buffered terminal output drains to EOF; once
+the event channel closes, the platform pane is released while the dead core
+pane and its authoritative screen remain available. A simultaneous generic I/O
+failure cannot replace a concrete process status or append a second logical
+exit marker.
+
 ## Windows ownership rules
 
 - The daemon process is created by the local WMI provider in the calling user's
@@ -107,6 +116,24 @@ does not enter this sequence.
   Closing or crashing a client cannot close a pane Job Object.
 - Server exit closes the endpoint and lock only after control replies drain or
   the bounded shutdown deadline expires.
+
+## Phase 3 verification record
+
+Native tests use unique instance suffixes and bounded waits. They verify the
+owner-only DACL and token SID comparison, first-pipe exclusion, stale and live
+lock ownership, WMI persistence, disconnect/reattach independence, one logical
+ConPTY exit, complete shutdown frames, lock release, and same-endpoint restart.
+The protocol constants are tied to `docs/ipc-protocol.md` by a compile-time
+included unit test so version, magic, and maximum payload documentation cannot
+drift silently.
+
+The exit/EOF regression was evidence-led: before the lifecycle fix, the native
+test timed out because the pseudoconsole remained owned after process exit, and
+the server coalescing test lost a concrete exit code when a generic indication
+arrived afterward. The fix closes the ConPTY endpoint on the first process exit,
+drains buffered output, prefers the concrete status, and drops the completed
+platform pane. Other Phase 3 race tests passed as characterization and did not
+trigger speculative implementation changes.
 
 ## Primary platform references
 

@@ -70,7 +70,7 @@ whole `Screen` and prevents transient clear frames from reaching clients.
 
 ## Terminal capabilities
 
-IPC protocol version 3 carries terminal capability bits in `Hello` and
+IPC protocol version 5 carries terminal capability bits in `Hello` and
 `HelloOk`. The server emits complete unframed render transactions. The client
 owns the physical host terminal and wraps each accepted transaction in one
 locked synchronized-output write when support was advertised, following

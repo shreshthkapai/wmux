@@ -34,6 +34,38 @@ types or host-dependent behavior from entering the shared semantic path.
 | Process-tree cleanup | Job Object descendant test | Awaiting Unix backend | Awaiting Unix backend |
 | Native transport | Named-pipe tests | Awaiting Unix backend | Awaiting Unix backend |
 
+### Phase 3 Windows lifecycle evidence
+
+The following rows are native automated tests run on Windows. They exercise
+unique per-test SID endpoints and bounded waits; they do not depend on an
+interactive terminal host.
+
+The Phase 3 verification run on 2026-08-20 passed all 209 workspace tests,
+produced portable conformance fingerprint `77b632078fd0ab8b`, and passed the
+full release performance gate.
+
+| Contract | Automated evidence | Status |
+| --- | --- | --- |
+| Token-SID endpoint identity and bounded unique instance names | `wmux-windows::pipe::tests::endpoint_*` | Verified |
+| Owner-only DACL, first-instance exclusion, and peer SID rejection | `factory_sddl_grants_only_the_owner_sid`, `factory_rejects_a_preexisting_first_pipe_instance`, `authenticated_pipe_is_full_duplex_and_rejects_a_different_sid` | Verified |
+| Stale marker recovery without replacing a live lock owner | `server_lock_recovers_a_stale_lock_file`, `server_lock_rejects_a_second_live_owner`, `server_lock_prevents_replacement_while_its_owner_is_live` | Verified |
+| WMI daemon survives bootstrap exit and is cleaned up by PID ownership | `native_wmi_launcher_returns_a_live_process`, `bootstrap_timeout_is_bounded_when_output_pipes_fill`, `bootstrap_return_is_bounded_when_descendant_inherits_output` | Verified |
+| Client disconnect after authenticated hello preserves detached state | `disconnect_after_hello_preserves_detached_session` | Verified |
+| Process exit plus ConPTY EOF yields one status and closes the event stream | `process_exit_and_conpty_eof_close_the_event_stream_once`, `exit_and_eof_are_coalesced_and_release_the_platform_pane` | Verified |
+| `kill-server` sends complete final frames and releases listener/lock state | `shutdown_writer_flushes_reports_drain_and_returns`, `shutdown_drains_clients_releases_lock_and_restarts` | Verified |
+| Same SID endpoint can restart after graceful shutdown | `shutdown_drains_clients_releases_lock_and_restarts` | Verified |
+
+Interactive host/shell combinations remain a separate manual acceptance pass.
+No automated ConPTY or renderer test identifies the enclosing host as Windows
+Terminal, conhost, or VS Code, so those combinations are not inferred from the
+native results above.
+
+| Terminal host | PowerShell 7 | Windows PowerShell | cmd.exe |
+| --- | --- | --- | --- |
+| Windows Terminal | Manual pending | Manual pending | Manual pending |
+| conhost | Manual pending | Manual pending | Manual pending |
+| VS Code integrated terminal | Manual pending | Manual pending | Manual pending |
+
 Windows process cleanup launches a real descendant process and verifies that
 terminating the pane's Job Object kills the descendant. This matches the
 documented Windows behavior that child processes join the parent's job by
