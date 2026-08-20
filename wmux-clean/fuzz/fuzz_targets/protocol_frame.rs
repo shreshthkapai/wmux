@@ -4,6 +4,12 @@ use libfuzzer_sys::fuzz_target;
 use wmux_protocol::{decode_frame_header, decode_frame_payload, FRAME_HEADER_LEN};
 
 fuzz_target!(|data: &[u8]| {
+    if let Some((&selector, payload)) = data.split_first() {
+        let tag = selector % 14 + 1;
+        let payload = &payload[..payload.len().min(64 * 1024)];
+        let _ = decode_frame_payload(tag, payload);
+    }
+
     if data.len() < FRAME_HEADER_LEN {
         return;
     }

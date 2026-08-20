@@ -271,15 +271,16 @@ impl CopyMode {
 
     fn search(&mut self, lines: &[Line], rows: u16, direction: SearchDirection, query: &str) {
         let found = match direction {
-            SearchDirection::Forward => ((self.cursor.line + 1)..lines.len())
-                .find_map(|line| lines[line].text().find(query).map(|column| (line, column))),
-            SearchDirection::Backward => (0..self.cursor.line)
-                .rev()
-                .find_map(|line| lines[line].text().rfind(query).map(|column| (line, column))),
+            SearchDirection::Forward => ((self.cursor.line + 1)..lines.len()).find_map(|line| {
+                find_query_column(&lines[line], query, false).map(|column| (line, column))
+            }),
+            SearchDirection::Backward => (0..self.cursor.line).rev().find_map(|line| {
+                find_query_column(&lines[line], query, true).map(|column| (line, column))
+            }),
         };
         if let Some((line, column)) = found {
             self.cursor.line = line;
-            self.cursor.column = column.min(usize::from(u16::MAX)) as u16;
+            self.cursor.column = column;
             self.ensure_cursor_visible(lines.len(), rows);
         }
     }
@@ -313,34 +314,34 @@ impl CopyMode {
     }
 
     fn previous_word(&mut self, lines: &[Line]) {
-        let text = lines
-            .get(self.cursor.line)
-            .map_or_else(String::new, Line::text);
-        let bytes = text.as_bytes();
-        let mut column = usize::from(self.cursor.column).min(bytes.len());
+        let Some(line) = lines.get(self.cursor.line) else {
+            return;
+        };
+        let end = usize::from(line_end(Some(line)));
+        let mut column = usize::from(self.cursor.column).min(end);
         column = column.saturating_sub(1);
-        while column > 0 && bytes[column].is_ascii_whitespace() {
+        while column > 0 && column_is_ascii_whitespace(line, column) {
             column -= 1;
         }
-        while column > 0 && !bytes[column - 1].is_ascii_whitespace() {
+        while column > 0 && !column_is_ascii_whitespace(line, column - 1) {
             column -= 1;
         }
-        self.cursor.column = column as u16;
+        self.cursor.column = normalize_cell_start(line, column);
     }
 
     fn next_word(&mut self, lines: &[Line]) {
-        let text = lines
-            .get(self.cursor.line)
-            .map_or_else(String::new, Line::text);
-        let bytes = text.as_bytes();
-        let mut column = usize::from(self.cursor.column).min(bytes.len());
-        while column < bytes.len() && !bytes[column].is_ascii_whitespace() {
+        let Some(line) = lines.get(self.cursor.line) else {
+            return;
+        };
+        let end = usize::from(line_end(Some(line)));
+        let mut column = usize::from(self.cursor.column).min(end);
+        while column < end && !column_is_ascii_whitespace(line, column) {
             column += 1;
         }
-        while column < bytes.len() && bytes[column].is_ascii_whitespace() {
+        while column < end && column_is_ascii_whitespace(line, column) {
             column += 1;
         }
-        self.cursor.column = column.min(usize::from(u16::MAX)) as u16;
+        self.cursor.column = normalize_cell_start(line, column);
     }
 
     fn ensure_cursor_visible(&mut self, total: usize, rows: u16) {
@@ -375,6 +376,52 @@ fn line_end(line: Option<&Line>) -> u16 {
             .min(usize::from(line.cols()))
             .min(usize::from(u16::MAX)) as u16
     })
+}
+
+fn find_query_column(line: &Line, query: &str, reverse: bool) -> Option<u16> {
+    let text = line.text();
+    let byte_offset = if reverse {
+        text.rfind(query)?
+    } else {
+        text.find(query)?
+    };
+    Some(byte_offset_to_grid_column(line, byte_offset))
+}
+
+fn byte_offset_to_grid_column(line: &Line, byte_offset: usize) -> u16 {
+    let mut consumed = 0_usize;
+    for column in 0..line.cols() {
+        let Some(cell) = line.cell(column) else {
+            break;
+        };
+        if cell.is_continuation() {
+            continue;
+        }
+        let end = consumed.saturating_add(cell.text().byte_len());
+        if byte_offset < end {
+            return column;
+        }
+        consumed = end;
+    }
+    line_end(Some(line))
+}
+
+fn column_is_ascii_whitespace(line: &Line, column: usize) -> bool {
+    u16::try_from(column)
+        .ok()
+        .and_then(|column| line.cell(column))
+        .is_some_and(|cell| {
+            !cell.is_continuation() && cell.text().first_char().is_ascii_whitespace()
+        })
+}
+
+fn normalize_cell_start(line: &Line, column: usize) -> u16 {
+    let column = column.min(usize::from(u16::MAX)) as u16;
+    if line.cell(column).is_some_and(|cell| cell.is_continuation()) {
+        line.previous_cell_start(column.saturating_add(1))
+    } else {
+        column
+    }
 }
 
 fn line_text_range(line: &Line, from: u16, to: u16) -> String {
@@ -455,6 +502,56 @@ mod tests {
         mode.handle_key(b"target", &lines, 2);
         mode.handle_key(b"\r", &lines, 2);
         assert_eq!(mode.cursor(), CopyPosition { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn search_maps_utf8_offsets_to_grid_columns() {
+        let mut combined = Line::blank(32);
+        let mut text = CellText::from('e');
+        assert!(text.try_append('\u{301}'));
+        combined.set_text(0, text, 1, Style::default());
+        combined.set(1, ' ', 1, Style::default());
+        for (offset, ch) in "target".chars().enumerate() {
+            combined.set(offset as u16 + 2, ch, 1, Style::default());
+        }
+        let lines = vec![line("zero"), combined];
+        let mut mode = CopyMode::new(PaneId::new(1), 0, 0, lines.len(), 2);
+
+        mode.handle_key(b"/", &lines, 2);
+        mode.handle_key(b"target", &lines, 2);
+        mode.handle_key(b"\r", &lines, 2);
+
+        assert_eq!(mode.cursor(), CopyPosition { line: 1, column: 2 });
+    }
+
+    #[test]
+    fn word_navigation_uses_grid_columns_for_multibyte_cells() {
+        let lines = vec![line("\u{3bb} target")];
+        let mut mode = CopyMode::new(PaneId::new(1), 0, 0, lines.len(), 1);
+
+        mode.handle_key(b"w", &lines, 1);
+        assert_eq!(mode.cursor(), CopyPosition { line: 0, column: 2 });
+
+        mode.handle_key(b"b", &lines, 1);
+        assert_eq!(mode.cursor(), CopyPosition { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn word_navigation_crosses_wide_cell_continuations() {
+        let mut wide = Line::blank(16);
+        wide.set(0, '\u{754c}', 2, Style::default());
+        wide.set(2, ' ', 1, Style::default());
+        for (offset, ch) in "target".chars().enumerate() {
+            wide.set(offset as u16 + 3, ch, 1, Style::default());
+        }
+        let lines = vec![wide];
+        let mut mode = CopyMode::new(PaneId::new(1), 0, 0, lines.len(), 1);
+
+        mode.handle_key(b"w", &lines, 1);
+        assert_eq!(mode.cursor(), CopyPosition { line: 0, column: 3 });
+
+        mode.handle_key(b"b", &lines, 1);
+        assert_eq!(mode.cursor(), CopyPosition { line: 0, column: 0 });
     }
 
     #[test]

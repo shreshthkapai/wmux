@@ -2,6 +2,13 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::text::{extends_grapheme, CellText};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphemeAppend {
+    NotExtension,
+    IgnoredOverLimit,
+    Appended { old_width: u8, new_width: u8 },
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Color {
     #[default]
@@ -274,15 +281,14 @@ impl Line {
         self.materialize_to(col.saturating_add(usize::from(width.max(1))));
         self.clear_cell_boundary(col);
         if width == 2 {
-            if col + 1 >= self.cols as usize {
-                Arc::make_mut(&mut self.cells)[col] = Cell::blank();
-                self.trim_default_tail();
-                return;
+            if col + 1 < self.cols as usize {
+                self.clear_cell_boundary(col + 1);
             }
-            self.clear_cell_boundary(col + 1);
             let cells = Arc::make_mut(&mut self.cells);
             cells[col] = Cell::printable_text_with_style_ref(text, 2, style);
-            cells[col + 1] = Cell::continuation_with_style_ref(style);
+            if col + 1 < cells.len() {
+                cells[col + 1] = Cell::continuation_with_style_ref(style);
+            }
         } else {
             Arc::make_mut(&mut self.cells)[col] =
                 Cell::printable_text_with_style_ref(text, 1, style);
@@ -292,42 +298,44 @@ impl Line {
         }
     }
 
-    pub(crate) fn append_grapheme(&mut self, col: u16, ch: char) -> Option<(u8, u8)> {
+    pub(crate) fn append_grapheme(&mut self, col: u16, ch: char) -> GraphemeAppend {
         let col = usize::from(col);
         if col >= usize::from(self.cols) {
-            return None;
+            return GraphemeAppend::NotExtension;
         }
 
-        let current = self.cell(col as u16)?.clone();
+        let Some(current) = self.cell(col as u16).cloned() else {
+            return GraphemeAppend::NotExtension;
+        };
         if current.is_continuation() || !extends_grapheme(current.text(), ch) {
-            return None;
+            return GraphemeAppend::NotExtension;
         }
 
         let mut text = current.text().clone();
         if !text.try_append(ch) {
-            return None;
+            return GraphemeAppend::IgnoredOverLimit;
         }
         let old_width = current.width().max(1);
         let new_width = text.display_width().max(1);
-        if new_width == 2 && col + 1 >= usize::from(self.cols) {
-            return None;
-        }
 
         self.materialize_to(col + usize::from(old_width.max(new_width)));
         self.clear_cell_boundary(col);
-        if new_width == 2 {
+        if new_width == 2 && col + 1 < usize::from(self.cols) {
             self.clear_cell_boundary(col + 1);
         }
         let cells = Arc::make_mut(&mut self.cells);
         let style = current.metadata.style();
         cells[col] = Cell::printable_text_with_style_ref(text, new_width, style);
-        if new_width == 2 {
+        if new_width == 2 && col + 1 < cells.len() {
             cells[col + 1] = Cell::continuation_with_style_ref(style);
         } else if old_width == 2 && col + 1 < cells.len() {
             cells[col + 1] = Cell::blank();
         }
         self.trim_default_tail();
-        Some((old_width, new_width))
+        GraphemeAppend::Appended {
+            old_width,
+            new_width,
+        }
     }
 
     pub fn cell(&self, col: u16) -> Option<&Cell> {
@@ -514,6 +522,11 @@ impl Line {
     pub fn resize(&mut self, cols: u16) {
         self.cols = cols.max(1);
         Arc::make_mut(&mut self.cells).truncate(self.cols as usize);
+        if self.cells.last().is_some_and(|cell| cell.width() == 2)
+            && self.cells.len() < self.cols as usize
+        {
+            Arc::make_mut(&mut self.cells).push(Cell::blank());
+        }
         self.sanitize_wide_cells();
         self.trim_default_tail();
     }
@@ -560,7 +573,7 @@ impl Line {
                 }
             } else if cells[index].width() == 2 {
                 if index + 1 >= cells.len() || index + 1 >= self.cols as usize {
-                    cells[index] = Cell::blank();
+                    continue;
                 } else {
                     let style = cells[index].metadata.style();
                     cells[index + 1] = Cell::continuation_with_style_ref(style);
@@ -727,8 +740,11 @@ impl Grid {
         }
     }
 
-    pub(crate) fn append_grapheme(&mut self, row: u16, col: u16, ch: char) -> Option<(u8, u8)> {
-        self.line_mut(row)?.append_grapheme(col, ch)
+    pub(crate) fn append_grapheme(&mut self, row: u16, col: u16, ch: char) -> GraphemeAppend {
+        self.line_mut(row)
+            .map_or(GraphemeAppend::NotExtension, |line| {
+                line.append_grapheme(col, ch)
+            })
     }
 
     pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
@@ -1159,10 +1175,8 @@ fn reflow_logical_line(cells: &[Cell], cols: u16, generation: u64, out: &mut Vec
             line = Line::blank(cols);
             col = 0;
         }
-        if width <= cols {
-            line.set_text(col, cell.text().clone(), cell.width().max(1), cell.style());
-            col = col.saturating_add(width).min(cols);
-        }
+        line.set_text(col, cell.text().clone(), cell.width().max(1), cell.style());
+        col = col.saturating_add(width).min(cols);
     }
     line.set_generation(generation);
     out.push(line);
@@ -1170,7 +1184,7 @@ fn reflow_logical_line(cells: &[Cell], cols: u16, generation: u64, out: &mut Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, Color, Grid, Line, Style};
+    use super::{reflow_lines, Cell, Color, Grid, Line, Style};
     use crate::CellText;
     use std::sync::Arc;
 
@@ -1377,5 +1391,45 @@ mod tests {
             history.iter().map(Line::text).collect::<Vec<_>>(),
             ["e\u{301}x", "yz"]
         );
+    }
+
+    #[test]
+    fn wide_text_survives_shrink_to_one_column_and_growth() {
+        let mut original = Line::blank(4);
+        let mut emoji = CellText::from('\u{1f469}');
+        assert!(emoji.try_append('\u{200d}'));
+        assert!(emoji.try_append('\u{1f4bb}'));
+        original.set_text(0, emoji, 2, Style::default());
+        original.set(2, 'x', 1, Style::default());
+
+        let narrow = reflow_lines(&[original], 1);
+        assert_eq!(
+            narrow.iter().map(Line::text).collect::<Vec<_>>(),
+            ["\u{1f469}\u{200d}\u{1f4bb}", "x"]
+        );
+        assert_eq!(narrow[0].width_at(0), 2);
+
+        let grown = reflow_lines(&narrow, 4);
+        assert_eq!(
+            grown.iter().map(Line::text).collect::<Vec<_>>(),
+            ["\u{1f469}\u{200d}\u{1f4bb}x"]
+        );
+        assert_eq!(grown[0].width_at(0), 2);
+        assert_eq!(grown[0].width_at(1), 0);
+    }
+
+    #[test]
+    fn nonreflow_line_resize_restores_wide_cell_continuation_after_growth() {
+        let mut line = Line::blank(4);
+        line.set(0, '\u{754c}', 2, Style::default());
+
+        line.resize(1);
+        assert_eq!(line.text(), "\u{754c}");
+        assert_eq!(line.width_at(0), 2);
+
+        line.resize(4);
+        assert_eq!(line.text(), "\u{754c}");
+        assert_eq!(line.width_at(0), 2);
+        assert_eq!(line.width_at(1), 0);
     }
 }

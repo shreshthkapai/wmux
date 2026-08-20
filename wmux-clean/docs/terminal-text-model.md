@@ -3,7 +3,8 @@
 wmux stores the terminal's authoritative text as displayed cells, not as a
 lossy stream of scalar values. A printable cell owns one bounded extended
 grapheme, its display width, its application style, and (for width-two text) a
-separate continuation cell in the following grid column.
+separate continuation cell in the following grid column whenever that column
+exists.
 
 ## Researched Compatibility Model
 
@@ -40,6 +41,12 @@ One cell accepts at most 32 UTF-8 bytes, matching tmux. An extension beyond the
 limit is ignored atomically: the previous text, width, continuation state, and
 cursor remain unchanged.
 
+When a width-two cell is temporarily wider than a one-column row, wmux retains
+the logical base cell without an in-bounds continuation. This follows tmux's
+edge-cell preservation and Zellij's reflow rule that the first logical
+character may exceed the current row width. Reflow or non-reflow growth restores
+the continuation cell, so resize never destroys terminal text.
+
 Grapheme boundaries come from `unicode-segmentation` 1.13.3 extended UAX #29
 rules. Widths come from non-CJK `unicode-width` 0.2.2 rules for complete strings,
 including emoji ZWJ, modifier, and presentation sequences. Stored terminal
@@ -63,10 +70,12 @@ state rather than replaying pane output.
 
 The pinned `vte` parser bounds CSI parameters at 32 and intermediates at two.
 wmux declares its parser as `vte::Parser<1024>` and constructs it through the
-fixed-capacity feature path, making the 1 KiB OSC allocation explicit. OSC 0
-and 2 update an authoritative screen title capped at 512 UTF-8 bytes without
-splitting a scalar. DCS/SOS/PM/APC payloads remain discard-only. Malformed or
-oversized input must return to printable ground state without panic.
+fixed-capacity feature path, making the 1 KiB OSC allocation explicit. Because
+`vte` exposes at most 16 semicolon-delimited OSC parameters, a parallel bounded
+OSC scanner preserves the raw OSC 0/2 title payload and operation ordering.
+Titles are capped at 512 UTF-8 bytes without splitting a scalar.
+DCS/SOS/PM/APC payloads remain discard-only. Malformed or oversized input must
+return to printable ground state without panic.
 
 The Phase 2 gate runs focused Unicode tests, the complete workspace suite,
 deterministic cross-OS conformance, protocol/terminal fuzz-target compilation,
@@ -80,18 +89,25 @@ Verified on Windows on 2026-08-20 with Rust 1.96.0. The relevant locked
 dependencies are `unicode-segmentation` 1.13.3, `unicode-width` 0.2.2, `vte`
 0.14.1, `smallvec` 1.15.2, and fuzz-only `libfuzzer-sys` 0.4.13.
 
-The fresh exit-gate results were:
+The fresh post-review exit-gate results were:
 
-- `cargo fmt --all -- --check`: passed after applying the formatter's two
-  conformance-layout changes.
+- `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test --workspace`: 163 passed, 0 failed, 0 ignored.
+- `cargo test --workspace`: 176 passed, 0 failed, 0 ignored.
 - `cargo metadata --manifest-path fuzz/Cargo.toml --no-deps --format-version 1`:
   exactly `protocol_frame` and `terminal_bytes` were listed.
 - `cargo check --manifest-path fuzz/Cargo.toml --bins`: both fuzz harnesses
   compiled on stable Windows.
+- `cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings`: passed.
 - No sanitizer-backed fuzz run is claimed from Windows; the checked-in README
   records the supported nightly Unix commands.
+
+The review regressions now cover pending-wrap ZWJ/modifier/flag extensions,
+exact and over-limit cell text, one-column reflow and non-reflow restoration,
+Unicode copy search/word movement, OSC titles beyond `vte`'s parameter limit,
+and UTF-8 continuation bytes in the C1 range. Protocol fuzzing also normalizes
+every non-empty input through payload decoding and includes valid variable and
+fixed-shape payload seeds.
 
 Two consecutive release conformance runs produced the same fingerprints:
 
@@ -113,17 +129,17 @@ The unchanged full release performance rejection gate passed:
 
 | Scenario | Total ms | p50 us | p95 us | MiB/s | Alloc MiB | Peak MiB | Queue |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `parser-codex` | 16.775 | 0.000 | 0.000 | 118.95 | 2.63 | 1.35 | 0 |
-| `parser-claude` | 19.189 | 0.000 | 0.000 | 104.80 | 2.64 | 1.35 | 0 |
-| `frame-codex` | 27.746 | 55.500 | 99.900 | 71.91 | 44.15 | 1.42 | 0 |
-| `frame-claude` | 28.755 | 56.000 | 107.100 | 69.94 | 44.16 | 1.42 | 0 |
-| `hybrid-frame-codex` | 25.590 | 55.400 | 90.200 | 77.97 | 43.73 | 1.40 | 0 |
-| `hybrid-frame-claude` | 26.317 | 56.200 | 91.200 | 76.42 | 43.74 | 1.40 | 0 |
-| `scene-frame-codex` | 77.925 | 162.500 | 304.100 | 25.61 | 170.49 | 1.76 | 0 |
-| `idle-input-render` | 0.747 | 1.400 | 3.800 | 0.51 | 1.38 | 0.04 | 0 |
-| `damage-proportional` | 0.015 | 1.200 | 1.200 | 0.07 | 0.01 | 0.00 | 0 |
-| `large-paste` | 0.308 | 0.000 | 0.700 | 207590.01 | 0.00 | 0.00 | 0 |
-| `history-resize-100k` | 39.228 | 23.900 | 25.500 | 43.76 | 8.92 | 0.02 | 0 |
-| `split-storm` | 13.208 | 28.200 | 50.500 | 0.00 | 25.06 | 0.12 | 0 |
-| `detach-backlog` | 64.413 | 0.000 | 0.000 | 124.20 | 101.58 | 1.53 | 8192 |
-| `multiple-clients` | 70.370 | 151.400 | 255.100 | 28.58 | 53.93 | 1.43 | 8 |
+| `parser-codex` | 14.331 | 0.000 | 0.000 | 139.23 | 2.63 | 1.35 | 0 |
+| `parser-claude` | 13.556 | 0.000 | 0.000 | 148.35 | 2.64 | 1.35 | 0 |
+| `frame-codex` | 22.576 | 53.500 | 62.400 | 88.39 | 44.15 | 1.42 | 0 |
+| `frame-claude` | 23.382 | 53.600 | 87.300 | 86.01 | 44.16 | 1.42 | 0 |
+| `hybrid-frame-codex` | 23.156 | 53.700 | 77.700 | 86.17 | 43.73 | 1.40 | 0 |
+| `hybrid-frame-claude` | 23.977 | 53.600 | 88.600 | 83.87 | 43.74 | 1.40 | 0 |
+| `scene-frame-codex` | 62.121 | 148.900 | 177.100 | 32.12 | 170.49 | 1.76 | 0 |
+| `idle-input-render` | 0.982 | 1.600 | 5.200 | 0.39 | 1.38 | 0.04 | 0 |
+| `damage-proportional` | 0.018 | 2.000 | 2.000 | 0.05 | 0.01 | 0.00 | 0 |
+| `large-paste` | 0.678 | 0.000 | 0.700 | 94353.53 | 0.00 | 0.00 | 0 |
+| `history-resize-100k` | 14.719 | 21.800 | 24.400 | 116.62 | 8.92 | 0.02 | 0 |
+| `split-storm` | 10.567 | 23.800 | 38.900 | 0.00 | 25.06 | 0.12 | 0 |
+| `detach-backlog` | 61.218 | 0.000 | 0.000 | 130.68 | 101.58 | 1.53 | 8192 |
+| `multiple-clients` | 57.444 | 135.900 | 156.500 | 35.01 | 53.93 | 1.43 | 8 |

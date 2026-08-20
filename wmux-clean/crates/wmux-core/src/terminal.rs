@@ -207,30 +207,118 @@ impl Perform for TerminalBatch {
         // accumulate platform/device control strings it does not implement.
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if !params
-            .first()
-            .is_some_and(|command| matches!(*command, b"0" | b"2"))
-        {
-            return;
-        }
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
+        // `vte` exposes at most 16 semicolon-delimited OSC parameters. The
+        // bounded sidecar scanner in `TerminalEngine` owns title extraction so
+        // title text after that parser limit is not silently truncated.
+    }
+}
 
-        let mut raw = Vec::new();
-        for (index, part) in params.iter().skip(1).enumerate() {
-            if index > 0 {
-                raw.push(b';');
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OscTitleScanner {
+    state: OscScanState,
+    raw: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OscTitleEvent {
+    end: usize,
+    title: String,
+}
+
+impl OscTitleScanner {
+    fn scan(&mut self, bytes: &[u8]) -> SmallVec<[OscTitleEvent; 2]> {
+        let mut events = SmallVec::new();
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            match self.state {
+                OscScanState::Ground => {
+                    if byte == 0x1b {
+                        self.state = OscScanState::Escape;
+                    }
+                }
+                OscScanState::Escape => match byte {
+                    b']' => self.begin_osc(),
+                    0x1b => {}
+                    _ => self.state = OscScanState::Ground,
+                },
+                OscScanState::Osc => match byte {
+                    0x07 => {
+                        if let Some(title) = self.finish_osc() {
+                            events.push(OscTitleEvent {
+                                end: index + 1,
+                                title,
+                            });
+                        }
+                    }
+                    0x1b => self.state = OscScanState::OscEscape,
+                    0x18 | 0x1a => {
+                        self.raw.clear();
+                        self.state = OscScanState::Ground;
+                    }
+                    0x20..=0xff if self.raw.len() < MAX_OSC_BYTES => self.raw.push(byte),
+                    _ => {}
+                },
+                OscScanState::OscEscape => match byte {
+                    b'\\' => {
+                        if let Some(title) = self.finish_osc() {
+                            events.push(OscTitleEvent {
+                                end: index + 1,
+                                title,
+                            });
+                        }
+                    }
+                    b']' => self.begin_osc(),
+                    0x1b => {}
+                    _ => {
+                        self.raw.clear();
+                        self.state = OscScanState::Ground;
+                    }
+                },
             }
-            raw.extend_from_slice(part);
         }
-        let mut title = String::from_utf8_lossy(&raw).into_owned();
+        events
+    }
+
+    fn begin_osc(&mut self) {
+        self.raw.clear();
+        self.state = OscScanState::Osc;
+    }
+
+    fn finish_osc(&mut self) -> Option<String> {
+        self.state = OscScanState::Ground;
+        let title_start = if matches!(self.raw.as_slice(), b"0" | b"2") {
+            self.raw.len()
+        } else {
+            let Some(separator) = self.raw.iter().position(|byte| *byte == b';') else {
+                self.raw.clear();
+                return None;
+            };
+            if !matches!(&self.raw[..separator], b"0" | b"2") {
+                self.raw.clear();
+                return None;
+            }
+            separator + 1
+        };
+        let mut title = String::from_utf8_lossy(&self.raw[title_start..]).into_owned();
+        self.raw.clear();
         truncate_utf8(&mut title, MAX_TITLE_BYTES);
-        self.push(TerminalOperation::SetTitle(title));
+        Some(title)
     }
 }
 
 pub struct TerminalEngine {
     parser: vte::Parser<MAX_OSC_BYTES>,
     batch: TerminalBatch,
+    title_scanner: OscTitleScanner,
 }
 
 impl fmt::Debug for TerminalEngine {
@@ -246,6 +334,7 @@ impl TerminalEngine {
         Self {
             parser: vte::Parser::new_with_size(),
             batch: TerminalBatch::default(),
+            title_scanner: OscTitleScanner::default(),
         }
     }
 
@@ -254,7 +343,15 @@ impl TerminalEngine {
             return None;
         }
         self.batch.clear();
-        self.parser.advance(&mut self.batch, bytes);
+        let titles = self.title_scanner.scan(bytes);
+        let mut start = 0;
+        for event in titles {
+            self.parser
+                .advance(&mut self.batch, &bytes[start..event.end]);
+            self.batch.push(TerminalOperation::SetTitle(event.title));
+            start = event.end;
+        }
+        self.parser.advance(&mut self.batch, &bytes[start..]);
         if self.batch.operations.is_empty() {
             return None;
         }
@@ -292,11 +389,12 @@ fn apply_batch(screen: &mut Screen, batch: &TerminalBatch) -> Option<u64> {
         let before = screen.cursor();
         match operation {
             TerminalOperation::PrintRun { start, len } => {
-                screen.put_run(batch.print_text(*start, *len));
-                screen.record_damage(DamageOperation::PrintRun {
-                    start: before,
-                    end: screen.cursor(),
-                });
+                if screen.put_run(batch.print_text(*start, *len)) {
+                    screen.record_damage(DamageOperation::PrintRun {
+                        start: before,
+                        end: screen.cursor(),
+                    });
+                }
             }
             TerminalOperation::Execute(byte) => match *byte {
                 b'\x08' => screen.backspace(),
@@ -618,6 +716,44 @@ mod tests {
         engine.feed(&mut screen, unicode.as_bytes());
         assert_eq!(screen.title(), "\u{754c}".repeat(MAX_TITLE_BYTES / 3));
         assert_eq!(screen.title().len(), 510);
+    }
+
+    #[test]
+    fn osc_title_preserves_content_beyond_vte_parameter_limit() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 2);
+        let title = (0..40)
+            .map(|index| format!("part-{index}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let sequence = format!("\x1b]2;{title}\x1b\\");
+
+        for chunk in sequence.as_bytes().chunks(7) {
+            engine.feed(&mut screen, chunk);
+        }
+
+        assert_eq!(screen.title(), title);
+    }
+
+    #[test]
+    fn osc_title_command_without_separator_clears_the_title() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 2);
+
+        engine.feed(&mut screen, b"\x1b]2;current\x07");
+        engine.feed(&mut screen, b"\x1b]0\x07");
+
+        assert_eq!(screen.title(), "");
+    }
+
+    #[test]
+    fn osc_title_preserves_utf8_continuation_bytes_in_c1_range() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 2);
+
+        engine.feed(&mut screen, "\x1b]2;\u{dc}ber\x07".as_bytes());
+
+        assert_eq!(screen.title(), "\u{dc}ber");
     }
 
     #[test]
@@ -1026,13 +1162,15 @@ mod tests {
     }
 
     fn render_text(screen: &Screen, row: u16) -> String {
-        let mut text = screen
+        let mut text = String::new();
+        for cell in screen
             .render_line_cells(row)
             .unwrap_or_default()
             .into_iter()
             .filter(|cell| !cell.is_continuation())
-            .map(|cell| cell.ch())
-            .collect::<String>();
+        {
+            cell.text().push_to(&mut text);
+        }
         while text.ends_with(' ') {
             text.pop();
         }

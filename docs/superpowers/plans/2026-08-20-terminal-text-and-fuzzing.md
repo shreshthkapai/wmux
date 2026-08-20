@@ -366,7 +366,7 @@ cargo test -p wmux-core terminal::tests -- --nocapture
 
 - [x] **Step 3: Implement bounded title dispatch and explicit parser type**
 
-  Store `title: String` in `Screen`, truncate only at UTF-8 scalar boundaries to 512 bytes, and add an OSC handler for commands 0 and 2. Declare `TerminalEngine.parser` as `vte::Parser<MAX_OSC_BYTES>` so the 1 KiB parser allocation cannot silently change with a dependency default. Keep DCS and other string controls discard-only: `Perform::put` must not accumulate bytes.
+  Store `title: String` in `Screen`, truncate only at UTF-8 scalar boundaries to 512 bytes, and add bounded OSC handling for commands 0 and 2. Declare `TerminalEngine.parser` as `vte::Parser<MAX_OSC_BYTES>` so the 1 KiB parser allocation cannot silently change with a dependency default. Because `vte` exposes only 16 semicolon-delimited OSC parameters, retain the bounded raw title payload in a sidecar scanner instead of reconstructing it from a truncated callback. Keep DCS and other string controls discard-only: `Perform::put` must not accumulate bytes.
 
 - [x] **Step 4: Run focused and malformed-input tests**
 
@@ -457,11 +457,11 @@ bench = false
 members = ["."]
 ```
 
-  `protocol_frame` copies at most the fixed header, calls `decode_frame_header`, and calls `decode_frame_payload` only when the declared payload length exactly matches the remaining input. `terminal_bytes` derives dimensions in bounded ranges, feeds the input in varying bounded chunks, resizes once, materializes copy lines, and runs full rendering. Neither target asserts a particular arbitrary-input screen; crashes, panics, and sanitizer findings are failures.
+  `protocol_frame` copies at most the fixed header, calls `decode_frame_header`, and calls `decode_frame_payload` when the declared payload length exactly matches the remaining input. A second path normalizes every non-empty input to a valid tag and caps payloads at 64 KiB so checked-in seeds immediately exercise payload decoding. `terminal_bytes` derives dimensions in bounded ranges, feeds the input in varying bounded chunks, resizes once, materializes copy lines, and runs full rendering. Neither target asserts a particular arbitrary-input screen; crashes, panics, and sanitizer findings are failures.
 
 - [x] **Step 5: Check in small semantic seed corpora and instructions**
 
-  Keep corpus inputs immutable and small. The terminal corpus contains real multilingual/emoji text and malformed control-like data derived from the conformance fixtures; the protocol corpus contains bad magic and truncated headers. Document supported nightly Unix commands:
+  Keep corpus inputs immutable and small. The terminal corpus contains real multilingual/emoji text and malformed control-like data derived from the conformance fixtures; the protocol corpus contains bad magic, truncated headers, and valid fixed/variable payload shapes. Document supported nightly Unix commands:
 
 ```bash
 cargo +nightly fuzz run terminal_bytes -- -max_total_time=60

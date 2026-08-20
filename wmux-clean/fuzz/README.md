@@ -3,8 +3,10 @@
 This independent Cargo package keeps libFuzzer tooling out of the production
 workspace graph. The targets exercise only OS-neutral code:
 
-- `protocol_frame` validates a fixed header and decodes a payload only when its
-  declared length exactly matches the remaining input.
+- `protocol_frame` validates complete fixed headers and matching payloads. A
+  secondary bounded path normalizes every non-empty input to a valid tag so
+  payload decoding is exercised even before the fuzzer discovers a matching
+  frame length.
 - `terminal_bytes` bounds input to 64 KiB, dimensions to 120x50, history to 128
   rows, and feed chunks to 64 bytes before resize, copy, and full-render paths.
 

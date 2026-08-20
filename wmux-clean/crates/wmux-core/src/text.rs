@@ -218,10 +218,6 @@ pub fn scalar_width(ch: char) -> u8 {
 
 /// Return whether `next` belongs to the same extended grapheme as `text`.
 pub fn extends_grapheme(text: &CellText, next: char) -> bool {
-    if text.byte_len().saturating_add(next.len_utf8()) > MAX_CELL_TEXT_BYTES {
-        return false;
-    }
-
     let mut candidate = SmallVec::<[u8; MAX_CELL_TEXT_BYTES + 4]>::new();
     text.append_bytes(&mut candidate);
     let mut encoded = [0; 4];
@@ -300,6 +296,21 @@ mod tests {
         assert_eq!(text.byte_len(), MAX_CELL_TEXT_BYTES - 1);
 
         let before = text.clone();
+        assert!(extends_grapheme(&text, '\u{301}'));
+        assert!(!text.try_append('\u{301}'));
+        assert_eq!(text, before);
+    }
+
+    #[test]
+    fn cell_text_accepts_exact_byte_limit_before_rejecting_next_extension() {
+        let mut text = CellText::from('\u{1f469}');
+        for _ in 0..14 {
+            assert!(text.try_append('\u{301}'));
+        }
+        assert_eq!(text.byte_len(), MAX_CELL_TEXT_BYTES);
+
+        let before = text.clone();
+        assert!(extends_grapheme(&text, '\u{301}'));
         assert!(!text.try_append('\u{301}'));
         assert_eq!(text, before);
     }

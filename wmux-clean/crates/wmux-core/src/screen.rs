@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use crate::grid::GraphemeAppend;
 use crate::{scalar_width, Cell, Color, Grid, Line, Style};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
@@ -524,19 +525,21 @@ impl Screen {
         self.primary.set_history_limit(history_limit);
     }
 
-    pub fn put_char(&mut self, ch: char) {
+    pub fn put_char(&mut self, ch: char) -> bool {
         match ch {
             '\r' => self.carriage_return(),
             '\n' => self.linefeed(),
             '\x08' => self.backspace(),
             '\t' => self.tab(),
             _ if ch >= ' ' => {
-                if !ch.is_ascii() && self.append_to_previous_grapheme(ch) {
-                    return;
+                if !ch.is_ascii() {
+                    if let Some(changed) = self.append_to_previous_grapheme(ch) {
+                        return changed;
+                    }
                 }
                 let width = scalar_width(ch);
                 if width == 0 {
-                    return;
+                    return false;
                 }
                 if self.pending_wrap || width > self.remaining_cols() {
                     self.linefeed_wrapped(true);
@@ -549,17 +552,23 @@ impl Screen {
                 self.grid_mut().set(row, col, ch, width, style);
                 self.mark_dirty(row);
                 self.advance(width);
+                return true;
             }
             _ => {}
         }
+        true
     }
 
-    fn append_to_previous_grapheme(&mut self, ch: char) -> bool {
+    fn append_to_previous_grapheme(&mut self, ch: char) -> Option<bool> {
         let col = if self.pending_wrap {
-            self.cursor_col
+            self.grid()
+                .line(self.cursor_row)
+                .map_or(self.cursor_col, |line| {
+                    line.previous_cell_start(self.cursor_col.saturating_add(1))
+                })
         } else {
             if self.cursor_col == 0 {
-                return false;
+                return None;
             }
             self.grid()
                 .line(self.cursor_row)
@@ -569,8 +578,10 @@ impl Screen {
         };
 
         let row = self.cursor_row;
-        let Some((_, new_width)) = self.grid_mut().append_grapheme(row, col, ch) else {
-            return false;
+        let new_width = match self.grid_mut().append_grapheme(row, col, ch) {
+            GraphemeAppend::NotExtension => return None,
+            GraphemeAppend::IgnoredOverLimit => return Some(false),
+            GraphemeAppend::Appended { new_width, .. } => new_width,
         };
         self.mark_dirty(row);
 
@@ -582,10 +593,11 @@ impl Screen {
             self.cursor_col = end;
             self.pending_wrap = false;
         }
-        true
+        Some(true)
     }
 
-    pub fn put_run(&mut self, mut text: &str) {
+    pub fn put_run(&mut self, mut text: &str) -> bool {
+        let mut changed = false;
         while !text.is_empty() {
             let ascii = text
                 .as_bytes()
@@ -594,7 +606,7 @@ impl Screen {
                 .count();
             if ascii == 0 {
                 let ch = text.chars().next().expect("non-empty text");
-                self.put_char(ch);
+                changed |= self.put_char(ch);
                 text = &text[ch.len_utf8()..];
                 continue;
             }
@@ -616,6 +628,7 @@ impl Screen {
                 break;
             }
             self.mark_dirty(row);
+            changed = true;
             if usize::from(self.cursor_col) + written >= usize::from(self.cols()) {
                 self.cursor_col = self.cols().saturating_sub(1);
                 self.pending_wrap = true;
@@ -624,6 +637,7 @@ impl Screen {
             }
             text = &text[written..];
         }
+        changed
     }
 
     pub fn backspace(&mut self) {
@@ -1051,7 +1065,84 @@ fn push_utf8_mouse_value(out: &mut Vec<u8>, value: u32) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::{DamageOperation, Screen, DAMAGE_JOURNAL_CAPACITY};
-    use crate::TerminalEngine;
+    use crate::{TerminalEngine, MAX_CELL_TEXT_BYTES};
+
+    #[test]
+    fn wide_grapheme_at_right_margin_accepts_extensions_before_wrapping() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(4, 2);
+
+        engine.feed(&mut screen, "ab\u{1f469}".as_bytes());
+        assert_eq!(screen.cursor(), (0, 3));
+
+        engine.feed(&mut screen, "\u{200d}".as_bytes());
+        engine.feed(&mut screen, "\u{1f4bb}".as_bytes());
+
+        assert_eq!(
+            screen.render_line(0).map(|line| line.text()),
+            Some("ab\u{1f469}\u{200d}\u{1f4bb}".to_owned())
+        );
+        assert_eq!(screen.cursor(), (0, 3));
+        assert_eq!(screen.render_line(0).unwrap().width_at(2), 2);
+        assert_eq!(screen.render_line(0).unwrap().width_at(3), 0);
+
+        engine.feed(&mut screen, b"x");
+        assert_eq!(
+            screen.render_line(1).map(|line| line.text()),
+            Some("x".to_owned())
+        );
+    }
+
+    #[test]
+    fn emoji_modifier_at_right_margin_stays_with_its_base() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(2, 2);
+
+        engine.feed(&mut screen, "\u{1f44d}\u{1f3fd}".as_bytes());
+
+        assert_eq!(
+            screen.render_line(0).map(|line| line.text()),
+            Some("\u{1f44d}\u{1f3fd}".to_owned())
+        );
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn flag_expanding_at_right_margin_is_retained_as_one_cell() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(2, 2);
+
+        engine.feed(&mut screen, "a\u{1f1ec}\u{1f1e7}".as_bytes());
+
+        let line = screen.render_line(0).unwrap();
+        assert_eq!(line.text(), "a\u{1f1ec}\u{1f1e7}");
+        assert_eq!(line.width_at(1), 2);
+        assert_eq!(screen.cursor(), (0, 1));
+
+        engine.feed(&mut screen, b"x");
+        assert_eq!(
+            screen.render_line(1).map(|line| line.text()),
+            Some("x".to_owned())
+        );
+    }
+
+    #[test]
+    fn over_limit_grapheme_extension_is_ignored_atomically() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(8, 2);
+        let prefix = format!("\u{1f469}{}\u{200d}", "\u{301}".repeat(12));
+        assert_eq!(prefix.len(), MAX_CELL_TEXT_BYTES - 1);
+
+        engine.feed(&mut screen, prefix.as_bytes());
+        let cursor = screen.cursor();
+        let generation = screen.generation();
+
+        engine.feed(&mut screen, "\u{1f4bb}".as_bytes());
+
+        assert_eq!(screen.render_line(0).map(|line| line.text()), Some(prefix));
+        assert_eq!(screen.cursor(), cursor);
+        assert_eq!(screen.generation(), generation);
+    }
 
     #[test]
     fn batches_advance_pane_and_line_generations_once() {
