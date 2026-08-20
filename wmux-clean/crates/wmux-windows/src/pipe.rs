@@ -1,4 +1,9 @@
-use std::{env, fs::File, io, path::PathBuf};
+use std::{
+    env,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+};
 
 // Windows documents a 256-character named-pipe limit. Reserve sixteen
 // characters below it so callers do not rely on a transport boundary limit.
@@ -78,6 +83,10 @@ impl Endpoint {
 
     pub fn owner_sid(&self) -> &UserSid {
         &self.owner_sid
+    }
+
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
     }
 }
 

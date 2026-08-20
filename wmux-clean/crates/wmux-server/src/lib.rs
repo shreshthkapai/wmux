@@ -19,6 +19,7 @@ use tokio::{
         mpsc::error::{TryRecvError as AsyncTryRecvError, TrySendError},
         oneshot,
     },
+    task::JoinSet,
 };
 use wmux_config::{config_path, WmuxConfig};
 use wmux_core::{
@@ -56,6 +57,7 @@ const CLIENT_MAX_FRAME_BYTES: usize = FRAME_HEADER_LEN + MAX_FRAME;
 const PER_PANE_OUTPUT_BYTES: usize = 64 * 1024;
 const PER_PANE_OUTPUT_TIME: Duration = Duration::from_millis(1);
 const OUTPUT_ROUND_TIME: Duration = Duration::from_millis(4);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run() -> io::Result<()> {
     RuntimeBuilder::new_multi_thread()
@@ -68,37 +70,110 @@ pub fn run() -> io::Result<()> {
 
 async fn run_async() -> io::Result<()> {
     let endpoint = Endpoint::current_user()?;
+    run_async_at(endpoint).await
+}
+
+async fn run_async_at(endpoint: Endpoint) -> io::Result<()> {
     let _lock = ServerLock::acquire(&endpoint)?;
     let config = load_config();
     eprintln!("wmux config {}", config_path().display());
 
-    let (owner_tx, owner_rx) = mpsc::channel();
-    let state_owner_tx = owner_tx.clone();
-    let io = TokioHandle::current();
-    thread::Builder::new()
-        .name("wmux-state-owner".to_string())
-        .spawn(move || ServerOwner::new(config, io, state_owner_tx).run(owner_rx))?;
-
-    eprintln!("wmux clean server listening on {}", endpoint.pipe_name());
+    let endpoint_name = endpoint.pipe_name().to_string();
     let owner_sid = endpoint.owner_sid().clone();
     let mut pipe_factory = ServerPipeFactory::new(endpoint)?;
     let mut listener = pipe_factory.create()?;
-    loop {
-        if let Err(error) = listener.connect().await {
-            eprintln!("accept error: {error}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            listener = pipe_factory.create()?;
-            continue;
-        }
-        let connected = listener;
-        listener = pipe_factory.create()?;
-        let owner_tx = owner_tx.clone();
-        let owner_sid = owner_sid.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(connected, owner_tx, owner_sid).await {
-                eprintln!("client error: {error}");
+
+    let (owner_tx, owner_rx) = mpsc::channel();
+    let state_owner_tx = owner_tx.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let io = TokioHandle::current();
+    let state_owner = thread::Builder::new()
+        .name("wmux-state-owner".to_string())
+        .spawn(move || ServerOwner::new(config, io, state_owner_tx, shutdown_tx).run(owner_rx))?;
+
+    eprintln!("wmux clean server listening on {endpoint_name}");
+    let mut connections = JoinSet::new();
+    let accept_result = 'accept: loop {
+        tokio::select! {
+            biased;
+            shutdown = &mut shutdown_rx => {
+                break 'accept shutdown.map_err(|_| io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "server owner stopped before requesting shutdown",
+                ));
             }
-        });
+            completed = connections.join_next(), if !connections.is_empty() => {
+                report_connection_completion(completed);
+            }
+            accepted = listener.connect() => {
+                if let Err(error) = accepted {
+                    eprintln!("accept error: {error}");
+                    tokio::select! {
+                        biased;
+                        shutdown = &mut shutdown_rx => {
+                            break 'accept shutdown.map_err(|_| io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "server owner stopped before requesting shutdown",
+                            ));
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                    listener = match pipe_factory.create() {
+                        Ok(listener) => listener,
+                        Err(error) => break 'accept Err(error),
+                    };
+                    continue;
+                }
+
+                let next_listener = match pipe_factory.create() {
+                    Ok(listener) => listener,
+                    Err(error) => break 'accept Err(error),
+                };
+                let connected = std::mem::replace(&mut listener, next_listener);
+                let connection_owner = owner_tx.clone();
+                let connection_sid = owner_sid.clone();
+                connections.spawn(async move {
+                    handle_connection(connected, connection_owner, connection_sid).await
+                });
+            }
+        }
+    };
+
+    drop(listener);
+    drain_connection_tasks(&mut connections).await;
+    let _ = owner_tx.send(OwnerMessage::Stop);
+    drop(owner_tx);
+    let owner_result = state_owner
+        .join()
+        .map_err(|_| io::Error::other("server owner thread panicked"));
+    accept_result.and(owner_result)
+}
+
+fn report_connection_completion(completed: Option<Result<io::Result<()>, tokio::task::JoinError>>) {
+    match completed {
+        Some(Ok(Err(error))) => eprintln!("client error: {error}"),
+        Some(Err(error)) if !error.is_cancelled() => eprintln!("client task error: {error}"),
+        _ => {}
+    }
+}
+
+async fn drain_connection_tasks(connections: &mut JoinSet<io::Result<()>>) {
+    let deadline = tokio::time::Instant::now() + CONNECTION_DRAIN_TIMEOUT;
+    while !connections.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, connections.join_next()).await {
+            Ok(completed) => report_connection_completion(completed),
+            Err(_) => break,
+        }
+    }
+    if !connections.is_empty() {
+        connections.abort_all();
+        while let Some(completed) = connections.join_next().await {
+            report_connection_completion(Some(completed));
+        }
     }
 }
 
@@ -132,6 +207,7 @@ enum OwnerMessage {
         bytes: usize,
     },
     PlatformReady,
+    Stop,
 }
 
 enum Outbound {
@@ -187,29 +263,35 @@ async fn connection_io_loop(
             }
         }
     };
-    let write = async move {
-        let mut outbound_rx = outbound_rx;
-        while let Some(outbound) = outbound_rx.recv().await {
-            let (message, shutdown) = match outbound {
-                Outbound::Message(message) => (message, false),
-                Outbound::Shutdown(message) => (message, true),
-            };
-            let bytes = message.wire_len();
-            write_async_message(&mut writer, message).await?;
-            write_owner
-                .send(OwnerMessage::OutboundDrained { client, bytes })
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server owner stopped"))?;
-            if shutdown {
-                process::exit(0);
-            }
-        }
-        Ok(())
-    };
+    let write = write_outbound_messages(&mut writer, outbound_rx, &write_owner, client);
 
     tokio::select! {
         result = read => result,
         result = write => result,
     }
+}
+
+async fn write_outbound_messages(
+    writer: &mut (impl AsyncWrite + Unpin),
+    mut outbound_rx: async_mpsc::Receiver<Outbound>,
+    owner_tx: &mpsc::Sender<OwnerMessage>,
+    client: ClientId,
+) -> io::Result<()> {
+    while let Some(outbound) = outbound_rx.recv().await {
+        let (message, shutdown) = match outbound {
+            Outbound::Message(message) => (message, false),
+            Outbound::Shutdown(message) => (message, true),
+        };
+        let bytes = message.wire_len();
+        write_async_message(&mut *writer, message).await?;
+        owner_tx
+            .send(OwnerMessage::OutboundDrained { client, bytes })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server owner stopped"))?;
+        if shutdown {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 async fn read_async_message(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Message>> {
@@ -532,6 +614,19 @@ impl Runtime {
             .retain(|pane, _| self.state.panes.contains_key(pane));
         self.resize_repaint_holds
             .retain(|pane, _| self.state.panes.contains_key(pane));
+    }
+
+    fn shutdown_platform_panes(&mut self) {
+        for platform in self.platform_panes.values_mut() {
+            if let Some(conpty) = platform.conpty.as_mut() {
+                conpty.terminate(1);
+            }
+        }
+        self.platform_panes.clear();
+        self.output_ring.clear();
+        self.sync_started_at.clear();
+        self.resize_repaint_holds.clear();
+        self.history_growth.clear();
     }
 
     fn write_pane_input(&mut self, pane_id: PaneId, input: ClientInput) -> io::Result<()> {
@@ -946,13 +1041,29 @@ impl Outbound {
 struct ServerOwner {
     runtime: Runtime,
     clients: BTreeMap<ClientId, ClientView>,
+    shutdown: ShutdownState,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownState {
+    Running,
+    Draining,
+    StopRequested,
 }
 
 impl ServerOwner {
-    fn new(config: WmuxConfig, io: TokioHandle, owner_tx: mpsc::Sender<OwnerMessage>) -> Self {
+    fn new(
+        config: WmuxConfig,
+        io: TokioHandle,
+        owner_tx: mpsc::Sender<OwnerMessage>,
+        shutdown_tx: oneshot::Sender<()>,
+    ) -> Self {
         Self {
             runtime: Runtime::with_native_io(config, io, owner_tx),
             clients: BTreeMap::new(),
+            shutdown: ShutdownState::Running,
+            shutdown_tx: Some(shutdown_tx),
         }
     }
 
@@ -961,11 +1072,13 @@ impl ServerOwner {
         Self {
             runtime: Runtime::with_config(config),
             clients: BTreeMap::new(),
+            shutdown: ShutdownState::Running,
+            shutdown_tx: None,
         }
     }
 
     fn run(mut self, owner_rx: Receiver<OwnerMessage>) {
-        loop {
+        'owner: loop {
             let mut did_work = false;
             for _ in 0..CONTROL_EVENTS_PER_TURN {
                 match owner_rx.try_recv() {
@@ -974,8 +1087,19 @@ impl ServerOwner {
                         self.handle_owner_message(message);
                     }
                     Err(StdTryRecvError::Empty) => break,
-                    Err(StdTryRecvError::Disconnected) => return,
+                    Err(StdTryRecvError::Disconnected) => break 'owner,
                 }
+            }
+
+            if self.should_stop() {
+                break;
+            }
+            if self.is_shutting_down() {
+                match owner_rx.recv() {
+                    Ok(message) => self.handle_owner_message(message),
+                    Err(_) => break,
+                }
+                continue;
             }
 
             let output = self.runtime.process_output_round(OutputBudget::default());
@@ -1007,16 +1131,26 @@ impl ServerOwner {
                     {
                         Ok(message) => self.handle_owner_message(message),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'owner,
                     }
                 } else {
                     match owner_rx.recv() {
                         Ok(message) => self.handle_owner_message(message),
-                        Err(_) => return,
+                        Err(_) => break 'owner,
                     }
                 }
             }
         }
+        self.runtime.shutdown_platform_panes();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown != ShutdownState::Running
+    }
+
+    fn should_stop(&self) -> bool {
+        self.shutdown == ShutdownState::StopRequested
+            || (self.shutdown == ShutdownState::Draining && self.clients.is_empty())
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -1062,18 +1196,26 @@ impl ServerOwner {
                 capabilities,
                 reply,
             } => {
+                if self.is_shutting_down() {
+                    return;
+                }
                 let client = self.runtime.state.add_client();
                 self.clients
                     .insert(client, ClientView::new(outbound, capabilities));
                 let _ = reply.send(client);
             }
             OwnerMessage::Event(event) => {
+                if self.is_shutting_down() {
+                    return;
+                }
                 if let Err(error) = self.handle_event(event) {
                     eprintln!("server event error: {error}");
                 }
             }
             OwnerMessage::InvalidCommand { client, message } => {
-                self.send_critical(client, Message::CommandErr(message));
+                if !self.is_shutting_down() {
+                    self.send_critical(client, Message::CommandErr(message));
+                }
             }
             OwnerMessage::Disconnect(client) => self.disconnect_client(client, true),
             OwnerMessage::OutboundDrained { client, bytes } => {
@@ -1086,6 +1228,7 @@ impl ServerOwner {
                 }
             }
             OwnerMessage::PlatformReady => {}
+            OwnerMessage::Stop => self.shutdown = ShutdownState::StopRequested,
         }
     }
 
@@ -1174,7 +1317,7 @@ impl ServerOwner {
         };
 
         if shutdown && result.ok {
-            self.send_shutdown(client, response);
+            self.begin_shutdown(client, response);
             return Ok(());
         }
         self.send_critical(client, response);
@@ -1634,13 +1777,34 @@ impl ServerOwner {
         }
     }
 
-    fn send_shutdown(&mut self, client: ClientId, message: Message) {
-        let sent = self
-            .clients
-            .get_mut(&client)
-            .is_some_and(|view| view.try_enqueue(Outbound::Shutdown(message)).is_ok());
-        if !sent {
-            process::exit(0);
+    fn begin_shutdown(&mut self, requester: ClientId, response: Message) {
+        if self.is_shutting_down() {
+            return;
+        }
+        self.shutdown = ShutdownState::Draining;
+        self.runtime.shutdown_platform_panes();
+
+        let clients = self.clients.keys().copied().collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for client in clients {
+            let message = if client == requester {
+                response.clone()
+            } else {
+                Message::Shutdown
+            };
+            if self
+                .clients
+                .get_mut(&client)
+                .is_none_or(|view| view.try_enqueue(Outbound::Shutdown(message)).is_err())
+            {
+                failed.push(client);
+            }
+        }
+        for client in failed {
+            self.disconnect_client(client, false);
+        }
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
         }
     }
 
@@ -1947,9 +2111,9 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, read_async_message, write_async_message, ClientView, FrameScheduler,
-        Outbound, OutputBudget, PlatformPane, RenderCause, Runtime, ServerOwner,
-        PER_PANE_OUTPUT_TIME,
+        collect_pane_events, read_async_message, run_async_at, write_async_message,
+        write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, PlatformPane,
+        RenderCause, Runtime, ServerOwner, PER_PANE_OUTPUT_TIME,
     };
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -1959,7 +2123,252 @@ mod tests {
         MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
         TerminalSize,
     };
-    use wmux_protocol::TerminalCapabilities;
+    use wmux_protocol::{Message, TerminalCapabilities, VERSION};
+    use wmux_windows::pipe::{connect_async, Endpoint, NamedPipeClient};
+
+    #[test]
+    fn shutdown_transaction_notifies_clients_and_clears_platform_panes() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let requester = owner.runtime.state.add_client();
+        let attached = owner.runtime.state.add_client();
+        let (requester_tx, mut requester_rx) = mpsc::channel(4);
+        let (attached_tx, mut attached_rx) = mpsc::channel(4);
+        owner.clients.insert(
+            requester,
+            ClientView::new(requester_tx, TerminalCapabilities::default()),
+        );
+        let mut attached_view = ClientView::new(attached_tx, TerminalCapabilities::default());
+        attached_view.attached = true;
+        owner.clients.insert(attached, attached_view);
+        let created = owner.runtime.state.create_session("shutdown", 80, 24);
+        let (_pane_tx, pane_rx) = mpsc::channel(1);
+        owner.runtime.platform_panes.insert(
+            created.pane,
+            PlatformPane::test(pane_rx, TerminalSize::new(80, 24)),
+        );
+        owner.runtime.output_ring.push_back(created.pane);
+
+        owner
+            .handle_event(ServerEvent::Command {
+                client: requester,
+                command: Command::KillServer,
+            })
+            .unwrap();
+
+        assert!(owner.is_shutting_down());
+        assert!(matches!(
+            requester_rx.try_recv(),
+            Ok(Outbound::Shutdown(wmux_protocol::Message::CommandOk(_)))
+        ));
+        assert!(matches!(
+            attached_rx.try_recv(),
+            Ok(Outbound::Shutdown(wmux_protocol::Message::Shutdown))
+        ));
+        assert!(owner.runtime.platform_panes.is_empty());
+        assert!(owner.runtime.output_ring.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_writer_flushes_reports_drain_and_returns() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let (outbound_tx, outbound_rx) = mpsc::channel(2);
+        outbound_tx
+            .send(Outbound::Shutdown(wmux_protocol::Message::CommandOk(
+                "done".to_string(),
+            )))
+            .await
+            .unwrap();
+        drop(outbound_tx);
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+
+        let writer_task = tokio::spawn(async move {
+            write_outbound_messages(&mut writer, outbound_rx, &owner_tx, client).await
+        });
+        assert_eq!(
+            read_async_message(&mut reader).await.unwrap(),
+            Some(wmux_protocol::Message::CommandOk("done".to_string()))
+        );
+        writer_task.await.unwrap().unwrap();
+        assert!(matches!(
+            owner_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(super::OwnerMessage::OutboundDrained { client: drained, .. }) if drained == client
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_clients_releases_lock_and_restarts() {
+        let endpoint = Endpoint::for_instance(&unique_instance("shutdown-restart")).unwrap();
+        let server_endpoint = endpoint.clone();
+        let (server_thread, server_done) = start_test_server(server_endpoint);
+
+        let mut requester = connect_test_client(&endpoint).await;
+        write_async_message(
+            &mut requester,
+            Message::Command("new-session -d".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_until(&mut requester, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+
+        let mut attached = connect_test_client(&endpoint).await;
+        write_async_message(
+            &mut attached,
+            Message::Command("attach-session".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_until(&mut attached, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+
+        write_async_message(&mut requester, Message::Command("kill-server".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_until(&mut requester, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+        assert_eq!(
+            read_until(&mut attached, |message| matches!(
+                message,
+                Message::Shutdown
+            ))
+            .await,
+            Message::Shutdown
+        );
+        drop(requester);
+        drop(attached);
+        await_test_server(server_thread, server_done).await;
+        assert!(!endpoint.lock_path().exists());
+
+        let restart_endpoint = endpoint.clone();
+        let (restart_thread, restart_done) = start_test_server(restart_endpoint);
+        let mut killer = connect_test_client(&endpoint).await;
+        write_async_message(&mut killer, Message::Command("kill-server".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_until(&mut killer, |message| matches!(
+                message,
+                Message::CommandOk(_)
+            ))
+            .await,
+            Message::CommandOk(_)
+        ));
+        drop(killer);
+        await_test_server(restart_thread, restart_done).await;
+        assert!(!endpoint.lock_path().exists());
+    }
+
+    fn start_test_server(
+        endpoint: Endpoint,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = done_tx.send(runtime.block_on(run_async_at(endpoint)));
+        });
+        (server_thread, done_rx)
+    }
+
+    async fn await_test_server(
+        server_thread: std::thread::JoinHandle<()>,
+        server_done: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), server_done)
+            .await
+            .expect("server did not finish graceful shutdown")
+            .expect("server thread dropped completion")
+            .expect("server returned an error");
+        server_thread.join().expect("server thread panicked");
+    }
+
+    async fn connect_test_client(endpoint: &Endpoint) -> NamedPipeClient {
+        let mut last_error = None;
+        for _ in 0..100 {
+            match connect_async(endpoint) {
+                Ok(mut pipe) => {
+                    write_async_message(
+                        &mut pipe,
+                        Message::Hello {
+                            version: VERSION,
+                            pid: std::process::id(),
+                            capabilities: TerminalCapabilities::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        read_async_message(&mut pipe).await.unwrap(),
+                        Some(Message::HelloOk {
+                            version: VERSION,
+                            ..
+                        })
+                    ));
+                    return pipe;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("could not connect test client: {:?}", last_error)
+    }
+
+    async fn read_until(
+        pipe: &mut NamedPipeClient,
+        predicate: impl Fn(&Message) -> bool,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = read_async_message(&mut *pipe)
+                    .await
+                    .expect("failed to read server message")
+                    .expect("server closed before expected message");
+                if predicate(&message) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for server message")
+    }
+
+    fn unique_instance(label: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after Unix epoch")
+            .as_nanos();
+        format!("{label}-{}-{nonce}", std::process::id())
+    }
 
     #[test]
     fn frame_scheduler_is_immediate_after_idle_and_coalesces_bursts() {

@@ -38,6 +38,7 @@ pub struct ConptyPane {
     pseudo_console: Option<PseudoConsole>,
     _pty_input_read: OwnedHandle,
     job: OwnedHandle,
+    terminated: bool,
 }
 
 unsafe impl Send for ConptyPane {}
@@ -64,16 +65,20 @@ impl ConptyPane {
     }
 
     pub fn terminate(&mut self, exit_code: u32) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        self.input.take();
+        let _ = self.closing.send(true);
         let _ = unsafe { TerminateJobObject(self.job.raw, exit_code) };
+        self.pseudo_console.take();
     }
 }
 
 impl Drop for ConptyPane {
     fn drop(&mut self) {
-        self.input.take();
-        let _ = self.closing.send(true);
-        let _ = unsafe { TerminateJobObject(self.job.raw, 1) };
-        self.pseudo_console.take();
+        self.terminate(1);
     }
 }
 
@@ -153,6 +158,7 @@ pub fn spawn_shell(
             pseudo_console: Some(pseudo_console),
             _pty_input_read: pty_input_read,
             job,
+            terminated: false,
         },
         rx,
     ))
@@ -927,6 +933,9 @@ mod tests {
         assert!(process_is_running(child));
 
         pane.terminate(99);
+        pane.terminate(99);
+        assert!(pane.write_input(b"ignored".to_vec()).is_err());
+        assert!(pane.resize(TerminalSize::new(80, 24)).is_err());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while process_is_running(child) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
