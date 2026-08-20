@@ -497,7 +497,7 @@ git commit -m "test: add terminal and protocol fuzz coverage"
 - Consumes: all Task 1-5 commits and the Phase 1 baseline.
 - Produces: formatting/lint/test/conformance/fuzz-build/performance evidence and a clean Phase 2 branch ready for review.
 
-- [ ] **Step 1: Run formatting and lint**
+- [x] **Step 1: Run formatting and lint**
 
 ```powershell
 cargo fmt --all -- --check
@@ -506,7 +506,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
   Expected: both commands exit 0 with no warnings or formatting diff.
 
-- [ ] **Step 2: Run the complete workspace suite**
+- [x] **Step 2: Run the complete workspace suite**
 
 ```powershell
 cargo test --workspace
@@ -514,7 +514,7 @@ cargo test --workspace
 
   Expected: every pre-existing and Phase 2 test passes; no test is ignored to obtain a green result.
 
-- [ ] **Step 3: Run deterministic conformance twice**
+- [x] **Step 3: Run deterministic conformance twice**
 
 ```powershell
 cargo run -p wmux-conformance --release
@@ -523,7 +523,7 @@ cargo run -p wmux-conformance --release
 
   Expected: both runs emit the same individual and aggregate fingerprints and exit 0.
 
-- [ ] **Step 4: Validate fuzz targets from the stable Windows host**
+- [x] **Step 4: Validate fuzz targets from the stable Windows host**
 
 ```powershell
 cargo metadata --manifest-path fuzz/Cargo.toml --no-deps
@@ -532,7 +532,7 @@ cargo check --manifest-path fuzz/Cargo.toml --bins
 
   Expected: exactly two binaries are described and both compile. Record that sanitizer-backed execution remains a nightly Unix CI/developer command.
 
-- [ ] **Step 5: Enforce the release performance rejection gate**
+- [x] **Step 5: Enforce the release performance rejection gate**
 
 ```powershell
 cargo run -p wmux-bench --release -- --suite full --gate
@@ -540,11 +540,11 @@ cargo run -p wmux-bench --release -- --suite full --gate
 
   Expected: exit 0, parser throughput remains at least 40 MiB/s for both fixtures, and every existing memory/latency/queue gate passes. If the gate fails materially because of cell storage, reject or redesign the representation rather than raising thresholds.
 
-- [ ] **Step 6: Update evidence and plan checkboxes**
+- [x] **Step 6: Update evidence and plan checkboxes**
 
   Record dependency versions, final test count, conformance fingerprints, fuzz-target validation, performance results, and the explicit Windows fuzz-execution limitation in `terminal-text-model.md`. Mark only commands actually observed passing as complete.
 
-- [ ] **Step 7: Inspect branch integrity**
+- [x] **Step 7: Inspect branch integrity**
 
 ```powershell
 git diff --check main...HEAD
@@ -554,10 +554,10 @@ git log --oneline main..HEAD
 
   Expected: no whitespace errors, no unintended generated artifacts, only Phase 2 files/changes, and coherent incremental commits.
 
-- [ ] **Step 8: Commit final evidence if documentation changed**
+- [x] **Step 8: Commit final evidence if documentation changed**
 
 ```powershell
-git add wmux-clean/docs/terminal-text-model.md docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md
+git add docs/superpowers/plans/2026-08-20-cross-platform-beta-completion.md docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md wmux-clean/crates/wmux-conformance/src/lib.rs wmux-clean/docs/terminal-text-model.md
 git commit -m "docs: record phase 2 terminal correctness evidence"
 ```
 

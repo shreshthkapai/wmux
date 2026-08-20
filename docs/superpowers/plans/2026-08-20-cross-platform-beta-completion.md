@@ -106,16 +106,16 @@ cargo run -p wmux-bench --release -- --suite full --gate
 - Consumes: the current `Cell`, `Line`, `Grid`, `Screen`, `TerminalEngine`, and renderer APIs.
 - Produces: a compact `CellText` representation that preserves base characters plus combining code points, deterministic width calculation, and crash-resistant parser/protocol fuzz targets.
 
-- [ ] Research tmux UTF-8 cell storage and zellij terminal-cell/grapheme handling; record the chosen compatibility model in `wmux-clean/docs/terminal-text-model.md`.
-- [ ] Write failing unit tests for combining marks, variation selectors, emoji sequences, wide-cell replacement, split UTF-8, zero-width input at column zero, resize/reflow, and copy-mode extraction.
-- [ ] Replace the `char`-only printable payload with `CellText`, using inline storage for the common one-scalar case and owned overflow only for combined sequences.
-- [ ] Replace the hand-maintained width ranges with a reviewed Unicode width dependency and pin the dependency version in `Cargo.lock`.
-- [ ] Preserve terminal-default colours as `Color::Default`; do not resolve them to a palette in core.
-- [ ] Extend renderer and copy-mode tests to prove combined text survives full render, diff render, scrollback, selection, resize, detach, and reattach.
-- [ ] Add bounded parser limits for CSI, OSC, DCS, and string controls, with malformed-input tests that prove recovery without panic or unbounded memory.
-- [ ] Add protocol and terminal-byte fuzz targets with checked-in seed corpora derived from the conformance fixtures.
-- [ ] Add deterministic conformance cases for multilingual prompts, combining text, wide text, emoji, alternate screen, synchronized output, OSC titles, and malformed control strings.
-- [ ] Run focused tests, the full workspace suite, conformance, and performance gate. Reject the design if cell storage materially regresses the existing performance thresholds.
+- [x] Research tmux UTF-8 cell storage and zellij terminal-cell/grapheme handling; record the chosen compatibility model in `wmux-clean/docs/terminal-text-model.md`.
+- [x] Write failing unit tests for combining marks, variation selectors, emoji sequences, wide-cell replacement, split UTF-8, zero-width input at column zero, resize/reflow, and copy-mode extraction.
+- [x] Replace the `char`-only printable payload with `CellText`, using inline storage for the common one-scalar case and owned overflow only for combined sequences.
+- [x] Replace the hand-maintained width ranges with a reviewed Unicode width dependency and pin the dependency version in `Cargo.lock`.
+- [x] Preserve terminal-default colours as `Color::Default`; do not resolve them to a palette in core.
+- [x] Extend renderer and copy-mode tests to prove combined text survives full render, diff render, scrollback, selection, resize, detach, and reattach.
+- [x] Add bounded parser limits for CSI, OSC, DCS, and string controls, with malformed-input tests that prove recovery without panic or unbounded memory.
+- [x] Add protocol and terminal-byte fuzz targets with checked-in seed corpora derived from the conformance fixtures.
+- [x] Add deterministic conformance cases for multilingual prompts, combining text, wide text, emoji, alternate screen, synchronized output, OSC titles, and malformed control strings.
+- [x] Run focused tests, the full workspace suite, conformance, and performance gate. Reject the design if cell storage materially regresses the existing performance thresholds.
 
 **Exit gate:** Pane text round-trips through parser, grid, scrollback, copy mode, resize, rendering, detach, and reattach without losing combining data or changing application styles.
 

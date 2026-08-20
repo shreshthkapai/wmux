@@ -261,10 +261,7 @@ fn unicode_terminal_text_case() -> Result<CaseResult, String> {
         terminal.feed(&mut screen, chunk);
     }
 
-    let line = screen
-        .grid()
-        .line(0)
-        .ok_or("Unicode fixture row missing")?;
+    let line = screen.grid().line(0).ok_or("Unicode fixture row missing")?;
     if line.text() != fixture {
         return Err(format!(
             "Unicode fixture changed: expected {fixture:?}, got {:?}",
@@ -285,7 +282,9 @@ fn unicode_terminal_text_case() -> Result<CaseResult, String> {
     }
     for column in [8, 11, 14, 17] {
         if line.width_at(column) != 2 || line.width_at(column + 1) != 0 {
-            return Err(format!("Unicode cell {column} lost its wide-cell invariant"));
+            return Err(format!(
+                "Unicode cell {column} lost its wide-cell invariant"
+            ));
         }
     }
 

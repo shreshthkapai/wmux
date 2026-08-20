@@ -73,3 +73,57 @@ deterministic cross-OS conformance, protocol/terminal fuzz-target compilation,
 and the unchanged release performance thresholds. Sanitizer-backed cargo-fuzz
 execution uses nightly Rust on a supported Unix-like host because cargo-fuzz
 does not support Windows.
+
+## Phase 2 Verification Evidence
+
+Verified on Windows on 2026-08-20 with Rust 1.96.0. The relevant locked
+dependencies are `unicode-segmentation` 1.13.3, `unicode-width` 0.2.2, `vte`
+0.14.1, `smallvec` 1.15.2, and fuzz-only `libfuzzer-sys` 0.4.13.
+
+The fresh exit-gate results were:
+
+- `cargo fmt --all -- --check`: passed after applying the formatter's two
+  conformance-layout changes.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo test --workspace`: 163 passed, 0 failed, 0 ignored.
+- `cargo metadata --manifest-path fuzz/Cargo.toml --no-deps --format-version 1`:
+  exactly `protocol_frame` and `terminal_bytes` were listed.
+- `cargo check --manifest-path fuzz/Cargo.toml --bins`: both fuzz harnesses
+  compiled on stable Windows.
+- No sanitizer-backed fuzz run is claimed from Windows; the checked-in README
+  records the supported nightly Unix commands.
+
+Two consecutive release conformance runs produced the same fingerprints:
+
+| Case | Fingerprint |
+|---|---:|
+| `vt-replay-grid` | `a4b6730791ae60e9` |
+| `detach-reattach-persistence` | `3e7ff92dccf4cc09` |
+| `multiple-client-consistency` | `05e713cca6822bb7` |
+| `resize-reflow` | `09848825260ccebf` |
+| `malformed-input-resilience` | `9e0a00486d9b8448` |
+| `key-paste-behavior` | `63a3aa224a4d7943` |
+| `mouse-mode-routing` | `cfb320142e88231b` |
+| `unicode-terminal-text` | `903fdf4289fd38bb` |
+| `terminal-modes-and-title` | `27d45dd045405a17` |
+| `bounded-control-recovery` | `75180fe6bb88ab1b` |
+| **Suite** | **`77b632078fd0ab8b`** |
+
+The unchanged full release performance rejection gate passed:
+
+| Scenario | Total ms | p50 us | p95 us | MiB/s | Alloc MiB | Peak MiB | Queue |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `parser-codex` | 16.775 | 0.000 | 0.000 | 118.95 | 2.63 | 1.35 | 0 |
+| `parser-claude` | 19.189 | 0.000 | 0.000 | 104.80 | 2.64 | 1.35 | 0 |
+| `frame-codex` | 27.746 | 55.500 | 99.900 | 71.91 | 44.15 | 1.42 | 0 |
+| `frame-claude` | 28.755 | 56.000 | 107.100 | 69.94 | 44.16 | 1.42 | 0 |
+| `hybrid-frame-codex` | 25.590 | 55.400 | 90.200 | 77.97 | 43.73 | 1.40 | 0 |
+| `hybrid-frame-claude` | 26.317 | 56.200 | 91.200 | 76.42 | 43.74 | 1.40 | 0 |
+| `scene-frame-codex` | 77.925 | 162.500 | 304.100 | 25.61 | 170.49 | 1.76 | 0 |
+| `idle-input-render` | 0.747 | 1.400 | 3.800 | 0.51 | 1.38 | 0.04 | 0 |
+| `damage-proportional` | 0.015 | 1.200 | 1.200 | 0.07 | 0.01 | 0.00 | 0 |
+| `large-paste` | 0.308 | 0.000 | 0.700 | 207590.01 | 0.00 | 0.00 | 0 |
+| `history-resize-100k` | 39.228 | 23.900 | 25.500 | 43.76 | 8.92 | 0.02 | 0 |
+| `split-storm` | 13.208 | 28.200 | 50.500 | 0.00 | 25.06 | 0.12 | 0 |
+| `detach-backlog` | 64.413 | 0.000 | 0.000 | 124.20 | 101.58 | 1.53 | 8192 |
+| `multiple-clients` | 70.370 | 151.400 | 255.100 | 28.58 | 53.93 | 1.43 | 8 |
