@@ -848,9 +848,11 @@ fn render_cells_exact(line: &Line, start: usize, end: usize, out: &mut Vec<u8>) 
             push_style(cell.style(), out);
             style = cell.style();
         }
-        let ch = if cell.style().hidden { ' ' } else { cell.ch() };
-        let mut buf = [0; 4];
-        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        if cell.style().hidden {
+            out.extend(std::iter::repeat_n(b' ', usize::from(cell.width().max(1))));
+        } else {
+            cell.text().write_utf8(out);
+        }
         index += 1;
     }
     if style != Style::default() {
@@ -881,14 +883,14 @@ fn push_style(style: Style, out: &mut Vec<u8>) {
     out.push(b'm');
 }
 
-fn push_color(color: Option<Color>, foreground: bool, out: &mut Vec<u8>) {
+fn push_color(color: Color, foreground: bool, out: &mut Vec<u8>) {
     match color {
-        Some(Color::Indexed(index)) if index < 8 => {
+        Color::Indexed(index) if index < 8 => {
             out.push(b';');
             let code = if foreground { 30 + index } else { 40 + index };
             push_decimal(out, code);
         }
-        Some(Color::Indexed(index)) if index < 16 => {
+        Color::Indexed(index) if index < 16 => {
             out.push(b';');
             let code = if foreground {
                 90 + index - 8
@@ -897,11 +899,11 @@ fn push_color(color: Option<Color>, foreground: bool, out: &mut Vec<u8>) {
             };
             push_decimal(out, code);
         }
-        Some(Color::Indexed(index)) => {
+        Color::Indexed(index) => {
             out.extend_from_slice(if foreground { b";38;5;" } else { b";48;5;" });
             push_decimal(out, index);
         }
-        Some(Color::Rgb(red, green, blue)) => {
+        Color::Rgb(red, green, blue) => {
             out.extend_from_slice(if foreground { b";38;2;" } else { b";48;2;" });
             push_decimal(out, red);
             out.push(b';');
@@ -909,7 +911,7 @@ fn push_color(color: Option<Color>, foreground: bool, out: &mut Vec<u8>) {
             out.push(b';');
             push_decimal(out, blue);
         }
-        None => {}
+        Color::Default => {}
     }
 }
 
@@ -1074,7 +1076,10 @@ fn put_scene_cell(lines: &mut [Line], x: u16, y: u16, cell: Cell) {
     let Some(target) = line.cell(x) else {
         return;
     };
-    let replacement = if target.ch() != ' ' && cell.ch() != ' ' && target.ch() != cell.ch() {
+    let replacement = if !target.text().is_single_char(' ')
+        && !cell.text().is_single_char(' ')
+        && target.text() != cell.text()
+    {
         Cell::printable('+', 1, Style::default())
     } else {
         cell
@@ -1133,6 +1138,22 @@ mod tests {
         assert!(diff.contains("\x1b[1;4Hd"));
         assert!(!diff.contains("\x1b[1;1H\x1b[2K"));
         assert!(!diff.contains("\x1b[2;1H\x1b[2K"));
+    }
+
+    #[test]
+    fn full_and_diff_render_emit_complete_grapheme_bytes() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(8, 2);
+        let mut state = RenderState::new(8, 2);
+
+        engine.feed(&mut screen, "e\u{301}".as_bytes());
+        let full = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
+        assert!(full.contains("e\u{301}"));
+
+        engine.feed(&mut screen, b"\r");
+        engine.feed(&mut screen, "a\u{301}".as_bytes());
+        let diff = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
+        assert!(diff.contains("a\u{301}"));
     }
 
     #[test]

@@ -1176,4 +1176,34 @@ mod tests {
         assert_eq!(state.clients[&client].attached_session, None);
         assert_eq!(state.clients[&client].attached_pane, None);
     }
+
+    #[test]
+    fn detach_and_reattach_preserve_complete_authoritative_cell_text() {
+        let mut state = ServerState::new();
+        let created = state.create_session("persistent", 12, 2);
+        let first = state.add_client();
+        state.attach_client(first, created.session).unwrap();
+        {
+            let pane = state.pane_mut(created.pane).unwrap();
+            pane.terminal.feed(&mut pane.screen, "e\u{301}x".as_bytes());
+        }
+
+        state.detach_client(first);
+        state.remove_client(first);
+        let second = state.add_client();
+        assert_eq!(
+            state.attach_client(second, created.session),
+            Some(created.pane)
+        );
+
+        let line = state
+            .pane(created.pane)
+            .unwrap()
+            .screen
+            .grid()
+            .line(0)
+            .unwrap();
+        assert_eq!(line.text(), "e\u{301}x");
+        assert_eq!(line.cell(0).unwrap().text().to_string(), "e\u{301}");
+    }
 }

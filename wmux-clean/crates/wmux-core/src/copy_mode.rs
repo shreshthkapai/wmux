@@ -385,7 +385,7 @@ fn line_text_range(line: &Line, from: u16, to: u16) -> String {
             continue;
         };
         if !cell.is_continuation() {
-            out.push(cell.ch());
+            cell.text().push_to(&mut out);
         }
     }
     while out.ends_with(' ') {
@@ -397,7 +397,7 @@ fn line_text_range(line: &Line, from: u16, to: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PaneId, Style};
+    use crate::{CellText, PaneId, Style};
 
     fn line(text: &str) -> Line {
         let mut line = Line::blank(32);
@@ -429,6 +429,22 @@ mod tests {
         mode.handle_key(b"\x1b[B", &lines, 2);
         mode.handle_key(b"\x1b[C", &lines, 2);
         assert_eq!(mode.selected_text(&lines), "lpha\nbet");
+    }
+
+    #[test]
+    fn selection_copies_combined_text_without_splitting_grid_columns() {
+        let mut line = Line::blank(8);
+        let mut text = CellText::from('e');
+        assert!(text.try_append('\u{301}'));
+        line.set_text(0, text, 1, Style::default());
+        line.set(1, 'x', 1, Style::default());
+        let lines = vec![line];
+        let mut mode = CopyMode::new(PaneId::new(1), 0, 0, 1, 1);
+
+        mode.handle_key(b" ", &lines, 1);
+        mode.handle_key(b"l", &lines, 1);
+
+        assert_eq!(mode.selected_text(&lines), "e\u{301}x");
     }
 
     #[test]

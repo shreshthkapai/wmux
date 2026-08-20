@@ -2,16 +2,18 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::text::{extends_grapheme, CellText};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Color {
+    #[default]
+    Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Style {
-    pub fg: Option<Color>,
-    pub bg: Option<Color>,
+    pub fg: Color,
+    pub bg: Color,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
@@ -96,23 +98,23 @@ impl CellMetadata {
     }
 }
 
-fn encode_color(color: Option<Color>) -> u64 {
+fn encode_color(color: Color) -> u64 {
     match color {
-        None => 0,
-        Some(Color::Indexed(index)) => u64::from(index) + 1,
-        Some(Color::Rgb(red, green, blue)) => {
+        Color::Default => 0,
+        Color::Indexed(index) => u64::from(index) + 1,
+        Color::Rgb(red, green, blue) => {
             257 + (u64::from(red) << 16) + (u64::from(green) << 8) + u64::from(blue)
         }
     }
 }
 
-fn decode_color(encoded: u64) -> Option<Color> {
+fn decode_color(encoded: u64) -> Color {
     match encoded {
-        0 => None,
-        1..=256 => Some(Color::Indexed((encoded - 1) as u8)),
+        0 => Color::Default,
+        1..=256 => Color::Indexed((encoded - 1) as u8),
         value => {
             let rgb = value - 257;
-            Some(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+            Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
         }
     }
 }
@@ -1168,7 +1170,8 @@ fn reflow_logical_line(cells: &[Cell], cols: u16, generation: u64, out: &mut Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, Grid, Line, Style};
+    use super::{Cell, Color, Grid, Line, Style};
+    use crate::CellText;
     use std::sync::Arc;
 
     #[test]
@@ -1228,7 +1231,7 @@ mod tests {
     fn non_default_blank_cells_remain_explicit() {
         let mut line = Line::blank(80);
         let style = Style {
-            bg: Some(super::Color::Indexed(4)),
+            bg: super::Color::Indexed(4),
             ..Style::default()
         };
         line.clear_range_with_style(70, 80, style);
@@ -1269,7 +1272,7 @@ mod tests {
     fn equal_non_default_styles_are_interned() {
         let style = Style {
             bold: true,
-            fg: Some(super::Color::Rgb(10, 20, 30)),
+            fg: super::Color::Rgb(10, 20, 30),
             ..Style::default()
         };
         let left = Cell::printable('a', 1, style);
@@ -1277,6 +1280,14 @@ mod tests {
         assert_eq!(left.metadata.style(), right.metadata.style());
         assert_eq!(std::mem::size_of::<super::StyleId>(), 8);
         assert!(std::mem::size_of::<Cell>() <= 16);
+    }
+
+    #[test]
+    fn terminal_default_colours_are_explicit_and_interned() {
+        let style = Style::default();
+        assert_eq!(style.fg, Color::Default);
+        assert_eq!(style.bg, Color::Default);
+        assert_eq!(Cell::blank().style(), style);
     }
 
     #[test]
@@ -1347,5 +1358,24 @@ mod tests {
             ["histo", "rical"]
         );
         assert_eq!(grid.history_cache.len(), 2);
+    }
+
+    #[test]
+    fn combined_text_survives_wrapped_history_reflow() {
+        let mut grid = Grid::new(4, 2);
+        let mut text = CellText::from('e');
+        assert!(text.try_append('\u{301}'));
+        grid.set_text(0, 0, text, 1, Style::default());
+        grid.set(0, 1, 'x', 1, Style::default());
+        grid.set(0, 2, 'y', 1, Style::default());
+        grid.set(0, 3, 'z', 1, Style::default());
+        grid.set_wrapped(0, true);
+        grid.scroll_up_whole_screen(1);
+
+        let history = grid.history_lines_at_width(2);
+        assert_eq!(
+            history.iter().map(Line::text).collect::<Vec<_>>(),
+            ["e\u{301}x", "yz"]
+        );
     }
 }

@@ -906,11 +906,11 @@ impl Screen {
         self.current_style.strikethrough = enabled;
     }
 
-    pub fn set_fg(&mut self, color: Option<Color>) {
+    pub fn set_fg(&mut self, color: Color) {
         self.current_style.fg = color;
     }
 
-    pub fn set_bg(&mut self, color: Option<Color>) {
+    pub fn set_bg(&mut self, color: Color) {
         self.current_style.bg = color;
     }
 

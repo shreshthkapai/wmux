@@ -225,19 +225,19 @@ fn apply_sgr(screen: &mut Screen, params: &[u16]) {
             27 => screen.set_reverse(false),
             28 => screen.set_hidden(false),
             29 => screen.set_strikethrough(false),
-            30..=37 => screen.set_fg(Some(Color::Indexed((params[index] - 30) as u8))),
-            39 => screen.set_fg(None),
-            40..=47 => screen.set_bg(Some(Color::Indexed((params[index] - 40) as u8))),
-            49 => screen.set_bg(None),
-            90..=97 => screen.set_fg(Some(Color::Indexed((params[index] - 82) as u8))),
-            100..=107 => screen.set_bg(Some(Color::Indexed((params[index] - 92) as u8))),
+            30..=37 => screen.set_fg(Color::Indexed((params[index] - 30) as u8)),
+            39 => screen.set_fg(Color::Default),
+            40..=47 => screen.set_bg(Color::Indexed((params[index] - 40) as u8)),
+            49 => screen.set_bg(Color::Default),
+            90..=97 => screen.set_fg(Color::Indexed((params[index] - 82) as u8)),
+            100..=107 => screen.set_bg(Color::Indexed((params[index] - 92) as u8)),
             38 | 48 => {
                 let foreground = params[index] == 38;
                 if let Some((color, consumed)) = parse_color(&params[index + 1..]) {
                     if foreground {
-                        screen.set_fg(Some(color));
+                        screen.set_fg(color);
                     } else {
-                        screen.set_bg(Some(color));
+                        screen.set_bg(color);
                     }
                     index += consumed;
                 }

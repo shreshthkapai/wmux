@@ -9,7 +9,7 @@ use wmux_protocol::{encode_frame, read_message, Message};
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xfeb4_8e63_0335_4e80;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x0340_7628_c53b_7958;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -266,7 +266,10 @@ fn hash_screen(screen: &Screen) -> u64 {
             .render_line_cells(row)
             .expect("visible screen row exists")
         {
-            hash.u32(cell.ch() as u32);
+            let mut text = Vec::with_capacity(cell.text().byte_len());
+            cell.text().write_utf8(&mut text);
+            hash.byte(text.len() as u8);
+            hash.bytes(&text);
             hash.byte(cell.width());
             hash.byte(u8::from(cell.is_continuation()));
             hash_style(&mut hash, cell.style());
@@ -291,14 +294,14 @@ fn hash_style(hash: &mut Fnv64, style: Style) {
     }
 }
 
-fn hash_color(hash: &mut Fnv64, color: Option<Color>) {
+fn hash_color(hash: &mut Fnv64, color: Color) {
     match color {
-        None => hash.byte(0),
-        Some(Color::Indexed(index)) => {
+        Color::Default => hash.byte(0),
+        Color::Indexed(index) => {
             hash.byte(1);
             hash.byte(index);
         }
-        Some(Color::Rgb(red, green, blue)) => {
+        Color::Rgb(red, green, blue) => {
             hash.byte(2);
             hash.byte(red);
             hash.byte(green);
@@ -335,10 +338,6 @@ impl Fnv64 {
         self.bytes(&value.to_le_bytes());
     }
 
-    fn u32(&mut self, value: u32) {
-        self.bytes(&value.to_le_bytes());
-    }
-
     fn u64(&mut self, value: u64) {
         self.bytes(&value.to_le_bytes());
     }
@@ -354,7 +353,10 @@ impl Fnv64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_portable_suite, verify_portable_suite, EXPECTED_PORTABLE_FINGERPRINT};
+    use super::{
+        hash_screen, run_portable_suite, verify_portable_suite, EXPECTED_PORTABLE_FINGERPRINT,
+    };
+    use wmux_core::{Screen, TerminalEngine};
 
     #[test]
     fn portable_semantic_suite_passes() {
@@ -366,5 +368,17 @@ mod tests {
     #[test]
     fn portable_semantic_suite_is_deterministic() {
         assert_eq!(run_portable_suite().unwrap(), run_portable_suite().unwrap());
+    }
+
+    #[test]
+    fn screen_hash_includes_every_byte_of_combined_cell_text() {
+        let mut scalar = Screen::new(8, 2);
+        let mut combined = Screen::new(8, 2);
+        let mut scalar_terminal = TerminalEngine::new();
+        let mut combined_terminal = TerminalEngine::new();
+        scalar_terminal.feed(&mut scalar, b"e");
+        combined_terminal.feed(&mut combined, "e\u{301}".as_bytes());
+
+        assert_ne!(hash_screen(&scalar), hash_screen(&combined));
     }
 }

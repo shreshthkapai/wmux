@@ -232,13 +232,15 @@ git commit -m "feat(core): preserve graphemes in pane grids"
 - Modify: `wmux-clean/crates/wmux-core/src/render.rs`
 - Modify: `wmux-clean/crates/wmux-core/src/screen.rs`
 - Modify: `wmux-clean/crates/wmux-core/src/terminal.rs`
+- Modify: `wmux-clean/crates/wmux-core/src/state.rs`
 - Modify: `wmux-clean/crates/wmux-conformance/src/lib.rs`
+- Modify: `wmux-clean/crates/wmux-bench/src/legacy_terminal.rs`
 
 **Interfaces:**
 - Consumes: grapheme-aware `Cell`/`Line` state from Task 2.
 - Produces: full-text `Line::text`, reflow, copy extraction, scene equality/diff output, byte-based conformance hashing, and explicit `Color::Default` semantics.
 
-- [ ] **Step 1: Add failing lifecycle and renderer tests**
+- [x] **Step 1: Add failing lifecycle and renderer tests**
 
   Add tests proving the same literal sequence survives wrapped reflow, history materialization, copy-mode selection, full render, a client diff after changing a combined cell, and a `ServerState` detach/reattach. Each expected string must be a literal rather than produced by a wmux helper.
 
@@ -270,7 +272,7 @@ fn full_and_diff_render_emit_complete_grapheme_bytes() {
 }
 ```
 
-- [ ] **Step 2: Run tests and observe RED**
+- [x] **Step 2: Run tests and observe RED**
 
 ```powershell
 cargo test -p wmux-core copy_mode::tests::selection_copies_combined_text_without_splitting_grid_columns -- --nocapture
@@ -279,11 +281,11 @@ cargo test -p wmux-core render::tests::full_and_diff_render_emit_complete_graphe
 
   Expected: text after the first scalar is missing from copy/render output.
 
-- [ ] **Step 3: Replace every lossy `cell.ch()` projection**
+- [x] **Step 3: Replace every lossy `cell.ch()` projection**
 
   Make `Line::text` and copy selection call `CellText::push_to`; make renderer output call `CellText::write_utf8` unless hidden; make reflow place cloned `CellText`; compare complete text in border collision logic; and hash every UTF-8 byte plus width/continuation/style in conformance. Retain `ch()` only where layout code intentionally deals in one ASCII border glyph.
 
-- [ ] **Step 4: Represent terminal defaults explicitly**
+- [x] **Step 4: Represent terminal defaults explicitly**
 
   Change the colour model to:
 
@@ -297,7 +299,7 @@ pub enum Color {
 
   Make `Style::default()` use `Color::Default` for both foreground and background, make SGR 39/49 restore `Color::Default`, preserve `Default` in style interning, and have `push_color` emit no palette sequence for it after the renderer's SGR reset. Update existing literal assertions from `None`/`Some` to direct `Color` variants.
 
-- [ ] **Step 5: Run focused tests and the portable consumers**
+- [x] **Step 5: Run focused tests and the portable consumers**
 
 ```powershell
 cargo test -p wmux-core
@@ -306,10 +308,10 @@ cargo test -p wmux-conformance -p wmux-server -p wmux-bench
 
   Expected: all tests pass; old ASCII and style behaviors remain unchanged while complete grapheme bytes survive every consumer.
 
-- [ ] **Step 6: Commit complete text propagation**
+- [x] **Step 6: Commit complete text propagation**
 
 ```powershell
-git add wmux-clean/crates/wmux-core/src/grid.rs wmux-clean/crates/wmux-core/src/copy_mode.rs wmux-clean/crates/wmux-core/src/render.rs wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs wmux-clean/crates/wmux-conformance/src/lib.rs
+git add docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md wmux-clean/crates/wmux-core/src/grid.rs wmux-clean/crates/wmux-core/src/copy_mode.rs wmux-clean/crates/wmux-core/src/render.rs wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs wmux-clean/crates/wmux-core/src/state.rs wmux-clean/crates/wmux-conformance/src/lib.rs wmux-clean/crates/wmux-bench/src/legacy_terminal.rs
 git commit -m "feat(core): retain cell text across rendering and copy"
 ```
 
