@@ -1,5 +1,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
+use crate::text::{extends_grapheme, CellText};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Color {
     Indexed(u8),
@@ -28,6 +30,7 @@ struct StyleId(u64);
 impl StyleId {
     const COLOR_BITS: u32 = 25;
     const COLOR_MASK: u64 = (1 << Self::COLOR_BITS) - 1;
+    const STYLE_MASK: u64 = (1 << 57) - 1;
 
     fn intern(style: Style) -> Self {
         let mut bits = encode_color(style.fg);
@@ -57,6 +60,42 @@ impl StyleId {
     }
 }
 
+/// Cell-local display metadata packed into the seven unused high bits of the
+/// canonical 57-bit style word. Terminal cell widths are limited to 0, 1, or
+/// 2, leaving room for the continuation marker without growing `Cell`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellMetadata(u64);
+
+impl CellMetadata {
+    const WIDTH_SHIFT: u32 = 57;
+    const WIDTH_MASK: u64 = 0b11 << Self::WIDTH_SHIFT;
+    const CONTINUATION_MASK: u64 = 1 << 59;
+
+    const fn new(style: StyleId, width: u8, continuation: bool) -> Self {
+        Self(
+            (style.0 & StyleId::STYLE_MASK)
+                | (((width as u64) & 0b11) << Self::WIDTH_SHIFT)
+                | ((continuation as u64) << 59),
+        )
+    }
+
+    const fn style(self) -> StyleId {
+        StyleId(self.0 & StyleId::STYLE_MASK)
+    }
+
+    const fn width(self) -> u8 {
+        ((self.0 & Self::WIDTH_MASK) >> Self::WIDTH_SHIFT) as u8
+    }
+
+    const fn is_continuation(self) -> bool {
+        self.0 & Self::CONTINUATION_MASK != 0
+    }
+
+    fn set_style(&mut self, style: StyleId) {
+        self.0 = (self.0 & !StyleId::STYLE_MASK) | (style.0 & StyleId::STYLE_MASK);
+    }
+}
+
 fn encode_color(color: Option<Color>) -> u64 {
     match color {
         None => 0,
@@ -80,26 +119,20 @@ fn decode_color(encoded: u64) -> Option<Color> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cell {
-    ch: char,
-    width: u8,
-    continuation: bool,
-    style: StyleId,
+    text: CellText,
+    metadata: CellMetadata,
 }
 
 static DEFAULT_CELL: Cell = Cell {
-    ch: ' ',
-    width: 1,
-    continuation: false,
-    style: StyleId(0),
+    text: CellText::from_char_const(' '),
+    metadata: CellMetadata::new(StyleId(0), 1, false),
 };
 
 impl Cell {
     pub(crate) const fn const_blank_for_render() -> Self {
         Self {
-            ch: ' ',
-            width: 1,
-            continuation: false,
-            style: StyleId(0),
+            text: CellText::from_char_const(' '),
+            metadata: CellMetadata::new(StyleId(0), 1, false),
         }
     }
 
@@ -113,39 +146,47 @@ impl Cell {
 
     fn blank_with_style_ref(style: StyleId) -> Self {
         Self {
-            ch: ' ',
-            width: 1,
-            continuation: false,
-            style,
+            text: CellText::from_char_const(' '),
+            metadata: CellMetadata::new(style, 1, false),
         }
     }
 
-    pub const fn ch(&self) -> char {
-        self.ch
+    pub fn ch(&self) -> char {
+        self.text.first_char()
+    }
+
+    pub const fn text(&self) -> &CellText {
+        &self.text
     }
 
     pub const fn width(&self) -> u8 {
-        self.width
+        self.metadata.width()
     }
 
     pub const fn is_continuation(&self) -> bool {
-        self.continuation
+        self.metadata.is_continuation()
     }
 
     pub fn style(&self) -> Style {
-        self.style.get()
+        self.metadata.style().get()
     }
 
     pub fn printable(ch: char, width: u8, style: Style) -> Self {
         Self::printable_with_style_ref(ch, width, StyleId::intern(style))
     }
 
+    pub fn printable_text(text: CellText, width: u8, style: Style) -> Self {
+        Self::printable_text_with_style_ref(text, width, StyleId::intern(style))
+    }
+
     fn printable_with_style_ref(ch: char, width: u8, style: StyleId) -> Self {
+        Self::printable_text_with_style_ref(CellText::from(ch), width, style)
+    }
+
+    fn printable_text_with_style_ref(text: CellText, width: u8, style: StyleId) -> Self {
         Self {
-            ch,
-            width,
-            continuation: false,
-            style,
+            text,
+            metadata: CellMetadata::new(style, width, false),
         }
     }
 
@@ -155,15 +196,16 @@ impl Cell {
 
     fn continuation_with_style_ref(style: StyleId) -> Self {
         Self {
-            ch: ' ',
-            width: 0,
-            continuation: true,
-            style,
+            text: CellText::from_char_const(' '),
+            metadata: CellMetadata::new(style, 0, true),
         }
     }
 
     pub fn is_blank_default(&self) -> bool {
-        self.ch == ' ' && self.width == 1 && !self.continuation && self.style == StyleId::default()
+        self.text.is_single_char(' ')
+            && self.width() == 1
+            && !self.is_continuation()
+            && self.metadata.style() == StyleId::default()
     }
 }
 
@@ -186,12 +228,10 @@ impl Line {
     }
 
     pub fn text(&self) -> String {
-        let mut text = self
-            .cells
-            .iter()
-            .filter(|cell| !cell.is_continuation())
-            .map(Cell::ch)
-            .collect::<String>();
+        let mut text = String::new();
+        for cell in self.cells.iter().filter(|cell| !cell.is_continuation()) {
+            cell.text().push_to(&mut text);
+        }
         while text.ends_with(' ') {
             text.pop();
         }
@@ -215,11 +255,15 @@ impl Line {
     }
 
     pub fn set(&mut self, col: u16, ch: char, width: u8, style: Style) {
+        self.set_text(col, CellText::from(ch), width, style);
+    }
+
+    pub fn set_text(&mut self, col: u16, text: CellText, width: u8, style: Style) {
         let col = col as usize;
         if col >= self.cols as usize {
             return;
         }
-        let default_space = width != 2 && ch == ' ' && style == Style::default();
+        let default_space = width != 2 && text.is_single_char(' ') && style == Style::default();
         if default_space && col >= self.cells.len() {
             return;
         }
@@ -235,14 +279,53 @@ impl Line {
             }
             self.clear_cell_boundary(col + 1);
             let cells = Arc::make_mut(&mut self.cells);
-            cells[col] = Cell::printable_with_style_ref(ch, 2, style);
+            cells[col] = Cell::printable_text_with_style_ref(text, 2, style);
             cells[col + 1] = Cell::continuation_with_style_ref(style);
         } else {
-            Arc::make_mut(&mut self.cells)[col] = Cell::printable_with_style_ref(ch, 1, style);
+            Arc::make_mut(&mut self.cells)[col] =
+                Cell::printable_text_with_style_ref(text, 1, style);
         }
         if may_shorten {
             self.trim_default_tail();
         }
+    }
+
+    pub(crate) fn append_grapheme(&mut self, col: u16, ch: char) -> Option<(u8, u8)> {
+        let col = usize::from(col);
+        if col >= usize::from(self.cols) {
+            return None;
+        }
+
+        let current = self.cell(col as u16)?.clone();
+        if current.is_continuation() || !extends_grapheme(current.text(), ch) {
+            return None;
+        }
+
+        let mut text = current.text().clone();
+        if !text.try_append(ch) {
+            return None;
+        }
+        let old_width = current.width().max(1);
+        let new_width = text.display_width().max(1);
+        if new_width == 2 && col + 1 >= usize::from(self.cols) {
+            return None;
+        }
+
+        self.materialize_to(col + usize::from(old_width.max(new_width)));
+        self.clear_cell_boundary(col);
+        if new_width == 2 {
+            self.clear_cell_boundary(col + 1);
+        }
+        let cells = Arc::make_mut(&mut self.cells);
+        let style = current.metadata.style();
+        cells[col] = Cell::printable_text_with_style_ref(text, new_width, style);
+        if new_width == 2 {
+            cells[col + 1] = Cell::continuation_with_style_ref(style);
+        } else if old_width == 2 && col + 1 < cells.len() {
+            cells[col + 1] = Cell::blank();
+        }
+        self.trim_default_tail();
+        Some((old_width, new_width))
     }
 
     pub fn cell(&self, col: u16) -> Option<&Cell> {
@@ -263,7 +346,7 @@ impl Line {
         for cell in &mut cells[usize::from(start)..usize::from(end)] {
             let mut style = cell.style();
             style.reverse = !style.reverse;
-            cell.style = StyleId::intern(style);
+            cell.metadata.set_style(StyleId::intern(style));
         }
     }
 
@@ -477,7 +560,7 @@ impl Line {
                 if index + 1 >= cells.len() || index + 1 >= self.cols as usize {
                     cells[index] = Cell::blank();
                 } else {
-                    let style = cells[index].style;
+                    let style = cells[index].metadata.style();
                     cells[index + 1] = Cell::continuation_with_style_ref(style);
                 }
             }
@@ -634,6 +717,16 @@ impl Grid {
         if let Some(line) = self.line_mut(row) {
             line.set(col, ch, width, style);
         }
+    }
+
+    pub fn set_text(&mut self, row: u16, col: u16, text: CellText, width: u8, style: Style) {
+        if let Some(line) = self.line_mut(row) {
+            line.set_text(col, text, width, style);
+        }
+    }
+
+    pub(crate) fn append_grapheme(&mut self, row: u16, col: u16, ch: char) -> Option<(u8, u8)> {
+        self.line_mut(row)?.append_grapheme(col, ch)
     }
 
     pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
@@ -1065,7 +1158,7 @@ fn reflow_logical_line(cells: &[Cell], cols: u16, generation: u64, out: &mut Vec
             col = 0;
         }
         if width <= cols {
-            line.set(col, cell.ch(), cell.width().max(1), cell.style());
+            line.set_text(col, cell.text().clone(), cell.width().max(1), cell.style());
             col = col.saturating_add(width).min(cols);
         }
     }
@@ -1157,6 +1250,22 @@ mod tests {
     }
 
     #[test]
+    fn replacing_either_half_of_a_wide_cell_clears_the_other_half() {
+        let mut line = Line::blank(8);
+        line.set(0, '\u{754c}', 2, Style::default());
+
+        line.set(1, 'x', 1, Style::default());
+        assert_eq!(line.text(), " x");
+        assert_eq!(line.width_at(0), 1);
+        assert_eq!(line.width_at(1), 1);
+
+        line.set(2, '\u{754c}', 2, Style::default());
+        line.set(2, 'y', 1, Style::default());
+        assert_eq!(line.width_at(2), 1);
+        assert_eq!(line.width_at(3), 1);
+    }
+
+    #[test]
     fn equal_non_default_styles_are_interned() {
         let style = Style {
             bold: true,
@@ -1165,7 +1274,7 @@ mod tests {
         };
         let left = Cell::printable('a', 1, style);
         let right = Cell::printable('b', 1, style);
-        assert_eq!(left.style, right.style);
+        assert_eq!(left.metadata.style(), right.metadata.style());
         assert_eq!(std::mem::size_of::<super::StyleId>(), 8);
         assert!(std::mem::size_of::<Cell>() <= 16);
     }

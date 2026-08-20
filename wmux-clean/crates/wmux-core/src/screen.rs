@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{Cell, Color, Grid, Line, Style};
+use crate::{scalar_width, Cell, Color, Grid, Line, Style};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
 const DAMAGE_JOURNAL_CAPACITY: usize = 512;
@@ -514,7 +514,10 @@ impl Screen {
             '\x08' => self.backspace(),
             '\t' => self.tab(),
             _ if ch >= ' ' => {
-                let width = char_width(ch);
+                if !ch.is_ascii() && self.append_to_previous_grapheme(ch) {
+                    return;
+                }
+                let width = scalar_width(ch);
                 if width == 0 {
                     return;
                 }
@@ -532,6 +535,37 @@ impl Screen {
             }
             _ => {}
         }
+    }
+
+    fn append_to_previous_grapheme(&mut self, ch: char) -> bool {
+        let col = if self.pending_wrap {
+            self.cursor_col
+        } else {
+            if self.cursor_col == 0 {
+                return false;
+            }
+            self.grid()
+                .line(self.cursor_row)
+                .map_or(self.cursor_col - 1, |line| {
+                    line.previous_cell_start(self.cursor_col)
+                })
+        };
+
+        let row = self.cursor_row;
+        let Some((_, new_width)) = self.grid_mut().append_grapheme(row, col, ch) else {
+            return false;
+        };
+        self.mark_dirty(row);
+
+        let end = col.saturating_add(u16::from(new_width));
+        if end >= self.cols() {
+            self.cursor_col = self.cols().saturating_sub(1);
+            self.pending_wrap = true;
+        } else {
+            self.cursor_col = end;
+            self.pending_wrap = false;
+        }
+        true
     }
 
     pub fn put_run(&mut self, mut text: &str) {
@@ -969,35 +1003,6 @@ impl Screen {
 
     pub(crate) const fn scroll_region(&self) -> (u16, u16) {
         (self.scroll_top, self.scroll_bottom)
-    }
-}
-
-fn char_width(ch: char) -> u8 {
-    let code = ch as u32;
-    if code == 0
-        || (code < 0x20)
-        || (0x7f..0xa0).contains(&code)
-        || (0x0300..=0x036f).contains(&code)
-        || (0x1ab0..=0x1aff).contains(&code)
-        || (0x1dc0..=0x1dff).contains(&code)
-        || (0x20d0..=0x20ff).contains(&code)
-        || (0xfe00..=0xfe0f).contains(&code)
-    {
-        0
-    } else if (0x1100..=0x115f).contains(&code)
-        || (0x2329..=0x232a).contains(&code)
-        || (0x2e80..=0xa4cf).contains(&code)
-        || (0xac00..=0xd7a3).contains(&code)
-        || (0xf900..=0xfaff).contains(&code)
-        || (0xfe10..=0xfe19).contains(&code)
-        || (0xfe30..=0xfe6f).contains(&code)
-        || (0xff00..=0xff60).contains(&code)
-        || (0xffe0..=0xffe6).contains(&code)
-        || (0x1f300..=0x1faff).contains(&code)
-    {
-        2
-    } else {
-        1
     }
 }
 

@@ -94,16 +94,13 @@ unicode-segmentation = "=1.13.3"
 unicode-width = { version = "=0.2.2", default-features = false }
 ```
 
-  Implement this public shape; `Combined(Arc<String>)` keeps the enum pointer-sized on its overflow arm and makes cloned scrollback/render snapshots share combined strings.
+  Implement this public shape; the tagged pointer-sized representation makes cloned scrollback/render snapshots share combined strings without growing each grid cell.
 
 ```rust
 pub const MAX_CELL_TEXT_BYTES: usize = 32;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum CellText {
-    Scalar(char),
-    Combined(Arc<String>),
-}
+#[repr(transparent)]
+pub struct CellText(NonZeroUsize);
 
 impl CellText {
     pub fn first_char(&self) -> char;
@@ -122,7 +119,7 @@ pub fn scalar_width(ch: char) -> u8;
 pub fn extends_grapheme(text: &CellText, next: char) -> bool;
 ```
 
-  Build candidate graphemes in `SmallVec<[u8; 32]>`, validate them with `str::from_utf8`, use `UnicodeSegmentation::graphemes(candidate, true)`, and derive widths through `UnicodeWidthChar`/`UnicodeWidthStr`. Do not normalize or rewrite application text.
+  Store a scalar inline and tag an `Arc<String>` raw pointer only for combined text, with clone/drop ownership tests and documented safety invariants. Build candidate graphemes in `SmallVec<[u8; 32]>`, validate them with `str::from_utf8`, use `UnicodeSegmentation::graphemes(candidate, true)`, and derive widths through `UnicodeWidthChar`/`UnicodeWidthStr`. Do not normalize or rewrite application text.
 
 - [x] **Step 4: Run focused tests and observe GREEN**
 
@@ -156,7 +153,7 @@ git commit -m "feat(core): add bounded Unicode cell text"
 - Consumes: Task 1 `CellText`, `extends_grapheme`, and width functions.
 - Produces: `Cell::text() -> &CellText`, `Cell::printable_text(CellText, u8, Style)`, `Line::set_text(u16, CellText, u8, Style)`, and screen behavior that appends a grapheme extension to the preceding base cell while preserving wide-cell invariants.
 
-- [ ] **Step 1: Add failing terminal/grid tests for grapheme storage**
+- [x] **Step 1: Add failing terminal/grid tests for grapheme storage**
 
   Add literal, hand-derived expectations for combining marks in one feed and across feeds, split UTF-8, variation selectors, emoji ZWJ sequences, modifiers, flags, zero-width input at column zero, and overwriting either half of a wide cell.
 
@@ -191,7 +188,7 @@ fn zero_width_scalar_at_column_zero_is_ignored_like_tmux() {
 }
 ```
 
-- [ ] **Step 2: Run tests and observe RED**
+- [x] **Step 2: Run tests and observe RED**
 
 ```powershell
 cargo test -p wmux-core terminal::tests -- --nocapture
@@ -199,27 +196,29 @@ cargo test -p wmux-core terminal::tests -- --nocapture
 
   Expected: assertions fail because zero-width input is dropped and emoji components occupy separate cells.
 
-- [ ] **Step 3: Replace `Cell.ch` with `CellText` and preserve convenience APIs**
+- [x] **Step 3: Replace `Cell.ch` with `CellText` and preserve convenience APIs**
 
-  Keep `Cell::printable(char, ...)`, `Line::set(char, ...)`, and `Grid::set(char, ...)` as scalar conveniences for layout/test callers. Add text-aware variants, make blank/continuation statics use `CellText::Scalar(' ')`, compare complete text in equality, and expose `Cell::ch()` only as a compatibility accessor for the first scalar. Add a line helper that atomically replaces a base plus continuation cells when a combined sequence changes width.
+  Keep `Cell::printable(char, ...)`, `Line::set(char, ...)`, and `Grid::set(char, ...)` as scalar conveniences for layout/test callers. Add text-aware variants, make blank/continuation statics use the const scalar constructor, compare complete text in equality, and expose `Cell::ch()` only as a compatibility accessor for the first scalar. Pack width and continuation state into unused high bits of the canonical style word so `Cell` stays within its 16-byte memory budget. Add a line helper that atomically replaces a base plus continuation cells when a combined sequence changes width.
 
-- [ ] **Step 4: Implement previous-cell grapheme extension in `Screen::put_char`**
+- [x] **Step 4: Implement previous-cell grapheme extension in `Screen::put_char`**
 
   Before normal placement of a non-ASCII printable scalar, locate the preceding base cell (respecting `pending_wrap` and wide continuations), test the candidate with `extends_grapheme`, enforce the 32-byte cap, recompute whole-string width, and update cursor/continuation state only after the line mutation succeeds. Width-zero input with no valid preceding base is ignored. The ASCII run fast path remains unchanged.
 
-- [ ] **Step 5: Run focused and core tests**
+- [x] **Step 5: Run focused and core tests**
 
 ```powershell
 cargo test -p wmux-core terminal::tests -- --nocapture
-cargo test -p wmux-core grid::tests screen::tests -- --nocapture
+cargo test -p wmux-core grid::tests -- --nocapture
+cargo test -p wmux-core screen::tests -- --nocapture
+cargo test -p wmux-core
 ```
 
   Expected: all grapheme, wide-cell, resize, scrollback, and existing terminal tests pass.
 
-- [ ] **Step 6: Commit grapheme-aware authoritative state**
+- [x] **Step 6: Commit grapheme-aware authoritative state**
 
 ```powershell
-git add wmux-clean/crates/wmux-core/src/grid.rs wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs
+git add docs/superpowers/plans/2026-08-20-terminal-text-and-fuzzing.md wmux-clean/crates/wmux-core/src/grid.rs wmux-clean/crates/wmux-core/src/screen.rs wmux-clean/crates/wmux-core/src/terminal.rs wmux-clean/crates/wmux-core/src/text.rs wmux-clean/docs/terminal-text-model.md
 git commit -m "feat(core): preserve graphemes in pane grids"
 ```
 

@@ -24,10 +24,17 @@ does not copy that lossy text behavior.
 
 ## wmux Representation
 
-`CellText::Scalar(char)` stores the common one-scalar value inline.
-`CellText::Combined(Arc<String>)` is created only when another scalar joins the
-cell. The `Arc` lets scrollback, frozen scenes, and per-client baselines share
-the uncommon overflow value across line-level copy-on-write snapshots.
+`CellText` is one machine word. A tagged scalar encoding stores the common
+one-scalar value inline; a tagged `Arc<String>` raw pointer is created only
+when another scalar joins the cell. Manual clone/drop implementations preserve
+the `Arc` strong-count contract, and dedicated tests cover shared ownership and
+independent mutation after cloning. The allocation lets scrollback, frozen
+scenes, and per-client baselines share uncommon combined text across line-level
+copy-on-write snapshots.
+
+The canonical style ID occupies 57 bits. Cell width and continuation state use
+three of its seven otherwise-unused high bits, keeping the complete `Cell`
+within the existing 16-byte memory budget even after grapheme support.
 
 One cell accepts at most 32 UTF-8 bytes, matching tmux. An extension beyond the
 limit is ignored atomically: the previous text, width, continuation state, and

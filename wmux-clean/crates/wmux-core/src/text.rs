@@ -1,4 +1,9 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 use smallvec::SmallVec;
 use unicode_segmentation::UnicodeSegmentation;
@@ -10,19 +15,29 @@ pub const MAX_CELL_TEXT_BYTES: usize = 32;
 /// Text stored in one terminal grid cell.
 ///
 /// The overwhelmingly common single-scalar case stays inline. Combined text
-/// owns a growable string behind `Arc`, so cloned lines and render baselines
-/// share the uncommon overflow allocation until a later mutation.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum CellText {
-    Scalar(char),
-    Combined(Arc<String>),
-}
+/// owns a string behind `Arc`, so cloned lines and render baselines share the
+/// uncommon overflow allocation.
+///
+/// The low bit tags an `Arc<String>` raw pointer. Inline scalars encode
+/// `(scalar + 1) << 1`, leaving zero unavailable so the entire value remains
+/// one word while retaining the `NonZeroUsize` niche.
+#[repr(transparent)]
+pub struct CellText(NonZeroUsize);
 
 impl CellText {
+    const POINTER_TAG: usize = 1;
+
+    pub const fn from_char_const(ch: char) -> Self {
+        let encoded = ((ch as usize) + 1) << 1;
+        // SAFETY: adding one before shifting makes every scalar encoding nonzero.
+        Self(unsafe { NonZeroUsize::new_unchecked(encoded) })
+    }
+
     pub fn first_char(&self) -> char {
-        match self {
-            Self::Scalar(ch) => *ch,
-            Self::Combined(text) => text
+        match self.scalar() {
+            Some(ch) => ch,
+            None => self
+                .combined()
                 .chars()
                 .next()
                 .expect("combined CellText always retains its base scalar"),
@@ -30,20 +45,24 @@ impl CellText {
     }
 
     pub const fn has_owned_overflow(&self) -> bool {
-        matches!(self, Self::Combined(_))
+        self.0.get() & Self::POINTER_TAG != 0
+    }
+
+    pub fn is_single_char(&self, expected: char) -> bool {
+        self.scalar() == Some(expected)
     }
 
     pub fn byte_len(&self) -> usize {
-        match self {
-            Self::Scalar(ch) => ch.len_utf8(),
-            Self::Combined(text) => text.len(),
+        match self.scalar() {
+            Some(ch) => ch.len_utf8(),
+            None => self.combined().len(),
         }
     }
 
     pub fn ends_with(&self, ch: char) -> bool {
-        match self {
-            Self::Scalar(current) => *current == ch,
-            Self::Combined(text) => text.ends_with(ch),
+        match self.scalar() {
+            Some(current) => current == ch,
+            None => self.combined().ends_with(ch),
         }
     }
 
@@ -54,66 +73,141 @@ impl CellText {
             return false;
         }
 
-        match self {
-            Self::Scalar(first) => {
-                let first = *first;
-                let mut combined = String::with_capacity(first.len_utf8() + ch.len_utf8());
-                combined.push(first);
-                combined.push(ch);
-                *self = Self::Combined(Arc::new(combined));
-            }
-            Self::Combined(text) => Arc::make_mut(text).push(ch),
-        }
+        let mut combined = String::with_capacity(self.byte_len() + ch.len_utf8());
+        self.push_to(&mut combined);
+        combined.push(ch);
+        *self = Self::from_combined(combined);
         true
     }
 
     pub fn display_width(&self) -> u8 {
-        let width = match self {
-            Self::Scalar(ch) => UnicodeWidthChar::width(*ch).unwrap_or(0),
-            Self::Combined(text) => UnicodeWidthStr::width(text.as_str()),
+        let width = match self.scalar() {
+            Some(ch) => UnicodeWidthChar::width(ch).unwrap_or(0),
+            None => UnicodeWidthStr::width(self.combined().as_str()),
         };
         width.min(2) as u8
     }
 
     pub fn push_to(&self, out: &mut String) {
-        match self {
-            Self::Scalar(ch) => out.push(*ch),
-            Self::Combined(text) => out.push_str(text),
+        match self.scalar() {
+            Some(ch) => out.push(ch),
+            None => out.push_str(self.combined()),
         }
     }
 
     pub fn write_utf8(&self, out: &mut Vec<u8>) {
-        match self {
-            Self::Scalar(ch) => {
+        match self.scalar() {
+            Some(ch) => {
                 let mut encoded = [0; 4];
                 out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
             }
-            Self::Combined(text) => out.extend_from_slice(text.as_bytes()),
+            None => out.extend_from_slice(self.combined().as_bytes()),
         }
     }
 
     fn append_bytes(&self, out: &mut SmallVec<[u8; MAX_CELL_TEXT_BYTES + 4]>) {
-        match self {
-            Self::Scalar(ch) => {
+        match self.scalar() {
+            Some(ch) => {
                 let mut encoded = [0; 4];
                 out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
             }
-            Self::Combined(text) => out.extend_from_slice(text.as_bytes()),
+            None => out.extend_from_slice(self.combined().as_bytes()),
+        }
+    }
+
+    fn scalar(&self) -> Option<char> {
+        if self.has_owned_overflow() {
+            return None;
+        }
+        let scalar = (self.0.get() >> 1) - 1;
+        // SAFETY: the only non-pointer constructor accepts a valid `char` and
+        // stores that scalar unchanged in the tagged word.
+        Some(unsafe { char::from_u32_unchecked(scalar as u32) })
+    }
+
+    fn from_combined(text: String) -> Self {
+        let raw = Arc::into_raw(Arc::new(text));
+        let address = raw.expose_provenance();
+        debug_assert_eq!(address & Self::POINTER_TAG, 0);
+        // SAFETY: `Arc<String>` is aligned to at least two bytes, so tagging its
+        // non-null allocation pointer leaves a nonzero value.
+        Self(unsafe { NonZeroUsize::new_unchecked(address | Self::POINTER_TAG) })
+    }
+
+    fn combined_ptr(&self) -> *const String {
+        debug_assert!(self.has_owned_overflow());
+        std::ptr::with_exposed_provenance(self.0.get() & !Self::POINTER_TAG)
+    }
+
+    fn combined(&self) -> &String {
+        // SAFETY: combined values originate exclusively from `Arc::into_raw`.
+        // Clone and Drop maintain one strong count for every tagged owner.
+        unsafe { &*self.combined_ptr() }
+    }
+}
+
+impl Clone for CellText {
+    fn clone(&self) -> Self {
+        if self.has_owned_overflow() {
+            // SAFETY: `combined_ptr` is a live pointer produced by
+            // `Arc::into_raw`; the clone owns the incremented strong count.
+            unsafe { Arc::increment_strong_count(self.combined_ptr()) };
+        }
+        Self(self.0)
+    }
+}
+
+impl Drop for CellText {
+    fn drop(&mut self) {
+        if self.has_owned_overflow() {
+            // SAFETY: this value owns exactly one strong count established by
+            // `from_combined` or `clone`, and Drop consumes that count once.
+            unsafe { Arc::decrement_strong_count(self.combined_ptr()) };
+        }
+    }
+}
+
+impl fmt::Debug for CellText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CellText")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl PartialEq for CellText {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.scalar(), other.scalar()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => self.combined() == other.combined(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CellText {}
+
+impl Hash for CellText {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.scalar() {
+            Some(ch) => ch.hash(state),
+            None => self.combined().hash(state),
         }
     }
 }
 
 impl From<char> for CellText {
     fn from(ch: char) -> Self {
-        Self::Scalar(ch)
+        Self::from_char_const(ch)
     }
 }
 
 impl fmt::Display for CellText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Scalar(ch) => formatter.write_fmt(format_args!("{ch}")),
-            Self::Combined(text) => formatter.write_str(text),
+        match self.scalar() {
+            Some(ch) => formatter.write_fmt(format_args!("{ch}")),
+            None => formatter.write_str(self.combined()),
         }
     }
 }
@@ -147,7 +241,7 @@ mod tests {
     fn scalar_uses_no_owned_overflow_until_a_combining_mark_arrives() {
         let mut text = CellText::from('e');
 
-        assert!(size_of::<CellText>() <= 16);
+        assert_eq!(size_of::<CellText>(), size_of::<usize>());
         assert!(!text.has_owned_overflow());
         assert!(text.try_append('\u{301}'));
         assert!(text.has_owned_overflow());
@@ -208,5 +302,17 @@ mod tests {
         let before = text.clone();
         assert!(!text.try_append('\u{301}'));
         assert_eq!(text, before);
+    }
+
+    #[test]
+    fn cloned_combined_text_keeps_its_allocation_alive_and_mutates_independently() {
+        let mut original = CellText::from('e');
+        assert!(original.try_append('\u{301}'));
+        let mut clone = original.clone();
+        drop(original);
+
+        assert_eq!(clone.to_string(), "e\u{301}");
+        assert!(clone.try_append('\u{301}'));
+        assert_eq!(clone.to_string(), "e\u{301}\u{301}");
     }
 }

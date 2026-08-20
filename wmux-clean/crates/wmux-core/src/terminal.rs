@@ -597,6 +597,74 @@ mod tests {
     }
 
     #[test]
+    fn combining_marks_survive_split_terminal_feeds_in_one_cell() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(8, 2);
+        engine.feed(&mut screen, b"e");
+        engine.feed(&mut screen, "\u{301}".as_bytes());
+
+        let line = screen.grid().line(0).unwrap();
+        assert_eq!(line.text(), "e\u{301}");
+        assert_eq!(line.width_at(0), 1);
+        assert_eq!(line.width_at(1), 1);
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn variation_selector_expands_the_previous_cell_to_two_columns() {
+        let screen = run("\u{2764}\u{fe0f}x".as_bytes());
+        let line = screen.grid().line(0).unwrap();
+
+        assert_eq!(line.text(), "\u{2764}\u{fe0f}x");
+        assert_eq!(line.width_at(0), 2);
+        assert_eq!(line.width_at(1), 0);
+        assert_eq!(line.width_at(2), 1);
+        assert_eq!(screen.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn emoji_zwj_sequence_occupies_one_wide_cell() {
+        let screen = run("\u{1f469}\u{200d}\u{1f4bb}x".as_bytes());
+        let line = screen.grid().line(0).unwrap();
+
+        assert_eq!(line.text(), "\u{1f469}\u{200d}\u{1f4bb}x");
+        assert_eq!(line.width_at(0), 2);
+        assert_eq!(line.width_at(1), 0);
+        assert_eq!(line.width_at(2), 1);
+        assert_eq!(screen.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn emoji_modifier_stays_with_its_base_cell() {
+        let screen = run("\u{1f44d}\u{1f3fd}x".as_bytes());
+        let line = screen.grid().line(0).unwrap();
+
+        assert_eq!(line.text(), "\u{1f44d}\u{1f3fd}x");
+        assert_eq!(line.width_at(0), 2);
+        assert_eq!(line.width_at(1), 0);
+        assert_eq!(line.width_at(2), 1);
+    }
+
+    #[test]
+    fn regional_indicator_pair_is_stored_as_one_flag_cell() {
+        let screen = run("\u{1f1ec}\u{1f1e7}x".as_bytes());
+        let line = screen.grid().line(0).unwrap();
+
+        assert_eq!(line.text(), "\u{1f1ec}\u{1f1e7}x");
+        assert_eq!(line.width_at(0), 2);
+        assert_eq!(line.width_at(1), 0);
+        assert_eq!(line.width_at(2), 1);
+    }
+
+    #[test]
+    fn zero_width_scalar_at_column_zero_is_ignored_like_tmux() {
+        let screen = run("\u{301}a".as_bytes());
+
+        assert_eq!(screen.grid().line(0).unwrap().text(), "a");
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    #[test]
     fn sgr_styles_are_stored_per_cell() {
         let mut engine = TerminalEngine::new();
         let mut screen = Screen::new(10, 2);
