@@ -66,6 +66,12 @@ emit continuation cells. Copy mode and reflow operate on the same complete
 value, so detach/reattach reconstructs the current scene from server-owned grid
 state rather than replaying pane output.
 
+A width-two cell that does not completely fit the remaining physical row is
+temporarily rendered as one styled blank. Pane composition applies the same
+clipping at local pane edges, so logical preservation cannot wrap a client row
+or overwrite a neighboring pane. The complete grapheme becomes visible again
+after growth provides both columns.
+
 ## Limits and Verification
 
 The pinned `vte` parser bounds CSI parameters at 32 and intermediates at two.
@@ -93,7 +99,7 @@ The fresh post-review exit-gate results were:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo test --workspace`: 176 passed, 0 failed, 0 ignored.
+- `cargo test --workspace`: 179 passed, 0 failed, 0 ignored.
 - `cargo metadata --manifest-path fuzz/Cargo.toml --no-deps --format-version 1`:
   exactly `protocol_frame` and `terminal_bytes` were listed.
 - `cargo check --manifest-path fuzz/Cargo.toml --bins`: both fuzz harnesses
@@ -105,9 +111,10 @@ The fresh post-review exit-gate results were:
 The review regressions now cover pending-wrap ZWJ/modifier/flag extensions,
 exact and over-limit cell text, one-column reflow and non-reflow restoration,
 Unicode copy search/word movement, OSC titles beyond `vte`'s parameter limit,
-and UTF-8 continuation bytes in the C1 range. Protocol fuzzing also normalizes
-every non-empty input through payload decoding and includes valid variable and
-fixed-shape payload seeds.
+UTF-8 continuation bytes in the C1 range, and safe physical rendering of
+partially visible wide cells at terminal and pane edges. Protocol fuzzing also
+normalizes every non-empty input through payload decoding and includes valid
+variable and fixed-shape payload seeds.
 
 Two consecutive release conformance runs produced the same fingerprints:
 
@@ -129,17 +136,17 @@ The unchanged full release performance rejection gate passed:
 
 | Scenario | Total ms | p50 us | p95 us | MiB/s | Alloc MiB | Peak MiB | Queue |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `parser-codex` | 14.331 | 0.000 | 0.000 | 139.23 | 2.63 | 1.35 | 0 |
-| `parser-claude` | 13.556 | 0.000 | 0.000 | 148.35 | 2.64 | 1.35 | 0 |
-| `frame-codex` | 22.576 | 53.500 | 62.400 | 88.39 | 44.15 | 1.42 | 0 |
-| `frame-claude` | 23.382 | 53.600 | 87.300 | 86.01 | 44.16 | 1.42 | 0 |
-| `hybrid-frame-codex` | 23.156 | 53.700 | 77.700 | 86.17 | 43.73 | 1.40 | 0 |
-| `hybrid-frame-claude` | 23.977 | 53.600 | 88.600 | 83.87 | 43.74 | 1.40 | 0 |
-| `scene-frame-codex` | 62.121 | 148.900 | 177.100 | 32.12 | 170.49 | 1.76 | 0 |
-| `idle-input-render` | 0.982 | 1.600 | 5.200 | 0.39 | 1.38 | 0.04 | 0 |
-| `damage-proportional` | 0.018 | 2.000 | 2.000 | 0.05 | 0.01 | 0.00 | 0 |
-| `large-paste` | 0.678 | 0.000 | 0.700 | 94353.53 | 0.00 | 0.00 | 0 |
-| `history-resize-100k` | 14.719 | 21.800 | 24.400 | 116.62 | 8.92 | 0.02 | 0 |
-| `split-storm` | 10.567 | 23.800 | 38.900 | 0.00 | 25.06 | 0.12 | 0 |
-| `detach-backlog` | 61.218 | 0.000 | 0.000 | 130.68 | 101.58 | 1.53 | 8192 |
-| `multiple-clients` | 57.444 | 135.900 | 156.500 | 35.01 | 53.93 | 1.43 | 8 |
+| `parser-codex` | 14.032 | 0.000 | 0.000 | 142.20 | 2.63 | 1.35 | 0 |
+| `parser-claude` | 13.950 | 0.000 | 0.000 | 144.15 | 2.64 | 1.35 | 0 |
+| `frame-codex` | 22.862 | 53.200 | 73.000 | 87.28 | 44.15 | 1.42 | 0 |
+| `frame-claude` | 22.665 | 53.400 | 63.500 | 88.73 | 44.16 | 1.42 | 0 |
+| `hybrid-frame-codex` | 22.426 | 52.900 | 67.300 | 88.97 | 43.73 | 1.40 | 0 |
+| `hybrid-frame-claude` | 25.740 | 55.500 | 91.200 | 78.13 | 43.74 | 1.40 | 0 |
+| `scene-frame-codex` | 63.408 | 152.200 | 183.000 | 31.47 | 170.49 | 1.76 | 0 |
+| `idle-input-render` | 0.758 | 1.400 | 3.800 | 0.50 | 1.38 | 0.04 | 0 |
+| `damage-proportional` | 0.011 | 1.000 | 1.000 | 0.09 | 0.01 | 0.00 | 0 |
+| `large-paste` | 0.228 | 0.000 | 0.400 | 280948.20 | 0.00 | 0.00 | 0 |
+| `history-resize-100k` | 15.580 | 21.500 | 22.600 | 110.18 | 8.92 | 0.02 | 0 |
+| `split-storm` | 11.516 | 25.000 | 43.800 | 0.00 | 25.06 | 0.12 | 0 |
+| `detach-backlog` | 60.953 | 0.000 | 0.000 | 131.25 | 101.58 | 1.53 | 8192 |
+| `multiple-clients` | 56.946 | 135.700 | 161.800 | 35.31 | 53.93 | 1.43 | 8 |

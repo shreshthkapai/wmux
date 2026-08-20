@@ -512,7 +512,10 @@ fn compose_pane_row(previous: &Line, screen: &Screen, source_row: u16, rect: Rec
             .and_then(|line| line.cell(offset))
             .cloned()
             .unwrap_or_else(Cell::blank);
-        wanted.replace_cell(rect.x.saturating_add(offset), cell);
+        wanted.replace_cell(
+            rect.x.saturating_add(offset),
+            clip_cell_to_width(cell, offset, rect.cols),
+        );
     }
     wanted
 }
@@ -848,7 +851,9 @@ fn render_cells_exact(line: &Line, start: usize, end: usize, out: &mut Vec<u8>) 
             push_style(cell.style(), out);
             style = cell.style();
         }
-        if cell.style().hidden {
+        if usize::from(cell.width()) > usize::from(line.cols()).saturating_sub(index) {
+            out.push(b' ');
+        } else if cell.style().hidden {
             out.extend(std::iter::repeat_n(b' ', usize::from(cell.width().max(1))));
         } else {
             cell.text().write_utf8(out);
@@ -987,7 +992,7 @@ fn draw_screen(lines: &mut [Line], screen: &Screen, rect: Rect) {
                 lines,
                 rect.x.saturating_add(offset as u16),
                 rect.y.saturating_add(row as u16),
-                cell.clone(),
+                clip_cell_to_width(cell.clone(), offset as u16, rect.cols),
             );
         }
     }
@@ -1005,7 +1010,7 @@ fn draw_retained_frame(lines: &mut [Line], frame: &RetainedPaneFrame, rect: Rect
                 lines,
                 rect.x.saturating_add(offset),
                 rect.y.saturating_add(row as u16),
-                cell.clone(),
+                clip_cell_to_width(cell.clone(), offset, rect.cols),
             );
         }
     }
@@ -1019,7 +1024,7 @@ fn draw_viewport(lines: &mut [Line], viewport: &PaneViewport, rect: Rect) {
                 lines,
                 rect.x.saturating_add(offset),
                 rect.y.saturating_add(row as u16),
-                cell,
+                clip_cell_to_width(cell, offset, rect.cols),
             );
         }
     }
@@ -1037,7 +1042,12 @@ fn copy_previous_rect(lines: &mut [Line], rect: Rect, previous: &RenderState) {
             if cell.is_blank_default() {
                 continue;
             }
-            put_scene_cell(lines, x, y, cell.clone());
+            put_scene_cell(
+                lines,
+                x,
+                y,
+                clip_cell_to_width(cell.clone(), x.saturating_sub(rect.x), rect.cols),
+            );
         }
     }
 }
@@ -1087,15 +1097,25 @@ fn put_scene_cell(lines: &mut [Line], x: u16, y: u16, cell: Cell) {
     line.replace_cell(x, replacement);
 }
 
+fn clip_cell_to_width(cell: Cell, column: u16, cols: u16) -> Cell {
+    if !cell.is_continuation()
+        && usize::from(cell.width()) > usize::from(cols).saturating_sub(usize::from(column))
+    {
+        Cell::blank_with_style(cell.style())
+    } else {
+        cell
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_window_scene, build_window_scene_with_retained_panes,
-        build_window_scene_with_viewports, build_window_structure, render_damage_from_structure,
-        render_diff, render_full_scene_with_capabilities, PaneSceneOverrides, PaneViewport,
-        RenderCapabilities, RenderState, RetainedPaneFrame,
+        build_window_scene_with_viewports, build_window_structure, draw_screen,
+        render_damage_from_structure, render_diff, render_full_scene_with_capabilities,
+        PaneSceneOverrides, PaneViewport, RenderCapabilities, RenderState, RetainedPaneFrame,
     };
-    use crate::{Line, Screen, ServerState, SplitDirection, Style, TerminalEngine};
+    use crate::{Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
     use std::collections::BTreeMap;
 
     fn assert_host_matches_screen(host: &Screen, source: &Screen) {
@@ -1154,6 +1174,62 @@ mod tests {
         engine.feed(&mut screen, "a\u{301}".as_bytes());
         let diff = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
         assert!(diff.contains("a\u{301}"));
+    }
+
+    #[test]
+    fn renderer_masks_a_logical_wide_cell_that_cannot_fit() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(2, 2);
+        let mut diff_state = RenderState::new(2, 2);
+        let _ = render_diff(&screen, &mut diff_state);
+        engine.feed(&mut screen, "a\u{1f1ec}\u{1f1e7}".as_bytes());
+
+        let diff = String::from_utf8(render_diff(&screen, &mut diff_state)).unwrap();
+        let mut full_state = RenderState::new(2, 2);
+        let full = String::from_utf8(render_diff(&screen, &mut full_state)).unwrap();
+
+        assert!(!diff.contains("\u{1f1ec}\u{1f1e7}"));
+        assert!(!full.contains("\u{1f1ec}\u{1f1e7}"));
+        assert_eq!(full_state.lines[0].text(), "a\u{1f1ec}\u{1f1e7}");
+
+        screen.resize(3, 2);
+        let grown = String::from_utf8(render_diff(&screen, &mut full_state)).unwrap();
+        assert!(grown.contains("\u{1f1ec}\u{1f1e7}"));
+    }
+
+    #[test]
+    fn renderer_restores_a_wide_grapheme_after_one_column_resize() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(2, 2);
+        let mut state = RenderState::new(2, 2);
+        engine.feed(&mut screen, "\u{1f469}\u{200d}\u{1f4bb}".as_bytes());
+        let initial = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
+        assert!(initial.contains("\u{1f469}\u{200d}\u{1f4bb}"));
+
+        screen.resize(1, 2);
+        let narrow = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
+        assert!(!narrow.contains("\u{1f469}\u{200d}\u{1f4bb}"));
+        assert_eq!(state.lines[0].text(), "\u{1f469}\u{200d}\u{1f4bb}");
+
+        screen.resize(2, 2);
+        let grown = String::from_utf8(render_diff(&screen, &mut state)).unwrap();
+        assert!(grown.contains("\u{1f469}\u{200d}\u{1f4bb}"));
+    }
+
+    #[test]
+    fn pane_compositor_clips_a_wide_cell_at_its_local_right_edge() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(2, 1);
+        engine.feed(&mut screen, "a\u{1f1ec}\u{1f1e7}".as_bytes());
+        let mut lines = vec![Line::blank(4)];
+        lines[0].set(2, '|', 1, Style::default());
+
+        draw_screen(&mut lines, &screen, Rect::new(0, 0, 2, 1));
+
+        assert_eq!(lines[0].cell(1).unwrap().width(), 1);
+        assert_eq!(lines[0].cell(1).unwrap().ch(), ' ');
+        assert_eq!(lines[0].cell(2).unwrap().ch(), '|');
+        assert_eq!(lines[0].text(), "a |");
     }
 
     #[test]
