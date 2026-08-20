@@ -187,22 +187,68 @@ pub(crate) fn run_bounded_command(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<BootstrapOutput> {
+    run_bounded_command_with(command, timeout, |_| {}, BootstrapPipes::drain_once)
+}
+
+#[cfg(test)]
+pub(crate) fn run_bounded_command_with_injected_drain_error(
+    command: &mut Command,
+    timeout: Duration,
+    fail_after: Duration,
+    spawned_pid: &std::sync::atomic::AtomicU32,
+) -> io::Result<BootstrapOutput> {
+    let started = Instant::now();
+    run_bounded_command_with(
+        command,
+        timeout,
+        |pid| spawned_pid.store(pid, std::sync::atomic::Ordering::SeqCst),
+        move |pipes| {
+            pipes.drain_once()?;
+            if started.elapsed() >= fail_after {
+                Err(io::Error::other("injected daemon output drain failure"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn run_bounded_command_with(
+    command: &mut Command,
+    timeout: Duration,
+    on_spawn: impl FnOnce(u32),
+    mut drain: impl FnMut(&mut BootstrapPipes) -> io::Result<()>,
+) -> io::Result<BootstrapOutput> {
     let mut child = command.spawn()?;
-    let mut pipes = BootstrapPipes::from_child(&mut child)?;
+    on_spawn(child.id());
+    let mut pipes = match BootstrapPipes::from_child(&mut child) {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            terminate_child_until(&mut child, None, Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT);
+            return Err(error);
+        }
+    };
     let started = Instant::now();
 
     loop {
-        pipes.drain_once()?;
+        if let Err(error) = drain(&mut pipes) {
+            terminate_child_until(
+                &mut child,
+                Some(&mut pipes),
+                Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT,
+            );
+            return Err(error);
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let _ = pipes.drain_once();
                 return Ok(pipes.finish(status));
             }
             Ok(None) if started.elapsed() < timeout => thread::sleep(BOOTSTRAP_POLL_INTERVAL),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = wait_for_exit_until(
+                terminate_child_until(
                     &mut child,
-                    &mut pipes,
+                    Some(&mut pipes),
                     Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT,
                 );
                 return Err(io::Error::new(
@@ -215,10 +261,9 @@ pub(crate) fn run_bounded_command(
                 ));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = wait_for_exit_until(
+                terminate_child_until(
                     &mut child,
-                    &mut pipes,
+                    Some(&mut pipes),
                     Instant::now() + BOOTSTRAP_CLEANUP_TIMEOUT,
                 );
                 return Err(error);
@@ -227,18 +272,18 @@ pub(crate) fn run_bounded_command(
     }
 }
 
-fn wait_for_exit_until(
+fn terminate_child_until(
     child: &mut Child,
-    pipes: &mut BootstrapPipes,
+    mut pipes: Option<&mut BootstrapPipes>,
     deadline: Instant,
-) -> io::Result<Option<ExitStatus>> {
+) {
+    let _ = child.kill();
     loop {
-        pipes.drain_once()?;
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+        if let Some(pipes) = pipes.as_deref_mut() {
+            let _ = pipes.drain_once();
         }
-        if Instant::now() >= deadline {
-            return Ok(None);
+        if matches!(child.try_wait(), Ok(Some(_))) || Instant::now() >= deadline {
+            return;
         }
         thread::sleep(BOOTSTRAP_POLL_INTERVAL);
     }

@@ -7,13 +7,14 @@ pub mod pipe;
 mod daemon_tests {
     use crate::daemon::{
         bootstrap_script, encode_powershell_command, powershell_literal, quote_windows_argument,
-        run_bounded_command, spawn_user_daemon, DaemonSpec,
+        run_bounded_command, run_bounded_command_with_injected_drain_error, spawn_user_daemon,
+        DaemonSpec,
     };
     use std::{
         ffi::OsString,
         path::PathBuf,
         process::{Command, Stdio},
-        sync::mpsc,
+        sync::{atomic::AtomicU32, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -99,11 +100,8 @@ mod daemon_tests {
     fn daemon_bootstrap_does_not_wait_for_descendant_held_output_handles() {
         // Mutation caught: output collection waits for EOF after the bootstrap
         // exits, even though a descendant still owns the inherited write ends.
-        let pid_path = std::env::temp_dir().join(format!(
-            "wmux-daemon-descendant-{}-{}.pid",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
-        ));
+        let pid_path = unique_pid_path("descendant");
+        let mut pending_cleanup = PendingPidCleanup::new(pid_path.clone());
         let descendant = windows_powershell();
         let script = format!(
             "$psi = [Diagnostics.ProcessStartInfo]::new(); \
@@ -127,15 +125,47 @@ mod daemon_tests {
             let _ = result_tx.send(run_bounded_command(&mut command, Duration::from_secs(1)));
         });
 
-        let mut descendant = ProcessCleanup::new(wait_for_pid(&pid_path));
+        let mut descendant = pending_cleanup.wait_and_transfer();
         let result = result_rx.recv_timeout(Duration::from_millis(750));
         descendant.terminate_and_wait().unwrap();
         worker.join().unwrap();
-        let _ = std::fs::remove_file(&pid_path);
 
         assert!(
             result.is_ok(),
             "bootstrap waited for a descendant-held output handle: {result:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_output_failure_terminates_the_owned_bootstrap() {
+        // Mutation caught: an output inspection failure returns directly and
+        // leaves the already-spawned bootstrap running in the background.
+        let mut command = Command::new(windows_powershell());
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg("Start-Sleep -Seconds 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let spawned_pid = AtomicU32::new(0);
+
+        let error = run_bounded_command_with_injected_drain_error(
+            &mut command,
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            &spawned_pid,
+        )
+        .unwrap_err();
+        let mut bootstrap =
+            ProcessCleanup::new(spawned_pid.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert!(error
+            .to_string()
+            .contains("injected daemon output drain failure"));
+        assert!(
+            !bootstrap.is_active_if_present(),
+            "output failure left bootstrap PID {} running",
+            bootstrap.pid
         );
     }
 
@@ -173,18 +203,67 @@ mod daemon_tests {
             .join("powershell.exe")
     }
 
+    fn unique_pid_path(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "wmux-daemon-{label}-{}-{nonce}.pid",
+            std::process::id()
+        ))
+    }
+
     fn wait_for_pid(path: &std::path::Path) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_pid_until(path, Instant::now() + Duration::from_secs(2))
+            .expect("descendant PID was not written")
+    }
+
+    fn wait_for_pid_until(path: &std::path::Path, deadline: Instant) -> Option<u32> {
         loop {
             if let Ok(pid) = std::fs::read_to_string(path).and_then(|text| {
                 text.trim()
                     .parse()
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }) {
-                return pid;
+                return Some(pid);
             }
-            assert!(Instant::now() < deadline, "descendant PID was not written");
+            if Instant::now() >= deadline {
+                return None;
+            }
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct PendingPidCleanup {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl PendingPidCleanup {
+        fn new(path: PathBuf) -> Self {
+            Self { path, armed: true }
+        }
+
+        fn wait_and_transfer(&mut self) -> ProcessCleanup {
+            let cleanup = ProcessCleanup::new(wait_for_pid(&self.path));
+            self.armed = false;
+            cleanup
+        }
+    }
+
+    impl Drop for PendingPidCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                if let Some(pid) =
+                    wait_for_pid_until(&self.path, Instant::now() + Duration::from_secs(2))
+                {
+                    drop(ProcessCleanup::new(pid));
+                }
+            }
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 
@@ -235,6 +314,19 @@ mod daemon_tests {
                 std::io::Error::last_os_error()
             );
             exit_code == STILL_ACTIVE as u32
+        }
+
+        fn is_active_if_present(&mut self) -> bool {
+            use windows_sys::Win32::{
+                Foundation::STILL_ACTIVE, System::Threading::GetExitCodeProcess,
+            };
+
+            let Ok(handle) = self.open_handle() else {
+                return false;
+            };
+            let mut exit_code = 0_u32;
+            (unsafe { GetExitCodeProcess(handle, &mut exit_code) }) != 0
+                && exit_code == STILL_ACTIVE as u32
         }
 
         fn terminate_and_wait(&mut self) -> std::io::Result<()> {
