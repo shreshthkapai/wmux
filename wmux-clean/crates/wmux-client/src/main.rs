@@ -24,6 +24,7 @@ use wmux_protocol::{
 use wmux_windows::{
     console,
     console::ConsoleInput,
+    daemon::{spawn_user_daemon, DaemonSpec},
     pipe::{connect, connect_async, is_running, Endpoint, NamedPipeClient},
 };
 
@@ -93,17 +94,16 @@ fn ensure_server() -> io::Result<()> {
         return Ok(());
     }
     spawn_server()?;
-    thread::sleep(Duration::from_millis(200));
     Ok(())
 }
 
 fn spawn_server() -> io::Result<()> {
-    let path = std::env::current_exe()?.with_file_name("wmux-server.exe");
-    process::Command::new(path)
-        .stdin(process::Stdio::null())
-        .stdout(process::Stdio::from(log_file("wmux-clean-server.out.log")?))
-        .stderr(process::Stdio::from(log_file("wmux-clean-server.err.log")?))
-        .spawn()?;
+    let executable = std::env::current_exe()?.with_file_name("wmux-server.exe");
+    let _ = spawn_user_daemon(&DaemonSpec {
+        executable,
+        arguments: Vec::new(),
+        current_dir: std::env::current_dir()?,
+    })?;
     Ok(())
 }
 
@@ -673,13 +673,6 @@ fn connect_retry(endpoint: &Endpoint) -> io::Result<File> {
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("connect failed")))
-}
-
-fn log_file(name: &str) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::env::temp_dir().join(name))
 }
 
 #[cfg(test)]
