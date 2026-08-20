@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 crossterm.workspace = true
 tokio.workspace = true
+windows-sys.workspace = true
 wmux-platform = { path = "../wmux-platform" }
 
 [lints]

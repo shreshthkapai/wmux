@@ -37,7 +37,7 @@ use wmux_protocol::{
 };
 use wmux_windows::{
     conpty::{spawn_shell, ConptyPane, PlatformEventReceiver, PlatformNotifier},
-    pipe::{create_server, Endpoint, NamedPipeServer, ServerLock},
+    pipe::{verify_client, Endpoint, NamedPipeServer, ServerLock, ServerPipeFactory, UserSid},
 };
 
 const TRACE_PREVIEW_BYTES: usize = 96;
@@ -67,7 +67,7 @@ pub fn run() -> io::Result<()> {
 }
 
 async fn run_async() -> io::Result<()> {
-    let endpoint = Endpoint::current_user();
+    let endpoint = Endpoint::current_user()?;
     let _lock = ServerLock::acquire(&endpoint)?;
     let config = load_config();
     eprintln!("wmux config {}", config_path().display());
@@ -80,19 +80,22 @@ async fn run_async() -> io::Result<()> {
         .spawn(move || ServerOwner::new(config, io, state_owner_tx).run(owner_rx))?;
 
     eprintln!("wmux clean server listening on {}", endpoint.pipe_name());
-    let mut listener = create_server(&endpoint)?;
+    let owner_sid = endpoint.owner_sid().clone();
+    let mut pipe_factory = ServerPipeFactory::new(endpoint)?;
+    let mut listener = pipe_factory.create()?;
     loop {
         if let Err(error) = listener.connect().await {
             eprintln!("accept error: {error}");
             tokio::time::sleep(Duration::from_millis(100)).await;
-            listener = create_server(&endpoint)?;
+            listener = pipe_factory.create()?;
             continue;
         }
         let connected = listener;
-        listener = create_server(&endpoint)?;
+        listener = pipe_factory.create()?;
         let owner_tx = owner_tx.clone();
+        let owner_sid = owner_sid.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(connected, owner_tx).await {
+            if let Err(error) = handle_connection(connected, owner_tx, owner_sid).await {
                 eprintln!("client error: {error}");
             }
         });
@@ -139,8 +142,9 @@ enum Outbound {
 async fn handle_connection(
     mut pipe: NamedPipeServer,
     owner_tx: mpsc::Sender<OwnerMessage>,
+    owner_sid: UserSid,
 ) -> io::Result<()> {
-    let capabilities = handshake(&mut pipe).await?;
+    let capabilities = handshake(&mut pipe, &owner_sid).await?;
 
     let (outbound_tx, outbound_rx) = async_mpsc::channel(CLIENT_OUTPUT_MESSAGES);
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -294,13 +298,17 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
     Some(OwnerMessage::Event(event))
 }
 
-async fn handshake(pipe: &mut NamedPipeServer) -> io::Result<TerminalCapabilities> {
+async fn handshake(
+    pipe: &mut NamedPipeServer,
+    owner_sid: &UserSid,
+) -> io::Result<TerminalCapabilities> {
     match read_async_message(&mut *pipe).await? {
         Some(Message::Hello {
             version,
             capabilities,
             ..
         }) if version == VERSION => {
+            verify_client(pipe, owner_sid)?;
             write_async_message(
                 pipe,
                 Message::HelloOk {

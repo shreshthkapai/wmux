@@ -88,7 +88,7 @@ fn show_effective_config() -> io::Result<()> {
 }
 
 fn ensure_server() -> io::Result<()> {
-    let endpoint = Endpoint::current_user();
+    let endpoint = Endpoint::current_user()?;
     if is_running(&endpoint) {
         return Ok(());
     }
@@ -577,7 +577,7 @@ fn text(bytes: &[u8]) -> String {
 }
 
 fn connect_handshake() -> io::Result<File> {
-    let endpoint = Endpoint::current_user();
+    let endpoint = Endpoint::current_user()?;
     let mut pipe = connect_retry(&endpoint)?;
     write_message(
         &mut pipe,
@@ -604,7 +604,7 @@ fn connect_handshake() -> io::Result<File> {
 async fn connect_async_handshake(
     capabilities: TerminalCapabilities,
 ) -> io::Result<NamedPipeClient> {
-    let endpoint = Endpoint::current_user();
+    let endpoint = Endpoint::current_user()?;
     let mut pipe = connect_async_retry(&endpoint).await?;
     write_async_message(
         &mut pipe,

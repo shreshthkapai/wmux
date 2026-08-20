@@ -25,6 +25,7 @@ tokio = { version = "1.40", default-features = false, features = ["io-util", "ma
 unicode-segmentation = "=1.13.3"
 unicode-width = { version = "=0.2.2", default-features = false }
 vte = { version = "0.14.1", default-features = true }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
