@@ -1,10 +1,12 @@
 use std::io::{self, IoSlice, Read, Write};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
-pub const VERSION: u32 = 5;
-pub const MAGIC: [u8; 4] = *b"WMX5";
+pub const VERSION: u32 = 6;
+pub const MAGIC: [u8; 4] = *b"WMX6";
 pub const FRAME_HEADER_LEN: usize = 9;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+const KEY_PREFIX_LEN: usize = 6;
+const ENCODED_HEADER_LEN: usize = FRAME_HEADER_LEN + KEY_PREFIX_LEN;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalCapabilities(u32);
@@ -26,6 +28,76 @@ impl TerminalCapabilities {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WireKeyCode {
+    Char(char),
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Backspace,
+    Delete,
+    Insert,
+    Enter,
+    Tab,
+    BackTab,
+    Escape,
+    Function(u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WireKeyModifiers(u8);
+
+impl WireKeyModifiers {
+    pub const NONE: Self = Self(0);
+    pub const SHIFT: Self = Self(1 << 0);
+    pub const ALT: Self = Self(1 << 1);
+    pub const CONTROL: Self = Self(1 << 2);
+    pub const SUPER: Self = Self(1 << 3);
+    pub const ALL: u8 = Self::SHIFT.0 | Self::ALT.0 | Self::CONTROL.0 | Self::SUPER.0;
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn contains(self, modifiers: Self) -> bool {
+        self.0 & modifiers.0 == modifiers.0
+    }
+}
+
+impl std::ops::BitOr for WireKeyModifiers {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for WireKeyModifiers {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WireKeyEvent {
+    pub code: WireKeyCode,
+    pub modifiers: WireKeyModifiers,
+    pub raw: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
     Hello {
@@ -42,7 +114,7 @@ pub enum Message {
     CommandOk(String),
     CommandErr(String),
     Input(Vec<u8>),
-    Key(Vec<u8>),
+    Key(WireKeyEvent),
     Paste(Vec<u8>),
     Mouse(MouseEvent),
     Output(Vec<u8>),
@@ -84,7 +156,8 @@ impl Message {
 /// The transport writes `header()` and `payload()` with a vectored write.
 #[derive(Debug)]
 pub struct EncodedFrame {
-    header: [u8; FRAME_HEADER_LEN],
+    header: [u8; ENCODED_HEADER_LEN],
+    header_len: usize,
     payload: EncodedPayload,
 }
 
@@ -96,17 +169,35 @@ enum EncodedPayload {
 
 impl EncodedFrame {
     pub fn from_message(message: Message) -> Self {
-        let tag = message.tag();
-        let payload = EncodedPayload::from_message(message);
-        let mut header = [0; FRAME_HEADER_LEN];
-        header[..MAGIC.len()].copy_from_slice(&MAGIC);
-        header[4] = tag;
-        header[5..].copy_from_slice(&(payload.as_slice().len() as u32).to_le_bytes());
-        Self { header, payload }
+        match message {
+            Message::Key(event) => {
+                let mut header = [0; ENCODED_HEADER_LEN];
+                header[..FRAME_HEADER_LEN]
+                    .copy_from_slice(&frame_header(11, KEY_PREFIX_LEN + event.raw.len()));
+                encode_key_prefix(&event, &mut header[FRAME_HEADER_LEN..]);
+                Self {
+                    header,
+                    header_len: ENCODED_HEADER_LEN,
+                    payload: EncodedPayload::Owned(event.raw),
+                }
+            }
+            message => {
+                let tag = message.tag();
+                let payload = EncodedPayload::from_message(message);
+                let mut header = [0; ENCODED_HEADER_LEN];
+                header[..FRAME_HEADER_LEN]
+                    .copy_from_slice(&frame_header(tag, payload.as_slice().len()));
+                Self {
+                    header,
+                    header_len: FRAME_HEADER_LEN,
+                    payload,
+                }
+            }
+        }
     }
 
-    pub fn header(&self) -> &[u8; FRAME_HEADER_LEN] {
-        &self.header
+    pub fn header(&self) -> &[u8] {
+        &self.header[..self.header_len]
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -114,7 +205,7 @@ impl EncodedFrame {
     }
 
     pub fn wire_len(&self) -> usize {
-        FRAME_HEADER_LEN + self.payload.as_slice().len()
+        self.header_len + self.payload.as_slice().len()
     }
 }
 
@@ -141,10 +232,10 @@ impl EncodedPayload {
                 Self::Owned(text.into_bytes())
             }
             Message::Input(bytes)
-            | Message::Key(bytes)
             | Message::Paste(bytes)
             | Message::Output(bytes)
             | Message::Clipboard(bytes) => Self::Owned(bytes),
+            Message::Key(_) => unreachable!("key events use a split owned payload"),
             Message::Resize { cols, rows } => {
                 let mut bytes = [0; 12];
                 bytes[..2].copy_from_slice(&cols.to_le_bytes());
@@ -172,6 +263,13 @@ impl EncodedPayload {
 }
 
 pub fn write_message(mut writer: impl Write, message: &Message) -> io::Result<()> {
+    if let Message::Key(event) = message {
+        let mut header = [0; ENCODED_HEADER_LEN];
+        header[..FRAME_HEADER_LEN]
+            .copy_from_slice(&frame_header(11, KEY_PREFIX_LEN + event.raw.len()));
+        encode_key_prefix(event, &mut header[FRAME_HEADER_LEN..]);
+        return write_vectored_all(&mut writer, &header, &event.raw);
+    }
     let mut fixed = [0_u8; 12];
     let payload = borrowed_payload(message, &mut fixed);
     let header = frame_header(message.tag(), payload.len());
@@ -225,10 +323,10 @@ fn borrowed_payload<'a>(message: &'a Message, fixed: &'a mut [u8; 12]) -> &'a [u
             text.as_bytes()
         }
         Message::Input(bytes)
-        | Message::Key(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
         | Message::Clipboard(bytes) => bytes,
+        Message::Key(_) => unreachable!("key events use a split borrowed payload"),
         Message::Resize { cols, rows } => {
             fixed[..2].copy_from_slice(&cols.to_le_bytes());
             fixed[2..4].copy_from_slice(&rows.to_le_bytes());
@@ -331,10 +429,10 @@ fn payload_len(message: &Message) -> usize {
         Message::Hello { .. } | Message::HelloOk { .. } => 12,
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => text.len(),
         Message::Input(bytes)
-        | Message::Key(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
         | Message::Clipboard(bytes) => bytes.len(),
+        Message::Key(event) => KEY_PREFIX_LEN + event.raw.len(),
         Message::Resize { .. } => 4,
         Message::Mouse(_) => 7,
         Message::Detach | Message::Shutdown => 0,
@@ -361,11 +459,16 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
             out.extend_from_slice(text.as_bytes());
         }
         Message::Input(bytes)
-        | Message::Key(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
         | Message::Clipboard(bytes) => {
             out.extend_from_slice(bytes);
+        }
+        Message::Key(event) => {
+            let start = out.len();
+            out.resize(start + KEY_PREFIX_LEN, 0);
+            encode_key_prefix(event, &mut out[start..]);
+            out.extend_from_slice(&event.raw);
         }
         Message::Resize { cols, rows } => {
             out.extend_from_slice(&cols.to_le_bytes());
@@ -420,12 +523,84 @@ fn decode_payload_owned(tag: u8, payload: Vec<u8>) -> io::Result<Message> {
             require_empty(&payload)?;
             Ok(Message::Shutdown)
         }
-        11 => Ok(Message::Key(payload)),
+        11 => decode_key_payload(payload).map(Message::Key),
         12 => Ok(Message::Paste(payload)),
         13 => decode_mouse(&payload).map(Message::Mouse),
         14 => Ok(Message::Clipboard(payload)),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
     }
+}
+
+fn encode_key_prefix(event: &WireKeyEvent, out: &mut [u8]) {
+    let (tag, value) = match event.code {
+        WireKeyCode::Char(character) => (0, character as u32),
+        WireKeyCode::Left => (1, 0),
+        WireKeyCode::Right => (2, 0),
+        WireKeyCode::Up => (3, 0),
+        WireKeyCode::Down => (4, 0),
+        WireKeyCode::Home => (5, 0),
+        WireKeyCode::End => (6, 0),
+        WireKeyCode::PageUp => (7, 0),
+        WireKeyCode::PageDown => (8, 0),
+        WireKeyCode::Backspace => (9, 0),
+        WireKeyCode::Delete => (10, 0),
+        WireKeyCode::Insert => (11, 0),
+        WireKeyCode::Enter => (12, 0),
+        WireKeyCode::Tab => (13, 0),
+        WireKeyCode::BackTab => (14, 0),
+        WireKeyCode::Escape => (15, 0),
+        WireKeyCode::Function(number) => (16, u32::from(number)),
+    };
+    out[0] = tag;
+    out[1] = event.modifiers.bits();
+    out[2..KEY_PREFIX_LEN].copy_from_slice(&value.to_le_bytes());
+}
+
+fn decode_key_payload(mut payload: Vec<u8>) -> io::Result<WireKeyEvent> {
+    if payload.len() < KEY_PREFIX_LEN {
+        return Err(bad_key("bad key event"));
+    }
+    let modifiers =
+        WireKeyModifiers::from_bits(payload[1]).ok_or_else(|| bad_key("bad key modifiers"))?;
+    let value = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+    let fixed = |code| {
+        if value == 0 {
+            Ok(code)
+        } else {
+            Err(bad_key("bad fixed key value"))
+        }
+    };
+    let code = match payload[0] {
+        0 => WireKeyCode::Char(char::from_u32(value).ok_or_else(|| bad_key("bad key character"))?),
+        1 => fixed(WireKeyCode::Left)?,
+        2 => fixed(WireKeyCode::Right)?,
+        3 => fixed(WireKeyCode::Up)?,
+        4 => fixed(WireKeyCode::Down)?,
+        5 => fixed(WireKeyCode::Home)?,
+        6 => fixed(WireKeyCode::End)?,
+        7 => fixed(WireKeyCode::PageUp)?,
+        8 => fixed(WireKeyCode::PageDown)?,
+        9 => fixed(WireKeyCode::Backspace)?,
+        10 => fixed(WireKeyCode::Delete)?,
+        11 => fixed(WireKeyCode::Insert)?,
+        12 => fixed(WireKeyCode::Enter)?,
+        13 => fixed(WireKeyCode::Tab)?,
+        14 => fixed(WireKeyCode::BackTab)?,
+        15 => fixed(WireKeyCode::Escape)?,
+        16 if (1..=24).contains(&value) => WireKeyCode::Function(value as u8),
+        16 => return Err(bad_key("bad function key")),
+        _ => return Err(bad_key("bad key tag")),
+    };
+    payload.drain(..KEY_PREFIX_LEN);
+    Ok(WireKeyEvent {
+        code,
+        modifiers,
+        raw: payload,
+    })
+}
+
+fn bad_key(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn encode_mouse(event: MouseEvent, out: &mut [u8; 12]) {
@@ -525,15 +700,15 @@ fn string_payload(payload: Vec<u8>) -> io::Result<String> {
 mod tests {
     use super::{
         decode_frame_header, decode_frame_payload, decode_frame_payload_owned, encode_frame,
-        read_message, write_message, EncodedFrame, Message, TerminalCapabilities, FRAME_HEADER_LEN,
-        MAGIC, MAX_FRAME, VERSION,
+        read_message, write_message, EncodedFrame, Message, TerminalCapabilities, WireKeyCode,
+        WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAGIC, MAX_FRAME, VERSION,
     };
     use std::io;
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
     #[test]
     fn roundtrips_all_basics() {
-        assert_eq!(MAGIC, *b"WMX5");
+        assert_eq!(MAGIC, *b"WMX6");
         let messages = [
             Message::Hello {
                 version: VERSION,
@@ -542,7 +717,11 @@ mod tests {
             },
             Message::Command("new -s x".to_string()),
             Message::Input(b"abc".to_vec()),
-            Message::Key(b"abc".to_vec()),
+            Message::Key(WireKeyEvent {
+                code: WireKeyCode::Char('a'),
+                modifiers: WireKeyModifiers::CONTROL,
+                raw: b"abc".to_vec(),
+            }),
             Message::Paste(b"abc def".to_vec()),
             Message::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollUp,
@@ -589,12 +768,34 @@ mod tests {
         let pointer = payload.as_ptr();
         let frame = EncodedFrame::from_message(Message::Output(payload));
         assert_eq!(frame.payload().as_ptr(), pointer);
+
+        let mut raw = Vec::with_capacity(4_096);
+        raw.extend_from_slice(b"key");
+        let pointer = raw.as_ptr();
+        let frame = EncodedFrame::from_message(Message::Key(WireKeyEvent {
+            code: WireKeyCode::Char('k'),
+            modifiers: WireKeyModifiers::ALT,
+            raw,
+        }));
+        assert_eq!(frame.payload(), b"key");
+        assert_eq!(frame.payload().as_ptr(), pointer);
+        assert_eq!(frame.header().len(), FRAME_HEADER_LEN + 6);
+
+        let mut payload = key_payload(0, WireKeyModifiers::NONE.bits(), u32::from('k'));
+        payload.extend_from_slice(b"decoded-key");
+        let pointer = payload.as_ptr();
+        let decoded = decode_frame_payload_owned(11, payload).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::Key(event)
+                if event.raw == b"decoded-key" && event.raw.as_ptr() == pointer
+        ));
     }
 
     #[test]
     fn async_transport_header_rejects_oversized_frames() {
         let mut header = [0_u8; FRAME_HEADER_LEN];
-        header[..4].copy_from_slice(b"WMX5");
+        header[..4].copy_from_slice(&MAGIC);
         header[4] = 7;
         header[5..].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
@@ -613,6 +814,8 @@ mod tests {
 
     #[test]
     fn protocol_documentation_matches_wire_constants() {
+        assert_eq!(VERSION, 6);
+        assert_eq!(MAGIC, *b"WMX6");
         let documentation = include_str!("../../../docs/ipc-protocol.md");
         assert!(documentation
             .lines()
@@ -623,5 +826,40 @@ mod tests {
         assert!(documentation
             .lines()
             .any(|line| line == format!("Maximum frame payload: {MAX_FRAME} bytes")));
+    }
+
+    #[test]
+    fn semantic_key_roundtrip_preserves_identity_and_raw_bytes() {
+        let message = Message::Key(WireKeyEvent {
+            code: WireKeyCode::Char('\u{3bb}'),
+            modifiers: WireKeyModifiers::ALT | WireKeyModifiers::CONTROL,
+            raw: "\u{3bb}".as_bytes().to_vec(),
+        });
+        let frame = encode_frame(&message);
+        assert_eq!(frame, b"WMX6\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
+        assert_eq!(read_message(frame.as_slice()).unwrap(), Some(message));
+    }
+
+    #[test]
+    fn invalid_semantic_keys_are_rejected() {
+        for payload in [
+            key_payload(0, 0, 0x11_0000),
+            key_payload(1, 0x80, 0),
+            key_payload(0xff, 0, 0),
+            key_payload(1, 0, 1),
+            key_payload(16, 0, 0),
+            key_payload(16, 0, 25),
+        ] {
+            assert_eq!(
+                decode_frame_payload_owned(11, payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    fn key_payload(tag: u8, modifiers: u8, value: u32) -> Vec<u8> {
+        let mut payload = vec![tag, modifiers];
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload
     }
 }

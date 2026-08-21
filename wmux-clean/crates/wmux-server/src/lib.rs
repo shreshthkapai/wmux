@@ -357,9 +357,13 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
                 });
             }
         },
-        Message::Input(bytes) | Message::Key(bytes) => ServerEvent::ClientInput {
+        Message::Input(bytes) => ServerEvent::ClientInput {
             client,
             input: ClientInput::Bytes(bytes),
+        },
+        Message::Key(event) => ServerEvent::ClientInput {
+            client,
+            input: ClientInput::Bytes(event.raw),
         },
         Message::Paste(bytes) => ServerEvent::ClientInput {
             client,
@@ -2658,7 +2662,11 @@ mod tests {
 
     #[tokio::test]
     async fn async_ipc_writer_emits_the_existing_protocol_format() {
-        let message = wmux_protocol::Message::Key(b"abc".to_vec());
+        let message = wmux_protocol::Message::Key(wmux_protocol::WireKeyEvent {
+            code: wmux_protocol::WireKeyCode::Char('a'),
+            modifiers: wmux_protocol::WireKeyModifiers::NONE,
+            raw: b"abc".to_vec(),
+        });
         let (mut writer, mut reader) = tokio::io::duplex(64);
         write_async_message(&mut writer, message.clone())
             .await

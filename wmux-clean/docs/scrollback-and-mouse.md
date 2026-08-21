@@ -25,7 +25,7 @@ path.
 ## Structured Input
 
 Platform backends produce `wmux_platform::MouseEvent` values with zero-based
-cell coordinates, event kind, button, and modifiers. Protocol version 5 carries
+cell coordinates, event kind, button, and modifiers. Protocol version 6 carries
 that event as a fixed-size frame. No platform console records or pre-encoded
 mouse escape strings cross the boundary.
 

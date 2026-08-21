@@ -1,7 +1,7 @@
 # IPC Protocol
 
-Protocol version: 5
-Wire magic: WMX5
+Protocol version: 6
+Wire magic: WMX6
 Maximum frame payload: 16777216 bytes
 
 wmux IPC is a versioned, framed byte protocol between disposable clients and
@@ -15,13 +15,13 @@ Every frame has a 9-byte header followed by the declared payload:
 
 | Offset | Size | Field | Encoding |
 | --- | ---: | --- | --- |
-| 0 | 4 | magic | ASCII `WMX5` |
+| 0 | 4 | magic | ASCII `WMX6` |
 | 4 | 1 | message tag | unsigned byte |
 | 5 | 4 | payload length | little-endian `u32` |
 
 The payload length excludes the header and may not exceed 16 MiB. Integer
 payload fields are little-endian. Text payloads are UTF-8. Byte-oriented input,
-output, paste, key, and clipboard payloads are opaque and may contain any byte.
+output, paste, key raw bytes, and clipboard payloads may contain any byte.
 
 ## Message tags
 
@@ -37,7 +37,7 @@ output, paste, key, and clipboard payloads are opaque and may contain any byte.
 | 8 | `Resize` | columns `u16`, rows `u16` |
 | 9 | `Detach` | empty |
 | 10 | `Shutdown` | empty |
-| 11 | `Key` | opaque decoded-key bytes |
+| 11 | `Key` | semantic key prefix followed by opaque original bytes |
 | 12 | `Paste` | opaque paste bytes |
 | 13 | `Mouse` | kind `u8`, button `u8`, modifiers `u8`, column `u16`, row `u16` |
 | 14 | `Clipboard` | opaque clipboard bytes |
@@ -48,9 +48,31 @@ preserved but do not grant behavior the receiver does not implement. Mouse
 payloads are exactly 7 bytes. `Resize` is exactly 4 bytes. `Detach` and
 `Shutdown` reject non-empty payloads.
 
+### Semantic key payload
+
+`Key` begins with a fixed 6-byte prefix and retains the exact application bytes
+produced by the client after it:
+
+| Offset | Size | Field | Encoding |
+| --- | ---: | --- | --- |
+| 0 | 1 | key tag | unsigned byte |
+| 1 | 1 | modifiers | bitset |
+| 2 | 4 | key value | little-endian `u32` |
+| 6 | remaining | raw | opaque original key bytes |
+
+Key tag 0 is a Unicode scalar and stores the scalar in `key value`. Tags 1
+through 15 are Left, Right, Up, Down, Home, End, PageUp, PageDown, Backspace,
+Delete, Insert, Enter, Tab, BackTab, and Escape; their key value must be zero.
+Tag 16 is a function key and its key value must be from 1 through 24.
+
+Modifier bits 0 through 3 mean Shift, Alt, Control, and Super. Other modifier
+bits, unknown key tags, invalid Unicode scalars, nonzero fixed-key values, and
+out-of-range function keys are rejected. The raw suffix is not interpreted by
+the protocol and may be empty.
+
 ## Handshake and identity
 
-The first client frame must be `Hello` with version 5. A compatible server
+The first client frame must be `Hello` with version 6. A compatible server
 answers `HelloOk` before accepting commands. A numeric mismatch returns a
 protocol-version error naming both versions. Invalid magic means an
 incompatible service owns the endpoint; the client reports that condition and
@@ -65,10 +87,10 @@ variable, or protocol field is an authorization input.
 ## Malformed input and disconnects
 
 The decoder rejects bad magic, payloads larger than the maximum, unknown tags,
-invalid UTF-8 text, invalid mouse values, and payloads whose fixed length is
-wrong. An incomplete payload is an I/O error. EOF while reading the next frame
-header is treated as a client disconnect. These failures close only that
-connection; malformed IPC must not panic or mutate server state outside the
+invalid UTF-8 text, invalid mouse values, malformed semantic keys, and payloads
+whose fixed length is wrong. An incomplete payload is an I/O error. EOF while
+reading the next frame header is treated as a client disconnect. These failures
+close only that connection; malformed IPC must not panic or mutate server state outside the
 serialized owner loop.
 
 The server may emit multiple ordinary frames before a command result. During

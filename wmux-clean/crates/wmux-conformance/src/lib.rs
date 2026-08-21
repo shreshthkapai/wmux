@@ -5,11 +5,13 @@ use wmux_core::{
     Style, TerminalEngine,
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
-use wmux_protocol::{encode_frame, read_message, Message};
+use wmux_protocol::{
+    encode_frame, read_message, Message, WireKeyCode, WireKeyEvent, WireKeyModifiers,
+};
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x77b6_3207_8fd0_ab8b;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xe393_9713_9974_294a;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -184,7 +186,7 @@ fn malformed_input_case() -> Result<CaseResult, String> {
 
     let malformed_frames = [
         b"NOPE\x01\x00\x00\x00x".to_vec(),
-        b"WMX5\xff\xff\xff\xff\xff".to_vec(),
+        b"WMX6\xff\xff\xff\xff\xff".to_vec(),
     ];
     for frame in malformed_frames {
         if read_message(Cursor::new(frame)).is_ok() {
@@ -234,7 +236,11 @@ fn key_and_paste_case() -> CaseResult {
     assert_eq!(bracketed, b"\x1b[200~alpha\r\nbeta\x1b[201~");
 
     let messages = [
-        Message::Key(key),
+        Message::Key(WireKeyEvent {
+            code: WireKeyCode::Left,
+            modifiers: WireKeyModifiers::CONTROL,
+            raw: key,
+        }),
         Message::Paste(plain),
         Message::Paste(bracketed),
     ];

@@ -386,7 +386,9 @@ async fn handle_key(
     }
 
     if !pending.is_empty() {
-        send_async_message(writer, Message::Key(pending)).await?;
+        // Until the Windows adapter supplies one semantic event per key, keep
+        // legacy client-side batches on the explicitly byte-oriented tag.
+        send_async_message(writer, Message::Input(pending)).await?;
     }
     Ok(false)
 }
@@ -768,8 +770,10 @@ mod tests {
             no_server_message(r"\\.\pipe\wmux-S-1-5-21-x"),
             r"no wmux server running for this user (\\.\pipe\wmux-S-1-5-21-x)"
         );
-        assert!(protocol_error(wmux_protocol::VERSION - 1).contains("client protocol 5"));
-        assert!(protocol_error(wmux_protocol::VERSION - 1).contains("server protocol 4"));
+        assert!(protocol_error(wmux_protocol::VERSION - 1)
+            .contains(&format!("client protocol {}", wmux_protocol::VERSION)));
+        assert!(protocol_error(wmux_protocol::VERSION - 1)
+            .contains(&format!("server protocol {}", wmux_protocol::VERSION - 1)));
         assert_eq!(retry_delays().len(), 20);
 
         let incompatible = handshake_read_error(
