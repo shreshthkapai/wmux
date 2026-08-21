@@ -17,6 +17,9 @@ use wmux_core::{
     CommandQueue, CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers,
     RenderCapabilities, RenderState, Screen, ServerState, SplitDirection, TerminalEngine,
 };
+use wmux_platform::{
+    PlatformEvent, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend, TerminalSize,
+};
 use wmux_protocol::{write_message, Message};
 
 #[global_allocator]
@@ -152,6 +155,7 @@ const SCENARIOS: &[&str] = &[
     "key-prefix-binding",
     "command-queue",
     "command-text",
+    "platform-dispatch",
 ];
 
 fn main() {
@@ -275,6 +279,12 @@ fn main() {
         &options,
         "command-text",
         || command_text_workload(options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "platform-dispatch",
+        || platform_dispatch_workload(options.suite),
         &mut reports,
     );
 
@@ -1049,6 +1059,66 @@ fn command_text_workload(suite: Suite) -> Report {
     })
 }
 
+#[derive(Default)]
+struct DispatchBackend {
+    submissions: u64,
+    checksum: u64,
+}
+
+impl PtyBackend for DispatchBackend {
+    #[inline]
+    fn submit(&mut self, request: PlatformRequest) -> PlatformResult<()> {
+        match request {
+            PlatformRequest::ResizePane { pane, size } => {
+                self.submissions += 1;
+                self.checksum = self
+                    .checksum
+                    .rotate_left(7)
+                    .wrapping_add(pane.raw())
+                    .wrapping_add((u64::from(size.cols) << 16) | u64::from(size.rows));
+            }
+            _ => self.checksum ^= u64::MAX,
+        }
+        Ok(())
+    }
+
+    fn try_next_event(&mut self, _pane: PlatformPaneId) -> PlatformResult<Option<PlatformEvent>> {
+        Ok(None)
+    }
+}
+
+fn platform_dispatch_iterations(suite: Suite) -> u64 {
+    match suite {
+        Suite::Smoke => 100_000,
+        Suite::Full => 10_000_000,
+    }
+}
+
+fn platform_dispatch_workload(suite: Suite) -> Report {
+    let operations = platform_dispatch_iterations(suite);
+    measure("platform-dispatch", suite, 0, operations, move || {
+        let mut backend = DispatchBackend::default();
+        let dispatch: &mut dyn PtyBackend = black_box(&mut backend);
+        for sequence in 0..operations {
+            let size = TerminalSize::new(
+                40 + (sequence % 200) as u16,
+                12 + ((sequence / 200) % 80) as u16,
+            );
+            dispatch
+                .submit(PlatformRequest::ResizePane {
+                    pane: PlatformPaneId::new(1 + (sequence % 16)),
+                    size,
+                })
+                .expect("dispatch backend accepts resize requests");
+        }
+        RawResult {
+            violations: usize::from(backend.submissions != operations),
+            checksum: backend.checksum ^ backend.submissions,
+            ..RawResult::default()
+        }
+    })
+}
+
 fn tui_frames(flavor: TuiFlavor, count: usize, cols: u16, rows: u16) -> Vec<Vec<u8>> {
     (0..count)
         .map(|frame| tui_frame(flavor, frame, cols, rows))
@@ -1204,6 +1274,7 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
         "key-prefix-binding",
         "command-queue",
         "command-text",
+        "platform-dispatch",
     ];
     for name in required {
         if find(name).is_none() {
@@ -1253,6 +1324,32 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
                 report.allocations.allocations
             ));
         }
+    }
+
+    let dispatch = find("platform-dispatch").expect("required report");
+    let dispatch_throughput = dispatch.operations as f64 / dispatch.elapsed.as_secs_f64();
+    if dispatch.operations != 10_000_000 {
+        failures.push(format!(
+            "platform-dispatch ran {} operations instead of 10000000",
+            dispatch.operations
+        ));
+    }
+    if dispatch_throughput < 20_000_000.0 {
+        failures.push(format!(
+            "platform-dispatch throughput {dispatch_throughput:.0} operations/second is below 20000000"
+        ));
+    }
+    if dispatch.allocations.allocations != 0 {
+        failures.push(format!(
+            "platform-dispatch performed {} measured allocations",
+            dispatch.allocations.allocations
+        ));
+    }
+    if dispatch.raw.violations != 0 {
+        failures.push(format!(
+            "platform-dispatch recorded {} semantic violations",
+            dispatch.raw.violations
+        ));
     }
 
     let idle = find("idle-input-render").expect("required report");
@@ -1410,7 +1507,10 @@ fn print_json(report: &Report) {
 
 #[cfg(test)]
 mod tests {
-    use super::{deterministic_bytes, tui_frame, tui_frames, Suite, TuiFlavor, SCENARIOS};
+    use super::{
+        deterministic_bytes, platform_dispatch_workload, tui_frame, tui_frames, Suite, TuiFlavor,
+        SCENARIOS,
+    };
     use crate::legacy_terminal::LegacyTerminalEngine;
     use wmux_core::{Screen, TerminalEngine};
 
@@ -1442,6 +1542,14 @@ mod tests {
         ] {
             assert!(SCENARIOS.contains(&required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn platform_dispatch_is_registered_and_allocation_free() {
+        assert!(SCENARIOS.contains(&"platform-dispatch"));
+        let report = platform_dispatch_workload(Suite::Smoke);
+        assert_eq!(report.allocations.allocations, 0);
+        assert_eq!(report.raw.violations, 0);
     }
 
     #[test]

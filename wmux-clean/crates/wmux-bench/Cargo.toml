@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 wmux-core = { path = "../wmux-core" }
+wmux-platform = { path = "../wmux-platform" }
 wmux-protocol = { path = "../wmux-protocol" }
 
 [lints]

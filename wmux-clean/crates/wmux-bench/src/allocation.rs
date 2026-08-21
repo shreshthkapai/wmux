@@ -1,14 +1,28 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    cell::Cell,
 };
 
 pub struct CountingAllocator;
 
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy, Default)]
+struct ThreadAllocationState {
+    allocations: u64,
+    allocated_bytes: u64,
+    live_bytes: usize,
+    peak_live_bytes: usize,
+}
+
+thread_local! {
+    static THREAD_STATE: Cell<ThreadAllocationState> = const {
+        Cell::new(ThreadAllocationState {
+            allocations: 0,
+            allocated_bytes: 0,
+            live_bytes: 0,
+            peak_live_bytes: 0,
+        })
+    };
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllocationSnapshot {
@@ -36,61 +50,71 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        record_deallocation(layout.size());
         unsafe { System.dealloc(pointer, layout) };
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let resized = unsafe { System.realloc(pointer, layout, new_size) };
         if !resized.is_null() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-            if new_size >= layout.size() {
-                let growth = new_size - layout.size();
-                let live = LIVE_BYTES.fetch_add(growth, Ordering::Relaxed) + growth;
-                update_peak(live);
-            } else {
-                LIVE_BYTES.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-            }
+            record_reallocation(layout.size(), new_size);
         }
         resized
     }
 }
 
 fn record_allocation(size: usize) {
-    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    update_peak(live);
+    let _ = THREAD_STATE.try_with(|state| {
+        let mut current = state.get();
+        current.allocations += 1;
+        current.allocated_bytes += size as u64;
+        current.live_bytes += size;
+        current.peak_live_bytes = current.peak_live_bytes.max(current.live_bytes);
+        state.set(current);
+    });
 }
 
-fn update_peak(live: usize) {
-    let mut peak = PEAK_LIVE_BYTES.load(Ordering::Relaxed);
-    while live > peak {
-        match PEAK_LIVE_BYTES.compare_exchange_weak(
-            peak,
-            live,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(actual) => peak = actual,
-        }
-    }
+fn record_deallocation(size: usize) {
+    let _ = THREAD_STATE.try_with(|state| {
+        let mut current = state.get();
+        current.live_bytes = current.live_bytes.saturating_sub(size);
+        state.set(current);
+    });
+}
+
+fn record_reallocation(old_size: usize, new_size: usize) {
+    let _ = THREAD_STATE.try_with(|state| {
+        let mut current = state.get();
+        current.allocations += 1;
+        current.allocated_bytes += new_size as u64;
+        current.live_bytes = current
+            .live_bytes
+            .saturating_sub(old_size)
+            .saturating_add(new_size);
+        current.peak_live_bytes = current.peak_live_bytes.max(current.live_bytes);
+        state.set(current);
+    });
 }
 
 pub fn snapshot() -> AllocationSnapshot {
-    AllocationSnapshot {
-        allocations: ALLOCATIONS.load(Ordering::Relaxed),
-        allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-        live_bytes: LIVE_BYTES.load(Ordering::Relaxed),
-        peak_live_bytes: PEAK_LIVE_BYTES.load(Ordering::Relaxed),
-    }
+    THREAD_STATE.with(|state| {
+        let current = state.get();
+        AllocationSnapshot {
+            allocations: current.allocations,
+            allocated_bytes: current.allocated_bytes,
+            live_bytes: current.live_bytes,
+            peak_live_bytes: current.peak_live_bytes,
+        }
+    })
 }
 
 pub fn begin_measurement() -> AllocationSnapshot {
     let current = snapshot();
-    PEAK_LIVE_BYTES.store(current.live_bytes, Ordering::Relaxed);
+    THREAD_STATE.with(|state| {
+        let mut value = state.get();
+        value.peak_live_bytes = value.live_bytes;
+        state.set(value);
+    });
     current
 }
 
