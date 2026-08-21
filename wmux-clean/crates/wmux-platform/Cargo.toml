@@ -8,5 +8,8 @@ license.workspace = true
 name = "wmux_platform"
 path = "src/lib.rs"
 
+[dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

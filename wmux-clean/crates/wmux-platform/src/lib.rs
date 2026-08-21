@@ -1,161 +1,33 @@
-use std::{ffi::OsString, io, path::PathBuf};
+//! OS-neutral runtime seams shared by wmux clients, servers, and adapters.
+//!
+//! Native handles, descriptors, process identifiers used as handles, console
+//! records, and signal numbers belong in platform adapter crates.
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PlatformPaneId(u64);
+mod error;
+mod pane;
+mod terminal;
+mod transport;
 
-impl PlatformPaneId {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TerminalSize {
-    pub cols: u16,
-    pub rows: u16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MouseEventKind {
-    Down,
-    Up,
-    Drag,
-    Move,
-    ScrollUp,
-    ScrollDown,
-    ScrollLeft,
-    ScrollRight,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MouseButton {
-    None,
-    Left,
-    Middle,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MouseModifiers(u8);
-
-impl MouseModifiers {
-    pub const SHIFT: u8 = 1 << 0;
-    pub const ALT: u8 = 1 << 1;
-    pub const CONTROL: u8 = 1 << 2;
-
-    pub const fn new(bits: u8) -> Self {
-        Self(bits & (Self::SHIFT | Self::ALT | Self::CONTROL))
-    }
-
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    pub const fn contains(self, modifier: u8) -> bool {
-        self.0 & modifier != 0
-    }
-}
-
-/// A terminal mouse event in zero-based character-cell coordinates.
-///
-/// Platform backends normalize native input into this type. Raw console
-/// records, window handles, and terminal-specific escape bytes never cross
-/// the platform boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MouseEvent {
-    pub kind: MouseEventKind,
-    pub button: MouseButton,
-    pub modifiers: MouseModifiers,
-    pub column: u16,
-    pub row: u16,
-}
-
-impl TerminalSize {
-    pub const fn new(cols: u16, rows: u16) -> Self {
-        Self { cols, rows }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandSpec {
-    pub program: OsString,
-    pub args: Vec<OsString>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpawnPane {
-    pub pane: PlatformPaneId,
-    pub size: TerminalSize,
-    pub command: Option<CommandSpec>,
-    pub cwd: Option<PathBuf>,
-    pub environment: Vec<(OsString, OsString)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminationMode {
-    Graceful,
-    Force,
-}
-
-/// A semantic operation requested by core from an OS backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PlatformRequest {
-    SpawnPane(SpawnPane),
-    WritePane {
-        pane: PlatformPaneId,
-        bytes: Vec<u8>,
-    },
-    ResizePane {
-        pane: PlatformPaneId,
-        size: TerminalSize,
-    },
-    TerminatePane {
-        pane: PlatformPaneId,
-        mode: TerminationMode,
-    },
-}
-
-/// A semantic event emitted by an OS backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PlatformEvent {
-    PtyOutput {
-        pane: PlatformPaneId,
-        bytes: Vec<u8>,
-    },
-    PtyExited {
-        pane: PlatformPaneId,
-        exit_code: Option<u32>,
-    },
-}
-
-pub type PtyEvent = PlatformEvent;
-
-/// An OS backend owns all raw process and terminal handles internally.
-///
-/// The server communicates exclusively through semantic requests and events,
-/// so an associated platform pane type cannot leak into core state.
-pub trait PtyBackend {
-    fn submit(&mut self, request: PlatformRequest) -> io::Result<()>;
-    fn next_event(&mut self) -> io::Result<PlatformEvent>;
-}
-
-pub trait TerminalBackend {
-    fn enter(&mut self) -> io::Result<()>;
-    fn restore(&mut self) -> io::Result<()>;
-    fn read_input(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
-    fn write_output(&mut self, bytes: &[u8]) -> io::Result<()>;
-    fn size(&self) -> io::Result<TerminalSize>;
-}
+pub use error::{PlatformError, PlatformErrorKind, PlatformResult, MAX_PLATFORM_DIAGNOSTIC_BYTES};
+pub use pane::{
+    CommandSpec, PlatformEvent, PlatformNotifier, PlatformPaneId, PlatformRequest, PtyBackend,
+    PtyEvent, SpawnPane, TerminationMode,
+};
+pub use terminal::{
+    MouseButton, MouseEvent, MouseEventKind, MouseModifiers, TerminalBackend, TerminalInput,
+    TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers, TerminalModeGuard, TerminalSize,
+};
+pub use transport::{
+    AcceptedConnection, BoxedIpcStream, ClientTransport, DaemonSpec, Endpoint, IpcStream,
+    PeerIdentity, PlatformFuture, ServerListener, ServerPlatform,
+};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandSpec, MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent,
-        PlatformPaneId, PlatformRequest, SpawnPane, TerminalSize, TerminationMode,
+        CommandSpec, MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PeerIdentity,
+        PlatformError, PlatformErrorKind, PlatformEvent, PlatformPaneId, PlatformRequest,
+        SpawnPane, TerminalKeyModifiers, TerminalSize, TerminationMode,
     };
     use std::{ffi::OsString, path::PathBuf};
 
@@ -207,6 +79,49 @@ mod tests {
             .modifiers
             .bits(),
             MouseModifiers::CONTROL
+        );
+    }
+
+    #[test]
+    fn platform_errors_are_classified_and_bounded() {
+        let error = PlatformError::new(
+            PlatformErrorKind::Disconnected,
+            "read pane",
+            "λ".repeat(4_096),
+        );
+
+        assert_eq!(error.kind(), PlatformErrorKind::Disconnected);
+        assert_eq!(error.operation(), "read pane");
+        assert!(error.message().len() <= 4_096);
+        assert!(error.message().is_char_boundary(error.message().len()));
+    }
+
+    #[test]
+    fn peer_identity_is_opaque_but_comparable() {
+        let first = PeerIdentity::from_token(b"owner-a");
+        let same = PeerIdentity::from_token(b"owner-a");
+        let other = PeerIdentity::from_token(b"owner-b");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert!(!format!("{first:?}").contains("owner-a"));
+    }
+
+    #[test]
+    fn terminal_modifiers_reject_unsupported_bits() {
+        assert!(TerminalKeyModifiers::from_bits(0b1111).is_some());
+        assert!(TerminalKeyModifiers::from_bits(0b1_0000).is_none());
+    }
+
+    #[test]
+    fn pane_exit_and_stream_close_are_distinct_events() {
+        let pane = PlatformPaneId::new(9);
+        assert_ne!(
+            PlatformEvent::PtyExited {
+                pane,
+                exit_code: Some(0),
+            },
+            PlatformEvent::PtyClosed { pane }
         );
     }
 }
