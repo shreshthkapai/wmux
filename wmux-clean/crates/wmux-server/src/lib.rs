@@ -435,7 +435,7 @@ fn parse_command_line(raw: &str) -> io::Result<Command> {
         .split_whitespace()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    parse_command(&argv).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.0))
+    parse_command(&argv).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 struct Runtime {

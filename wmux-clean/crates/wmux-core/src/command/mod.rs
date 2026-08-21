@@ -1,6 +1,46 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{ClientId, PaneId, ResizeDirection, ServerState, SessionId, SplitDirection};
+
+mod execute;
+mod lexer;
+mod parser;
+
+pub use execute::execute;
+pub use lexer::{CommandParseError, SourcePosition, SourceSpan};
+pub use parser::{parse_command, parse_command_argv, parse_command_text, MAX_COMMANDS};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandList(Arc<[Command]>);
+
+impl CommandList {
+    pub fn new(commands: Vec<Command>) -> Result<Self, CommandParseError> {
+        if commands.len() > MAX_COMMANDS {
+            return Err(CommandParseError::new("command list exceeds 256 commands"));
+        }
+        Ok(Self(commands.into()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Command> {
+        self.0.iter()
+    }
+}
+
+impl std::ops::Index<usize> for CommandList {
+    type Output = Command;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -123,7 +163,7 @@ impl CommandQueue {
     }
 }
 
-pub fn execute(state: &mut ServerState, queued: QueuedCommand) -> CommandResult {
+pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> CommandResult {
     match queued.command {
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
             sequence: queued.sequence,
@@ -493,9 +533,6 @@ fn attached_or_first_session(state: &ServerState, client: ClientId) -> Option<Se
         .or_else(|| state.sessions.keys().next().copied())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandParseError(pub String);
-
 struct CommandEntry {
     name: &'static str,
     alias: Option<&'static str>,
@@ -620,17 +657,17 @@ pub fn resolve_command_name(name: &str) -> Result<&'static str, CommandParseErro
 
     match matches.as_slice() {
         [name] => Ok(name),
-        [] => Err(CommandParseError(format!("unknown command: {name}"))),
-        _ => Err(CommandParseError(format!(
+        [] => Err(CommandParseError::new(format!("unknown command: {name}"))),
+        _ => Err(CommandParseError::new(format!(
             "ambiguous command: {name}, could be: {}",
             matches.join(", ")
         ))),
     }
 }
 
-pub fn parse_command(argv: &[String]) -> Result<Command, CommandParseError> {
+pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandParseError> {
     let Some(requested_command) = argv.first().map(String::as_str) else {
-        return Err(CommandParseError("empty command".to_string()));
+        return Err(CommandParseError::new("empty command"));
     };
     let command = resolve_command_name(requested_command)?;
 
@@ -799,7 +836,7 @@ fn validate_arguments(
         let argument = argv[index].as_str();
         if value_flags.contains(&argument) {
             if index + 1 >= argv.len() {
-                return Err(CommandParseError(format!(
+                return Err(CommandParseError::new(format!(
                     "missing argument for {argument}"
                 )));
             }
@@ -807,11 +844,13 @@ fn validate_arguments(
         } else if flags.contains(&argument) {
             index += 1;
         } else if argument.starts_with('-') {
-            return Err(CommandParseError(format!("unknown option: {argument}")));
+            return Err(CommandParseError::new(format!(
+                "unknown option: {argument}"
+            )));
         } else {
             positionals += 1;
             if positionals > max_positionals {
-                return Err(CommandParseError(format!(
+                return Err(CommandParseError::new(format!(
                     "too many arguments for {}",
                     argv[0]
                 )));
@@ -1262,11 +1301,11 @@ mod tests {
     #[test]
     fn reports_tmux_style_ambiguous_and_unknown_commands() {
         assert_eq!(
-            super::resolve_command_name("kill-s").unwrap_err().0,
+            super::resolve_command_name("kill-s").unwrap_err().message,
             "ambiguous command: kill-s, could be: kill-server, kill-session"
         );
         assert_eq!(
-            super::resolve_command_name("status").unwrap_err().0,
+            super::resolve_command_name("status").unwrap_err().message,
             "unknown command: status"
         );
     }
@@ -1280,19 +1319,19 @@ mod tests {
                 "test".to_string()
             ])
             .unwrap_err()
-            .0,
+            .message,
             "unknown option: -s"
         );
         assert_eq!(
             parse_command(&["kill-session".to_string(), "test".to_string()])
                 .unwrap_err()
-                .0,
+                .message,
             "too many arguments for kill-session"
         );
         assert_eq!(
             parse_command(&["kill-session".to_string(), "-t".to_string()])
                 .unwrap_err()
-                .0,
+                .message,
             "missing argument for -t"
         );
     }

@@ -81,7 +81,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, CliError> {
 }
 
 fn parse_server(args: &[String]) -> Result<Invocation, CliError> {
-    let canonical = resolve_command_name(&args[0]).map_err(|error| CliError(error.0))?;
+    let canonical = resolve_command_name(&args[0]).map_err(|error| CliError(error.to_string()))?;
     let mut argv = args.to_vec();
     argv[0] = canonical.to_string();
 
