@@ -984,6 +984,26 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_bounded_key_bytes_never_panic_or_emit_unbounded_errors() {
+        let mut seed = 0x6b65_792d_7068_6173_u64;
+        for len in 0..=4_096 {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                bytes.push(seed as u8);
+            }
+            let key = String::from_utf8_lossy(&bytes).into_owned();
+            let result = std::panic::catch_unwind(|| KeyCode::parse(&key));
+            let parsed = result.unwrap_or_else(|_| panic!("key parser panicked for length {len}"));
+            if let Err(error) = parsed {
+                assert!(error.to_string().len() <= 4 * 1024);
+            }
+        }
+    }
+
+    #[test]
     fn prefix_state_is_per_client_and_unbound_bytes_move_unchanged() {
         let mut state = ServerState::new();
         let first = state.add_client();

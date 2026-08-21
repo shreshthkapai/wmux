@@ -15,8 +15,8 @@ cargo run -p wmux-conformance --release
 
 The suite covers deterministic VT replay, detach and reattach persistence,
 multiple-client scene consistency, resize and reflow, malformed terminal and
-IPC input, key and bracketed-paste translation, and DEC mouse-mode routing.
-Each case produces a
+IPC input, key and bracketed-paste translation, DEC mouse-mode routing, and the
+portable command/target/key-table model. Each case produces a
 stable FNV-1a fingerprint. The aggregate fingerprint is checked against
 `EXPECTED_PORTABLE_FINGERPRINT`; a semantic change must deliberately update
 the fixture and expected value.
@@ -24,6 +24,23 @@ the fixture and expected value.
 The GitHub Actions matrix runs the portable core, protocol, platform contract,
 and conformance crates on all three operating systems. This prevents native
 types or host-dependent behavior from entering the shared semantic path.
+
+### Phase 4 command and key evidence
+
+The Phase 4 verification run on 2026-08-21 passed all 274 workspace tests. The
+portable suite contains 13 cases and produced aggregate fingerprint
+`00b763c726b9d162` on Windows. Two new portable cases cover command-list
+parsing, qualified target resolution, prefix and repeat handling, live binding
+mutation, exact `send-keys` output, session switching, per-client refresh, and
+confirmation rejection/acceptance.
+
+Fixed-seed malformed-input tests cover the command, target, and key parsers and
+protocol-v6 semantic-key decoder. The `command_text` fuzz target compiles on
+stable Windows; sanitizer-backed fuzz execution remains a nightly Unix CI or
+developer task. The full release performance rejection gate, including the
+four Phase 4 routing/parser workloads, passed without weakening an earlier
+threshold. See `command-key-model.md` for the model, exact measurements, and
+reference comparison limits.
 
 ## Native Coverage
 

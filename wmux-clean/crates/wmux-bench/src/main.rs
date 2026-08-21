@@ -12,9 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 use wmux_core::{
-    build_window_scene, build_window_structure, render_damage_from_structure, render_diff,
-    render_diff_scene, render_full_scene, RenderCapabilities, RenderState, Screen, ServerState,
-    SplitDirection, TerminalEngine,
+    build_window_scene, build_window_structure, parse_command_text, render_damage_from_structure,
+    render_diff, render_diff_scene, render_full_scene, route_key, ClientId, Command, CommandList,
+    CommandQueue, CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers,
+    RenderCapabilities, RenderState, Screen, ServerState, SplitDirection, TerminalEngine,
 };
 use wmux_protocol::{write_message, Message};
 
@@ -147,6 +148,10 @@ const SCENARIOS: &[&str] = &[
     "split-storm",
     "detach-backlog",
     "multiple-clients",
+    "key-unbound",
+    "key-prefix-binding",
+    "command-queue",
+    "command-text",
 ];
 
 fn main() {
@@ -246,6 +251,30 @@ fn main() {
         &options,
         "multiple-clients",
         || multiple_clients_workload(config, options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "key-unbound",
+        || key_unbound_workload(options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "key-prefix-binding",
+        || key_prefix_binding_workload(options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "command-queue",
+        || command_queue_workload(options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "command-text",
+        || command_text_workload(options.suite),
         &mut reports,
     );
 
@@ -834,6 +863,192 @@ fn multiple_clients_workload(config: WorkloadConfig, suite: Suite) -> Report {
     )
 }
 
+fn phase_4_iterations(suite: Suite) -> (u64, u64, usize, u64) {
+    match suite {
+        Suite::Smoke => (100_000, 50_000, 50_000, 10_000),
+        Suite::Full => (10_000_000, 5_000_000, 1_000_000, 250_000),
+    }
+}
+
+fn key_unbound_workload(suite: Suite) -> Report {
+    let (routes, _, _, _) = phase_4_iterations(suite);
+    let mut state = ServerState::new();
+    let client = state.add_client();
+    let key = KeyCode::character('q', KeyModifiers::NONE);
+    let mut raw = vec![b'q'];
+
+    measure("key-unbound", suite, routes, routes, move || {
+        let mut checksum = 0_u64;
+        let mut violations = 0;
+        for now in 0..routes {
+            match route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                KeyEvent::new(key, raw),
+                now,
+            ) {
+                InputRoute::PaneBytes(bytes) => {
+                    checksum = checksum
+                        .wrapping_mul(0x100000001b3)
+                        .wrapping_add(u64::from(bytes[0]));
+                    raw = bytes;
+                }
+                _ => {
+                    violations += 1;
+                    raw = vec![b'q'];
+                }
+            }
+        }
+        RawResult {
+            violations,
+            checksum,
+            ..RawResult::default()
+        }
+    })
+}
+
+fn key_prefix_binding_workload(suite: Suite) -> Report {
+    let (_, pairs, _, _) = phase_4_iterations(suite);
+    let mut state = ServerState::new();
+    let client = state.add_client();
+    let prefix = KeyCode::ctrl('b');
+    let binding = KeyCode::character('c', KeyModifiers::NONE);
+
+    measure(
+        "key-prefix-binding",
+        suite,
+        pairs.saturating_mul(2),
+        pairs,
+        move || {
+            let mut checksum = 0_u64;
+            let mut violations = 0;
+            for now in 0..pairs {
+                if route_key(
+                    &mut state,
+                    client,
+                    InputMode::Normal,
+                    KeyEvent::new(prefix, Vec::new()),
+                    now.saturating_mul(2),
+                ) != InputRoute::Consumed
+                {
+                    violations += 1;
+                }
+                match route_key(
+                    &mut state,
+                    client,
+                    InputMode::Normal,
+                    KeyEvent::new(binding, Vec::new()),
+                    now.saturating_mul(2).saturating_add(1),
+                ) {
+                    InputRoute::Commands(commands) => {
+                        checksum = checksum
+                            .wrapping_mul(0x100000001b3)
+                            .wrapping_add(commands.len() as u64);
+                        if !matches!(&commands[0], Command::NewWindow { .. }) {
+                            violations += 1;
+                        }
+                    }
+                    _ => violations += 1,
+                }
+            }
+            RawResult {
+                violations,
+                checksum,
+                ..RawResult::default()
+            }
+        },
+    )
+}
+
+fn command_queue_workload(suite: Suite) -> Report {
+    const CLIENTS: usize = 8;
+    let (_, _, commands, _) = phase_4_iterations(suite);
+    let mut queue = CommandQueue::default();
+    for client_index in 0..CLIENTS {
+        let mut remaining = commands / CLIENTS + usize::from(client_index < commands % CLIENTS);
+        while remaining > 0 {
+            let count = remaining.min(256);
+            let list = CommandList::new(vec![Command::ListSessions; count])
+                .expect("benchmark command list is bounded");
+            queue
+                .push_list(
+                    ClientId::new(client_index as u64 + 1),
+                    list,
+                    CommandSource::KeyBinding,
+                )
+                .expect("benchmark queue accepts commands");
+            remaining -= count;
+        }
+    }
+
+    measure(
+        "command-queue",
+        suite,
+        commands as u64,
+        commands as u64,
+        move || {
+            let mut checksum = 0_u64;
+            let mut processed = 0_usize;
+            while let Some(queued) = queue.pop() {
+                checksum = checksum
+                    .wrapping_mul(0x100000001b3)
+                    .wrapping_add(queued.client.raw())
+                    .wrapping_add(queued.sequence);
+                if !matches!(queued.command, Command::ListSessions) {
+                    checksum ^= u64::MAX;
+                }
+                processed += 1;
+                let _ = queue.finish(queued, Ok(String::new()));
+            }
+            RawResult {
+                max_queue_depth: commands,
+                final_queue_depth: usize::from(!queue.is_empty()),
+                violations: usize::from(processed != commands),
+                checksum: checksum ^ processed as u64,
+                ..RawResult::default()
+            }
+        },
+    )
+}
+
+fn command_text_workload(suite: Suite) -> Report {
+    let (_, _, _, lists) = phase_4_iterations(suite);
+    let fixture = "list-sessions; select-window -t +1; send-keys -l x; refresh-client".to_string();
+    let input_bytes = fixture.len() as u64 * lists;
+    measure("command-text", suite, input_bytes, lists, move || {
+        let mut checksum = 0_u64;
+        let mut violations = 0;
+        for _ in 0..lists {
+            match parse_command_text(&fixture) {
+                Ok(commands) => {
+                    checksum = checksum
+                        .wrapping_mul(0x100000001b3)
+                        .wrapping_add(commands.len() as u64);
+                    for command in commands.iter() {
+                        checksum = checksum.wrapping_add(match command {
+                            Command::ListSessions => 1,
+                            Command::SelectWindow { .. } => 2,
+                            Command::SendKeys { .. } => 3,
+                            Command::RefreshClient => 4,
+                            _ => {
+                                violations += 1;
+                                0
+                            }
+                        });
+                    }
+                }
+                Err(_) => violations += 1,
+            }
+        }
+        RawResult {
+            violations,
+            checksum,
+            ..RawResult::default()
+        }
+    })
+}
+
 fn tui_frames(flavor: TuiFlavor, count: usize, cols: u16, rows: u16) -> Vec<Vec<u8>> {
     (0..count)
         .map(|frame| tui_frame(flavor, frame, cols, rows))
@@ -985,6 +1200,10 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
         "split-storm",
         "detach-backlog",
         "multiple-clients",
+        "key-unbound",
+        "key-prefix-binding",
+        "command-queue",
+        "command-text",
     ];
     for name in required {
         if find(name).is_none() {
@@ -1002,6 +1221,36 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
             failures.push(format!(
                 "{name} throughput {:.1} MB/s is below 40 MB/s",
                 throughput / 1_000_000.0
+            ));
+        }
+    }
+
+    for (name, minimum, unit) in [
+        ("key-unbound", 15_000_000.0, "routes/second"),
+        ("key-prefix-binding", 5_000_000.0, "pairs/second"),
+        ("command-queue", 2_000_000.0, "commands/second"),
+        ("command-text", 200_000.0, "lists/second"),
+    ] {
+        let report = find(name).expect("required report");
+        let throughput = report.operations as f64 / report.elapsed.as_secs_f64();
+        if throughput < minimum {
+            failures.push(format!(
+                "{name} throughput {throughput:.0} {unit} is below {minimum:.0}"
+            ));
+        }
+        if report.raw.violations != 0 {
+            failures.push(format!(
+                "{name} recorded {} semantic violations",
+                report.raw.violations
+            ));
+        }
+    }
+    for name in ["key-unbound", "key-prefix-binding"] {
+        let report = find(name).expect("required report");
+        if report.allocations.allocations != 0 {
+            failures.push(format!(
+                "{name} performed {} measured allocations",
+                report.allocations.allocations
             ));
         }
     }
@@ -1071,13 +1320,14 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
 
 fn print_human(reports: &[Report]) {
     println!(
-        "{:<22} {:<7} {:>10} {:>10} {:>10} {:>10} {:>12} {:>11} {:>10}",
+        "{:<22} {:<7} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>11} {:>10}",
         "scenario",
         "profile",
         "total ms",
         "p50 us",
         "p95 us",
         "MiB/s",
+        "ops/s",
         "alloc MiB",
         "peak MiB",
         "queue"
@@ -1089,14 +1339,20 @@ fn print_human(reports: &[Report]) {
         } else {
             report.input_bytes as f64 / (1024.0 * 1024.0) / seconds
         };
+        let operations_per_second = if seconds == 0.0 {
+            0.0
+        } else {
+            report.operations as f64 / seconds
+        };
         println!(
-            "{:<22} {:<7} {:>10.3} {:>10.3} {:>10.3} {:>10.2} {:>12.2} {:>11.2} {:>10}",
+            "{:<22} {:<7} {:>10.3} {:>10.3} {:>10.3} {:>10.2} {:>12.0} {:>12.2} {:>11.2} {:>10}",
             report.scenario,
             report.profile,
             report.elapsed.as_secs_f64() * 1000.0,
             percentile(&report.raw.latencies_ns, 50) as f64 / 1000.0,
             percentile(&report.raw.latencies_ns, 95) as f64 / 1000.0,
             mib_per_second,
+            operations_per_second,
             report.allocations.allocated_bytes as f64 / (1024.0 * 1024.0),
             report.allocations.peak_live_bytes as f64 / (1024.0 * 1024.0),
             report.raw.max_queue_depth,
@@ -1112,11 +1368,17 @@ fn print_json(report: &Report) {
     } else {
         report.input_bytes as f64 / seconds
     };
+    let operations_per_second = if seconds == 0.0 {
+        0.0
+    } else {
+        report.operations as f64 / seconds
+    };
     println!(
         concat!(
             "{{\"scenario\":\"{}\",\"suite\":\"{}\",\"profile\":\"{}\",",
             "\"elapsed_ns\":{},\"input_bytes\":{},\"operations\":{},",
-            "\"bytes_per_second\":{:.3},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},",
+            "\"bytes_per_second\":{:.3},\"operations_per_second\":{:.3},",
+            "\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},",
             "\"allocations\":{},\"allocated_bytes\":{},\"peak_live_bytes\":{},",
             "\"ipc_bytes\":{},\"reference_bytes\":{},\"max_queue_depth\":{},",
             "\"final_queue_depth\":{},\"violations\":{},\"client_write_ns\":{},",
@@ -1129,6 +1391,7 @@ fn print_json(report: &Report) {
         report.input_bytes,
         report.operations,
         bytes_per_second,
+        operations_per_second,
         percentile(&report.raw.latencies_ns, 50),
         percentile(&report.raw.latencies_ns, 95),
         percentile(&report.raw.latencies_ns, 99),
@@ -1167,6 +1430,18 @@ mod tests {
         assert_eq!(Suite::Full.config().history_lines, 100_000);
         assert_eq!(Suite::Full.config().history_resize_iterations, 200);
         assert_eq!(Suite::Smoke.config().history_resize_iterations, 20);
+    }
+
+    #[test]
+    fn phase_4_hot_path_workloads_are_required() {
+        for required in [
+            "key-unbound",
+            "key-prefix-binding",
+            "command-queue",
+            "command-text",
+        ] {
+            assert!(SCENARIOS.contains(&required), "missing {required}");
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::{fmt, iter::Peekable, str::CharIndices};
 pub const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 pub const MAX_TOKENS: usize = 4_096;
 pub const MAX_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_ERROR_MESSAGE_BYTES: usize = 3 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePosition {
@@ -26,14 +27,14 @@ pub struct CommandParseError {
 impl CommandParseError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: bounded_error_message(message.into()),
             span: None,
         }
     }
 
     pub(crate) fn at(message: impl Into<String>, span: SourceSpan) -> Self {
         Self {
-            message: message.into(),
+            message: bounded_error_message(message.into()),
             span: Some(span),
         }
     }
@@ -44,6 +45,19 @@ impl CommandParseError {
         }
         self
     }
+}
+
+fn bounded_error_message(mut message: String) -> String {
+    if message.len() <= MAX_ERROR_MESSAGE_BYTES {
+        return message;
+    }
+    let mut end = MAX_ERROR_MESSAGE_BYTES - '…'.len_utf8();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push('…');
+    message
 }
 
 impl fmt::Display for CommandParseError {

@@ -170,16 +170,16 @@ cargo run -p wmux-bench --release -- --suite full --gate
 - Consumes: current `Command`, `CommandQueue`, `ServerState`, `ClientInput`, and hardcoded prefix translation.
 - Produces: `CommandList`, `TargetSpec`, `TargetResolver`, `KeyCode`, `KeyTable`, and `KeyBinding`, all owned and executed by the server.
 
-- [ ] Research tmux `cmd-parse`, target resolution, key tables, repeatable bindings, and default destructive confirmations; compare zellij input normalization where it maps cleanly to Rust.
-- [ ] Write lexer golden tests for quotes, escapes, empty arguments, comments, semicolon chains, command aliases, unique prefixes, and invalid syntax spans.
-- [ ] Implement one lexer/parser path used by CLI argv, IPC command strings, config files, key bindings, hooks, and control clients.
-- [ ] Write target-resolution tests for client, session, window, winlink, pane, relative, current, last, ambiguous, and absent targets.
-- [ ] Implement centralized `TargetResolver`; remove command-specific ad hoc lookup logic.
-- [ ] Write key-table tests for root/prefix/copy tables, repeat time, send-prefix, literal passthrough, bracketed paste, mouse precedence, and client-independent bindings.
-- [ ] Move prefix interpretation from `wmux-client` into server-owned key tables; the client should only normalize terminal input and transmit semantic input events.
-- [ ] Implement `bind-key`, `unbind-key`, `list-keys`, `send-keys`, `send-prefix`, `switch-client`, and `refresh-client` through the serialized command queue.
-- [ ] Represent kill-pane and kill-window defaults as confirmation commands in the binding table; the confirmation UI remains a plain functional prompt until Task 10.
-- [ ] Add malformed-command property tests and verify that one client cannot block or corrupt another client's queue.
+- [x] Research tmux `cmd-parse`, target resolution, key tables, repeatable bindings, and default destructive confirmations; compare zellij input normalization where it maps cleanly to Rust.
+- [x] Write lexer golden tests for quotes, escapes, empty arguments, comments, semicolon chains, command aliases, unique prefixes, and invalid syntax spans.
+- [x] Implement one lexer/parser path used by CLI argv, IPC command strings, config files, key bindings, hooks, and control clients.
+- [x] Write target-resolution tests for client, session, window, winlink, pane, relative, current, last, ambiguous, and absent targets.
+- [x] Implement centralized `TargetResolver`; remove command-specific ad hoc lookup logic.
+- [x] Write key-table tests for root/prefix/copy tables, repeat time, send-prefix, literal passthrough, bracketed paste, mouse precedence, and client-independent bindings.
+- [x] Move prefix interpretation from `wmux-client` into server-owned key tables; the client should only normalize terminal input and transmit semantic input events.
+- [x] Implement `bind-key`, `unbind-key`, `list-keys`, `send-keys`, `send-prefix`, `switch-client`, and `refresh-client` through the serialized command queue.
+- [x] Represent kill-pane and kill-window defaults as confirmation commands in the binding table; the confirmation UI remains a plain functional prompt until Task 10.
+- [x] Add malformed-command property tests and verify that one client cannot block or corrupt another client's queue.
 
 **Exit gate:** All command sources share one parser, all targets share one resolver, and clients contain no multiplexer key-binding policy.
 

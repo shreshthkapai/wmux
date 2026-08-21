@@ -857,6 +857,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arbitrary_bounded_semantic_key_payloads_never_panic_or_emit_unbounded_errors() {
+        let mut seed = 0x7769_7265_2d6b_6579_u64;
+        for len in 0..=4_096 {
+            let mut payload = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                payload.push(seed as u8);
+            }
+            let result = std::panic::catch_unwind(|| decode_frame_payload_owned(11, payload));
+            let decoded =
+                result.unwrap_or_else(|_| panic!("key decoder panicked for length {len}"));
+            if let Err(error) = decoded {
+                assert!(error.to_string().len() <= 4 * 1024);
+            }
+        }
+    }
+
     fn key_payload(tag: u8, modifiers: u8, value: u32) -> Vec<u8> {
         let mut payload = vec![tag, modifiers];
         payload.extend_from_slice(&value.to_le_bytes());

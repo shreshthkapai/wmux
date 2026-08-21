@@ -235,4 +235,41 @@ mod tests {
             "nested command depth exceeds 32 levels"
         );
     }
+
+    #[test]
+    fn arbitrary_bounded_command_bytes_never_panic_or_exceed_limits() {
+        let mut seed = 0x6d75_782d_7068_6173_u64;
+        for len in 0..=4_096 {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                bytes.push(seed as u8);
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let result = std::panic::catch_unwind(|| parse_command_text(&text));
+            let parsed = result.unwrap_or_else(|_| panic!("parser panicked for length {len}"));
+            if let Err(error) = parsed {
+                assert!(error.to_string().len() <= 4 * 1024);
+            }
+        }
+
+        let error = parse_command_text(&"x".repeat(4_096)).unwrap_err();
+        assert!(error.to_string().len() <= 4 * 1024);
+    }
+
+    #[test]
+    fn invalid_command_list_cannot_partially_mutate_server_state() {
+        let mut state = crate::ServerState::new();
+        state.create_session("before", 80, 24);
+        let before = state.list_sessions();
+
+        assert!(parse_command_text("new-session -s leaked; definitely-not-a-command").is_err());
+        assert_eq!(state.list_sessions(), before);
+        assert!(state
+            .sessions
+            .values()
+            .all(|session| session.name != "leaked"));
+    }
 }

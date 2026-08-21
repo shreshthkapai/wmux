@@ -3,6 +3,8 @@ use std::fmt;
 use crate::{ClientId, PaneId, ServerState, SessionId, WindowId, WinlinkId};
 
 const MAX_TARGET_BYTES: usize = 4 * 1024;
+const MAX_TARGET_DIAGNOSTIC_BYTES: usize = 1024;
+const MAX_AMBIGUOUS_CANDIDATES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetKind {
@@ -31,13 +33,13 @@ impl TargetSpec {
         let raw = raw.into();
         if raw.len() > MAX_TARGET_BYTES {
             return Err(TargetError::Invalid {
-                target: raw,
+                target: diagnostic_text(&raw, MAX_TARGET_DIAGNOSTIC_BYTES),
                 reason: format!("target exceeds {MAX_TARGET_BYTES} bytes"),
             });
         }
         if raw.contains('\0') {
             return Err(TargetError::Invalid {
-                target: raw,
+                target: diagnostic_text(&raw, MAX_TARGET_DIAGNOSTIC_BYTES),
                 reason: "target contains a NUL byte".to_string(),
             });
         }
@@ -394,14 +396,11 @@ impl<'a> TargetResolver<'a> {
         }
         if matches.len() > 1 {
             matches.sort_by_key(|session| session.id);
-            return Err(TargetError::Ambiguous {
-                kind: TargetKind::Session,
-                target: raw.to_string(),
-                candidates: matches
-                    .into_iter()
-                    .map(|session| session.name.clone())
-                    .collect(),
-            });
+            return Err(ambiguous(
+                TargetKind::Session,
+                raw,
+                matches.into_iter().map(|session| session.name.as_str()),
+            ));
         }
         if let Some(id) = parse_raw_id(raw) {
             let session = SessionId::new(id);
@@ -494,14 +493,13 @@ impl<'a> TargetResolver<'a> {
         match matches.as_slice() {
             [(winlink, _)] => Ok(winlink.id),
             [] => Err(not_found(TargetKind::Window, original)),
-            _ => Err(TargetError::Ambiguous {
-                kind: TargetKind::Window,
-                target: original.to_string(),
-                candidates: matches
+            _ => Err(ambiguous(
+                TargetKind::Window,
+                original,
+                matches
                     .iter()
-                    .map(|(winlink, window)| format!("{}:{}", winlink.index, window.name))
-                    .collect(),
-            }),
+                    .map(|(winlink, window)| format!("{}:{}", winlink.index, window.name)),
+            )),
         }
     }
 
@@ -662,7 +660,7 @@ fn required<T: Copy>(value: Option<T>, kind: TargetKind, raw: &str) -> Result<T,
 
 fn invalid(raw: &str, reason: &str) -> TargetError {
     TargetError::Invalid {
-        target: raw.to_string(),
+        target: diagnostic_text(raw, MAX_TARGET_DIAGNOSTIC_BYTES),
         reason: reason.to_string(),
     }
 }
@@ -670,8 +668,37 @@ fn invalid(raw: &str, reason: &str) -> TargetError {
 fn not_found(kind: TargetKind, raw: &str) -> TargetError {
     TargetError::NotFound {
         kind,
-        target: raw.to_string(),
+        target: diagnostic_text(raw, MAX_TARGET_DIAGNOSTIC_BYTES),
     }
+}
+
+fn ambiguous(
+    kind: TargetKind,
+    raw: &str,
+    candidates: impl IntoIterator<Item = impl AsRef<str>>,
+) -> TargetError {
+    TargetError::Ambiguous {
+        kind,
+        target: diagnostic_text(raw, MAX_TARGET_DIAGNOSTIC_BYTES),
+        candidates: candidates
+            .into_iter()
+            .take(MAX_AMBIGUOUS_CANDIDATES)
+            .map(|candidate| diagnostic_text(candidate.as_ref(), 256))
+            .collect(),
+    }
+}
+
+fn diagnostic_text(raw: &str, limit: usize) -> String {
+    if raw.len() <= limit {
+        return raw.to_string();
+    }
+    let mut end = limit;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = raw[..end].to_string();
+    bounded.push('…');
+    bounded
 }
 
 #[cfg(test)]
@@ -1003,6 +1030,27 @@ mod tests {
             Err(TargetError::Invalid { .. })
         ));
         assert!(TargetSpec::parse("x".repeat(MAX_TARGET_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn arbitrary_bounded_target_bytes_never_panic_or_emit_unbounded_errors() {
+        let mut seed = 0x7461_7267_6574_2d34_u64;
+        for len in 0..=4_096 {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                bytes.push(seed as u8);
+            }
+            let target = String::from_utf8_lossy(&bytes).into_owned();
+            let result = std::panic::catch_unwind(|| TargetSpec::parse(target));
+            let parsed =
+                result.unwrap_or_else(|_| panic!("target parser panicked for length {len}"));
+            if let Err(error) = parsed {
+                assert!(error.to_string().len() <= 4 * 1024);
+            }
+        }
     }
 
     #[test]

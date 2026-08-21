@@ -1,0 +1,1 @@
+bind-key -r -T prefix C-j 'select-pane -D; resize-pane -D 3'; send-keys -l "two words"

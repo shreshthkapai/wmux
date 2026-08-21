@@ -17,6 +17,10 @@ The command exits nonzero if a required scenario is absent or any gate fails.
 | No blank layout frame | `split-storm` must emit no ED2 or ED3 clear sequence |
 | Damage-proportional rendering | one-cell output must be less than one quarter of a full scene |
 | Bounded noisy/slow-client memory | detach and multi-client peak live memory must remain below 256 MiB |
+| Allocation-free unbound routing | `key-unbound` must sustain 15M routes/s with zero measured allocations |
+| Allocation-free prefix dispatch | `key-prefix-binding` must sustain 5M pairs/s with zero measured allocations |
+| Fair queue throughput | `command-queue` must sustain 2M pre-parsed commands/s across 8 clients |
+| Shared parser throughput | `command-text` must sustain 200K four-command lists/s |
 
 Parser throughput for both Codex and Claude fixtures must remain above 40 MB/s.
 The thresholds are intentionally conservative enough for shared CI runners but

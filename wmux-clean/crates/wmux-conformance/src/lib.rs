@@ -1,9 +1,11 @@
 use std::{fmt::Write as _, io::Cursor};
 
 use wmux_core::{
-    build_window_scene, render_full_scene, route_key, ClientInput, Color, Command, CommandQueue,
-    CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, KeyTableName,
-    RenderState, Screen, ServerState, Style, TerminalEngine,
+    build_window_scene, execute, parse_command_text, render_full_scene, route_key, ClientInput,
+    Color, Command, CommandEffect, CommandOutcome, CommandQueue, CommandSource, ConfirmationState,
+    InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, KeyTableName, QueuedCommand,
+    RenderState, ResolveContext, Screen, ServerState, Style, TargetKind, TargetResolver,
+    TargetSpec, TerminalEngine,
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use wmux_protocol::{
@@ -12,7 +14,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x0891_e689_383d_d436;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x00b7_63c7_26b9_d162;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -35,6 +37,8 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         malformed_input_case()?,
         key_and_paste_case(),
         semantic_key_routing_case()?,
+        command_target_binding_case()?,
+        command_effects_case()?,
         mouse_routing_case(),
         unicode_terminal_text_case()?,
         terminal_modes_and_title_case()?,
@@ -49,6 +53,34 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         cases,
         suite_fingerprint: suite_fingerprint.finish(),
     })
+}
+
+fn execute_text(
+    state: &mut ServerState,
+    client: wmux_core::ClientId,
+    raw: &str,
+) -> Result<Vec<CommandOutcome>, String> {
+    let commands = parse_command_text(raw).map_err(|error| error.to_string())?;
+    let command_count = commands.len();
+    let mut outcomes = Vec::with_capacity(command_count);
+    for (index, command) in commands.iter().cloned().enumerate() {
+        let outcome = execute(
+            state,
+            QueuedCommand {
+                invocation: 1,
+                sequence: index as u64 + 1,
+                client,
+                command,
+                source: CommandSource::ClientRequest,
+                final_in_list: index + 1 == command_count,
+            },
+        );
+        if !outcome.ok {
+            return Err(outcome.message);
+        }
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
 }
 
 pub fn verify_portable_suite() -> Result<ConformanceReport, String> {
@@ -365,6 +397,148 @@ fn semantic_key_routing_case() -> Result<CaseResult, String> {
     })
 }
 
+fn command_target_binding_case() -> Result<CaseResult, String> {
+    let mut state = ServerState::new();
+    let client = state.add_client();
+    let created = state.create_session("work", COLS, ROWS);
+    state
+        .attach_client(client, created.session)
+        .ok_or("command case attach failed")?;
+
+    let outcomes = execute_text(
+        &mut state,
+        client,
+        "new-window -n logs; bind-key -r -T prefix C-j 'select-pane -D'",
+    )?;
+    if outcomes.len() != 2
+        || !outcomes[0]
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CommandEffect::EnsurePane { .. }))
+    {
+        return Err("parsed command list did not create the named window".to_string());
+    }
+
+    let context = ResolveContext::for_client(&state, client).map_err(|error| error.to_string())?;
+    let target = TargetSpec::parse("work:logs.0").map_err(|error| error.to_string())?;
+    let resolved = TargetResolver::new(&state)
+        .resolve(&context, TargetKind::Pane, &target)
+        .map_err(|error| error.to_string())?;
+    let pane = resolved.pane.ok_or("pane target did not resolve")?;
+    if Some(pane) != state.clients[&client].attached_pane {
+        return Err("named pane target did not resolve to the active pane".to_string());
+    }
+
+    let prefix = KeyEvent::new(KeyCode::ctrl('b'), vec![0x02]);
+    let binding = KeyEvent::new(
+        KeyCode::parse("C-j").map_err(|error| error.to_string())?,
+        vec![0x0a],
+    );
+    if route_key(&mut state, client, InputMode::Normal, prefix, 10) != InputRoute::Consumed {
+        return Err("custom binding prefix was not consumed".to_string());
+    }
+    let first = match route_key(&mut state, client, InputMode::Normal, binding.clone(), 11) {
+        InputRoute::Commands(commands) => commands,
+        _ => return Err("custom binding did not route to commands".to_string()),
+    };
+    let repeated = match route_key(&mut state, client, InputMode::Normal, binding, 12) {
+        InputRoute::Commands(commands) => commands,
+        _ => return Err("repeatable binding did not remain active".to_string()),
+    };
+    if !matches!(first[0], Command::SelectPane { .. }) || first != repeated {
+        return Err("custom binding command changed during repeat".to_string());
+    }
+
+    let mut hash = Fnv64::new();
+    hash.u64(resolved.session.ok_or("resolved session missing")?.raw());
+    hash.u64(resolved.window.ok_or("resolved window missing")?.raw());
+    hash.u64(pane.raw());
+    hash.usize(first.len());
+    hash.byte(state.clients[&client].key_table.raw() as u8);
+    Ok(CaseResult {
+        name: "command-target-binding",
+        fingerprint: hash.finish(),
+    })
+}
+
+fn command_effects_case() -> Result<CaseResult, String> {
+    let mut state = ServerState::new();
+    let client = state.add_client();
+    let work = state.create_session("work", COLS, ROWS);
+    let other = state.create_session("other", COLS, ROWS);
+    state
+        .attach_client(client, work.session)
+        .ok_or("effect case attach failed")?;
+
+    let send = execute_text(&mut state, client, "send-keys -l -N 2 xy")?
+        .pop()
+        .ok_or("send-keys outcome missing")?;
+    let sent = send
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            CommandEffect::PaneInput { pane, bytes } => Some((*pane, bytes.clone())),
+            _ => None,
+        })
+        .ok_or("send-keys pane effect missing")?;
+    if sent != (work.pane, b"xyxy".to_vec()) {
+        return Err("send-keys emitted unexpected bytes".to_string());
+    }
+
+    let confirmation = execute_text(&mut state, client, "confirm-before -p 'kill?' 'kill-pane'")?
+        .pop()
+        .ok_or("confirmation outcome missing")?
+        .effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            CommandEffect::Confirm {
+                client: effect_client,
+                prompt,
+                commands,
+            } if effect_client == client => Some(ConfirmationState { prompt, commands }),
+            _ => None,
+        })
+        .ok_or("confirmation effect missing")?;
+    let confirmation_fingerprint = hash_bytes(confirmation.prompt.as_bytes());
+    state.clients.get_mut(&client).unwrap().confirmation = Some(confirmation.clone());
+    let reject = KeyEvent::new(KeyCode::character('n', KeyModifiers::NONE), b"n".to_vec());
+    if route_key(&mut state, client, InputMode::Normal, reject, 20) != InputRoute::Consumed
+        || state.clients[&client].confirmation.is_some()
+    {
+        return Err("confirmation rejection changed state incorrectly".to_string());
+    }
+    state.clients.get_mut(&client).unwrap().confirmation = Some(confirmation);
+    let accept = KeyEvent::new(KeyCode::character('y', KeyModifiers::NONE), b"y".to_vec());
+    let accepted = match route_key(&mut state, client, InputMode::Normal, accept, 21) {
+        InputRoute::Commands(commands) => commands,
+        _ => return Err("confirmation acceptance did not route commands".to_string()),
+    };
+    if !matches!(accepted[0], Command::KillPane) {
+        return Err("confirmation accepted the wrong command".to_string());
+    }
+
+    let switched = execute_text(&mut state, client, "switch-client -n; refresh-client")?;
+    if state.clients[&client].attached_session != Some(other.session)
+        || !switched.iter().all(|outcome| {
+            outcome.effects.iter().any(
+                |effect| matches!(effect, CommandEffect::RefreshClient { client: refreshed } if *refreshed == client),
+            )
+        })
+    {
+        return Err("switch/refresh effects did not update the requesting client".to_string());
+    }
+
+    let mut hash = Fnv64::new();
+    hash.bytes(&sent.1);
+    hash.u64(confirmation_fingerprint);
+    hash.usize(accepted.len());
+    hash.u64(other.session.raw());
+    Ok(CaseResult {
+        name: "command-effects",
+        fingerprint: hash.finish(),
+    })
+}
+
 fn unicode_terminal_text_case() -> Result<CaseResult, String> {
     let fixture = "\u{3bb}> cafe\u{301} \u{2764}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} \u{1f1ec}\u{1f1e7} \u{754c}";
     let mut screen = Screen::new(48, 4);
@@ -588,7 +762,7 @@ mod tests {
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 11);
+        assert_eq!(report.cases.len(), 13);
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 
