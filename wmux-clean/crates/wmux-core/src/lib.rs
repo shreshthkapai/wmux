@@ -13,9 +13,9 @@ pub mod terminal;
 pub mod text;
 
 pub use command::{
-    execute, parse_command, parse_command_argv, parse_command_text, resolve_command_name, Command,
-    CommandCompletion, CommandEffect, CommandList, CommandOutcome, CommandParseError, CommandQueue,
-    CommandSource, QueuedCommand, SourcePosition, SourceSpan,
+    execute, parse_command, parse_command_argv, parse_command_text, quote_argument,
+    resolve_command_name, Command, CommandCompletion, CommandEffect, CommandList, CommandOutcome,
+    CommandParseError, CommandQueue, CommandSource, QueuedCommand, SourcePosition, SourceSpan,
 };
 pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
@@ -23,8 +23,8 @@ pub use grid::{Cell, Color, Grid, Line, Style};
 pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, WinlinkId};
 pub use keys::{
     route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
-    KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTables, MAX_KEY_NAME_BYTES,
-    MAX_KEY_TABLE_NAME_BYTES,
+    KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTableTarget, KeyTables,
+    MAX_KEY_NAME_BYTES, MAX_KEY_TABLE_NAME_BYTES,
 };
 pub use layout::{LayoutNode, Rect, ResizeDirection, SplitDirection};
 pub use render::{

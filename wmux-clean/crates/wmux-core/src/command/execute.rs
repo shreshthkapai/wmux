@@ -55,7 +55,10 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::ListClients
             | Command::ListSessions
             | Command::ListWindows { .. }
-            | Command::ListPanes { .. } => {}
+            | Command::ListPanes { .. }
+            | Command::BindKey { .. }
+            | Command::UnbindKey { .. }
+            | Command::ListKeys { .. } => {}
         }
     }
 

@@ -44,7 +44,10 @@ impl Error for CliError {}
 pub const HELP: &str = "Usage: wmux [--help|-h] [--version|-V] [command [arguments]]\n\
 \n\
 Commands:\n\
-  config path|show|effective\n";
+  bind-key|bind [-nr] [-T table] key command [arguments]\n\
+  config path|show|effective\n\
+  list-keys|lsk [-T table]\n\
+  unbind-key|unbind [-an] [-T table] [key]\n";
 
 pub fn version_line() -> String {
     format!("wmux {}", env!("CARGO_PKG_VERSION"))
@@ -187,5 +190,14 @@ mod tests {
         let list_sessions = server(&["ls"]);
         assert_eq!(list_sessions.argv, args(&["list-sessions"]));
         assert!(!list_sessions.attached);
+
+        let bind = server(&["bind", "q", "list-sessions"]);
+        assert_eq!(bind.argv, args(&["bind-key", "q", "list-sessions"]));
+
+        let list_keys = server(&["lsk"]);
+        assert_eq!(list_keys.argv, args(&["list-keys"]));
+
+        let unbind = server(&["unbind", "q"]);
+        assert_eq!(unbind.argv, args(&["unbind-key", "q"]));
     }
 }

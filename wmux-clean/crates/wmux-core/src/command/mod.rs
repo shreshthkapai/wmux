@@ -5,8 +5,9 @@ use std::{
 };
 
 use crate::{
-    ClientId, PaneId, ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId,
-    SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
+    ClientId, KeyBinding, KeyCode, KeyTableTarget, PaneId, ResizeDirection, ResolveContext,
+    ResolvedTarget, ServerState, SessionId, SplitDirection, TargetError, TargetKind,
+    TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -15,7 +16,9 @@ mod parser;
 
 pub use execute::execute;
 pub use lexer::{CommandParseError, SourcePosition, SourceSpan};
-pub use parser::{parse_command, parse_command_argv, parse_command_text, MAX_COMMANDS};
+pub use parser::{
+    parse_command, parse_command_argv, parse_command_text, quote_argument, MAX_COMMANDS,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandList(Arc<[Command]>);
@@ -105,6 +108,20 @@ pub enum Command {
     },
     CopyMode,
     DetachClient,
+    BindKey {
+        table: KeyTableTarget,
+        key: KeyCode,
+        repeatable: bool,
+        commands: CommandList,
+    },
+    UnbindKey {
+        table: KeyTableTarget,
+        key: Option<KeyCode>,
+        all: bool,
+    },
+    ListKeys {
+        table: Option<KeyTableTarget>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,6 +375,64 @@ pub(super) fn execute_state_command(
     queued: QueuedCommand,
 ) -> CommandResult {
     match queued.command {
+        Command::BindKey {
+            table,
+            key,
+            repeatable,
+            commands,
+        } => {
+            let table = match state.key_tables.ensure_named(table.as_str()) {
+                Ok(table) => table,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            state
+                .key_tables
+                .table_mut(table)
+                .expect("ensured key table exists")
+                .bind(KeyBinding {
+                    key,
+                    repeatable,
+                    commands,
+                });
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: None,
+            }
+        }
+        Command::UnbindKey { table, key, all } => {
+            let Some(table) = state.key_tables.named(table.as_str()) else {
+                return error_result(
+                    queued.sequence,
+                    format!("unknown key table: {}", table.as_str()),
+                );
+            };
+            let table = state
+                .key_tables
+                .table_mut(table)
+                .expect("named key table exists");
+            if all {
+                table.clear();
+            } else if let Some(key) = key {
+                table.unbind(key);
+            }
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: None,
+            }
+        }
+        Command::ListKeys { table } => match list_key_bindings(state, table.as_ref()) {
+            Ok(message) => CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message,
+                attached_pane: None,
+            },
+            Err(error) => error_result(queued.sequence, error),
+        },
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
             sequence: queued.sequence,
             ok: true,
@@ -765,6 +840,45 @@ fn attach_result(
     }
 }
 
+fn list_key_bindings(
+    state: &ServerState,
+    selected: Option<&KeyTableTarget>,
+) -> Result<String, String> {
+    let selected = selected
+        .map(|table| {
+            state
+                .key_tables
+                .named(table.as_str())
+                .ok_or_else(|| format!("unknown key table: {}", table.as_str()))
+        })
+        .transpose()?;
+    let mut lines = Vec::new();
+    for table in state.key_tables.tables() {
+        if selected.is_some_and(|selected| selected != table.name()) {
+            continue;
+        }
+        let name = state
+            .key_tables
+            .name(table.name())
+            .expect("every key table has a name");
+        for binding in table.bindings() {
+            let nested = format_command_list(&binding.commands);
+            let nested = if binding.commands.len() == 1 {
+                nested
+            } else {
+                parser::quote_argument(&nested)
+            };
+            lines.push(format!(
+                "bind-key{} -T {} {} {nested}",
+                if binding.repeatable { " -r" } else { "" },
+                parser::quote_argument(name),
+                parser::quote_argument(&binding.key.to_string()),
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 fn resolve_command_target(
     state: &ServerState,
     client: ClientId,
@@ -798,6 +912,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "attach-session",
         alias: Some("attach"),
+    },
+    CommandEntry {
+        name: "bind-key",
+        alias: Some("bind"),
     },
     CommandEntry {
         name: "copy-mode",
@@ -834,6 +952,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "list-clients",
         alias: Some("lsc"),
+    },
+    CommandEntry {
+        name: "list-keys",
+        alias: Some("lsk"),
     },
     CommandEntry {
         name: "list-panes",
@@ -895,6 +1017,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         name: "swap-pane",
         alias: Some("swapp"),
     },
+    CommandEntry {
+        name: "unbind-key",
+        alias: Some("unbind"),
+    },
 ];
 
 pub fn resolve_command_name(name: &str) -> Result<&'static str, CommandParseError> {
@@ -921,13 +1047,19 @@ pub fn resolve_command_name(name: &str) -> Result<&'static str, CommandParseErro
     }
 }
 
-pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandParseError> {
+pub(super) fn parse_single_command(
+    argv: &[String],
+    depth: usize,
+) -> Result<Command, CommandParseError> {
     let Some(requested_command) = argv.first().map(String::as_str) else {
         return Err(CommandParseError::new("empty command"));
     };
     let command = resolve_command_name(requested_command)?;
 
     match command {
+        "bind-key" => parse_bind_key(argv, depth),
+        "unbind-key" => parse_unbind_key(argv),
+        "list-keys" => parse_list_keys(argv),
         "start-server" => {
             validate_arguments(argv, &[], &[], 0)?;
             Ok(Command::StartServer)
@@ -1075,6 +1207,338 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
     }
 }
 
+fn parse_bind_key(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut repeatable = false;
+    let mut root = false;
+    let mut table = None;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-r" => repeatable = true,
+            "-n" => root = true,
+            "-T" => {
+                if table.is_some() {
+                    return Err(CommandParseError::new("duplicate -T option"));
+                }
+                let name = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -T"))?;
+                table = Some(KeyTableTarget::parse(name.clone()).map_err(key_parse_error)?);
+                index += 1;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    if root && table.is_some() {
+        return Err(CommandParseError::new("-n and -T are mutually exclusive"));
+    }
+    let key = argv
+        .get(index)
+        .ok_or_else(|| CommandParseError::new("bind-key requires a key"))?;
+    let key = KeyCode::parse(key).map_err(key_parse_error)?;
+    let nested = argv
+        .get(index + 1..)
+        .filter(|nested| !nested.is_empty())
+        .ok_or_else(|| CommandParseError::new("bind-key requires a command"))?;
+    let commands = parser::parse_nested_command(nested, depth)?;
+    Ok(Command::BindKey {
+        table: table.unwrap_or_else(|| {
+            if root {
+                KeyTableTarget::root()
+            } else {
+                KeyTableTarget::prefix()
+            }
+        }),
+        key,
+        repeatable,
+        commands,
+    })
+}
+
+fn parse_unbind_key(argv: &[String]) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut all = false;
+    let mut root = false;
+    let mut table = None;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-a" => all = true,
+            "-n" => root = true,
+            "-T" => {
+                if table.is_some() {
+                    return Err(CommandParseError::new("duplicate -T option"));
+                }
+                let name = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -T"))?;
+                table = Some(KeyTableTarget::parse(name.clone()).map_err(key_parse_error)?);
+                index += 1;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    if root && table.is_some() {
+        return Err(CommandParseError::new("-n and -T are mutually exclusive"));
+    }
+    let remaining = &argv[index..];
+    if remaining.len() > 1 {
+        return Err(CommandParseError::new("unbind-key accepts at most one key"));
+    }
+    if all && !remaining.is_empty() {
+        return Err(CommandParseError::new(
+            "unbind-key -a does not accept a key",
+        ));
+    }
+    if !all && remaining.is_empty() {
+        return Err(CommandParseError::new("unbind-key requires a key or -a"));
+    }
+    let key = remaining
+        .first()
+        .map(|key| KeyCode::parse(key).map_err(key_parse_error))
+        .transpose()?;
+    Ok(Command::UnbindKey {
+        table: table.unwrap_or_else(|| {
+            if root {
+                KeyTableTarget::root()
+            } else {
+                KeyTableTarget::prefix()
+            }
+        }),
+        key,
+        all,
+    })
+}
+
+fn parse_list_keys(argv: &[String]) -> Result<Command, CommandParseError> {
+    match argv {
+        [_] => Ok(Command::ListKeys { table: None }),
+        [_, option, name] if option == "-T" => Ok(Command::ListKeys {
+            table: Some(KeyTableTarget::parse(name.clone()).map_err(key_parse_error)?),
+        }),
+        [_, option, ..] if option.starts_with('-') && option != "-T" => {
+            Err(CommandParseError::new(format!("unknown option: {option}")))
+        }
+        [_, option] if option == "-T" => Err(CommandParseError::new("missing argument for -T")),
+        _ => Err(CommandParseError::new("invalid list-keys arguments")),
+    }
+}
+
+fn key_parse_error(error: impl std::fmt::Display) -> CommandParseError {
+    CommandParseError::new(error.to_string())
+}
+
+fn format_command_list(commands: &CommandList) -> String {
+    commands
+        .iter()
+        .map(format_command)
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+fn format_command(command: &Command) -> String {
+    use parser::quote_argument;
+
+    let mut arguments = Vec::new();
+    let name = match command {
+        Command::StartServer => "start-server",
+        Command::KillServer => "kill-server",
+        Command::ListClients => "list-clients",
+        Command::ListSessions => "list-sessions",
+        Command::ListWindows { target } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "list-windows"
+        }
+        Command::ListPanes { target } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "list-panes"
+        }
+        Command::NewSession {
+            name,
+            group,
+            attach,
+            attach_if_exists,
+            ..
+        } => {
+            if !attach {
+                arguments.push("-d".to_string());
+            }
+            if *attach_if_exists {
+                arguments.push("-A".to_string());
+            }
+            if let Some(name) = name {
+                arguments.extend(["-s".to_string(), name.clone()]);
+            }
+            if let Some(group) = group {
+                arguments.extend(["-t".to_string(), group.to_string()]);
+            }
+            "new-session"
+        }
+        Command::NewWindow { name } => {
+            if let Some(name) = name {
+                arguments.extend(["-n".to_string(), name.clone()]);
+            }
+            "new-window"
+        }
+        Command::SplitWindow {
+            direction,
+            detached,
+        } => {
+            if matches!(direction, SplitDirection::LeftRight) {
+                arguments.push("-h".to_string());
+            }
+            if *detached {
+                arguments.push("-d".to_string());
+            }
+            "split-window"
+        }
+        Command::SelectWindow { target } => {
+            arguments.extend(["-t".to_string(), target.to_string()]);
+            "select-window"
+        }
+        Command::SelectPane { target } => {
+            match target {
+                PaneTarget::Target(target) => {
+                    arguments.extend(["-t".to_string(), target.to_string()]);
+                }
+                PaneTarget::Direction(direction) => arguments.push(
+                    match direction {
+                        ResizeDirection::Left => "-L",
+                        ResizeDirection::Right => "-R",
+                        ResizeDirection::Up => "-U",
+                        ResizeDirection::Down => "-D",
+                    }
+                    .to_string(),
+                ),
+            }
+            "select-pane"
+        }
+        Command::ResizePane { target, amount } => {
+            arguments.push(
+                match target {
+                    ResizeTarget::Zoom => "-Z",
+                    ResizeTarget::Direction(ResizeDirection::Left) => "-L",
+                    ResizeTarget::Direction(ResizeDirection::Right) => "-R",
+                    ResizeTarget::Direction(ResizeDirection::Up) => "-U",
+                    ResizeTarget::Direction(ResizeDirection::Down) => "-D",
+                }
+                .to_string(),
+            );
+            if !matches!(target, ResizeTarget::Zoom) {
+                arguments.push(amount.to_string());
+            }
+            "resize-pane"
+        }
+        Command::RenameWindow { name } => {
+            arguments.push(name.clone());
+            "rename-window"
+        }
+        Command::RotateWindow { reverse } => {
+            if *reverse {
+                arguments.push("-D".to_string());
+            }
+            "rotate-window"
+        }
+        Command::SwapPane { direction } => {
+            arguments.push(
+                match direction {
+                    ResizeDirection::Left => "-L",
+                    ResizeDirection::Right => "-R",
+                    ResizeDirection::Up => "-U",
+                    ResizeDirection::Down => "-D",
+                }
+                .to_string(),
+            );
+            "swap-pane"
+        }
+        Command::KillPane => "kill-pane",
+        Command::KillWindow => "kill-window",
+        Command::KillSession { target } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "kill-session"
+        }
+        Command::AttachSession { target } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "attach-session"
+        }
+        Command::CopyMode => "copy-mode",
+        Command::DetachClient => "detach-client",
+        Command::BindKey {
+            table,
+            key,
+            repeatable,
+            commands,
+        } => {
+            if *repeatable {
+                arguments.push("-r".to_string());
+            }
+            arguments.extend([
+                "-T".to_string(),
+                table.as_str().to_string(),
+                key.to_string(),
+            ]);
+            let nested = format_command_list(commands);
+            let nested = if commands.len() == 1 {
+                nested
+            } else {
+                quote_argument(&nested)
+            };
+            return format!(
+                "bind-key {} {nested}",
+                arguments
+                    .iter()
+                    .map(|argument| quote_argument(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Command::UnbindKey { table, key, all } => {
+            if *all {
+                arguments.push("-a".to_string());
+            }
+            arguments.extend(["-T".to_string(), table.as_str().to_string()]);
+            if let Some(key) = key {
+                arguments.push(key.to_string());
+            }
+            "unbind-key"
+        }
+        Command::ListKeys { table } => {
+            if let Some(table) = table {
+                arguments.extend(["-T".to_string(), table.as_str().to_string()]);
+            }
+            "list-keys"
+        }
+    };
+
+    if arguments.is_empty() {
+        name.to_string()
+    } else {
+        format!(
+            "{name} {}",
+            arguments
+                .iter()
+                .map(|argument| quote_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
+
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
     argv.windows(2)
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
@@ -1150,7 +1614,7 @@ mod tests {
         CommandSource,
     };
     use crate::{
-        build_window_scene, render_full_scene, RenderState, ServerState, SplitDirection,
+        build_window_scene, render_full_scene, KeyCode, RenderState, ServerState, SplitDirection,
         TargetResolver, TargetSpec,
     };
 
@@ -1167,6 +1631,134 @@ mod tests {
             CommandEffect::EnsurePane { pane } => Some(*pane),
             _ => None,
         })
+    }
+
+    fn execute_text(
+        state: &mut ServerState,
+        client: crate::ClientId,
+        raw: &str,
+    ) -> Result<String, String> {
+        let commands = parse_command_text(raw).map_err(|error| error.to_string())?;
+        let mut output = String::new();
+        for (index, command) in commands.iter().cloned().enumerate() {
+            let outcome = execute(
+                state,
+                super::QueuedCommand {
+                    invocation: 1,
+                    sequence: index as u64 + 1,
+                    client,
+                    command,
+                    source: CommandSource::ClientRequest,
+                    final_in_list: index + 1 == commands.len(),
+                },
+            );
+            if !outcome.ok {
+                return Err(outcome.message);
+            }
+            if !outcome.message.is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&outcome.message);
+            }
+        }
+        Ok(output)
+    }
+
+    #[test]
+    fn bind_unbind_and_list_keys_use_parsed_command_lists() {
+        let bind = parse_command_text("bind-key -r -T prefix C-j 'select-pane -D'").unwrap();
+        assert!(matches!(
+            &bind[0],
+            Command::BindKey {
+                table,
+                key,
+                repeatable: true,
+                commands,
+            } if table.as_str() == "prefix" && *key == KeyCode::ctrl('j') && commands.len() == 1
+        ));
+
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        execute_text(
+            &mut state,
+            client,
+            "bind-key -r -T prefix C-j 'select-pane -D'",
+        )
+        .unwrap();
+        let listed = execute_text(&mut state, client, "list-keys -T prefix").unwrap();
+        assert!(listed.contains("bind-key -r -T prefix C-j select-pane -D"));
+        execute_text(&mut state, client, "unbind-key -T prefix C-j").unwrap();
+        assert!(!execute_text(&mut state, client, "list-keys -T prefix")
+            .unwrap()
+            .contains("C-j"));
+    }
+
+    #[test]
+    fn bind_alias_defaults_tables_replaces_and_lists_parseably() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        for command in [
+            "bind q list-sessions",
+            "bind-key -n C-a list-clients",
+            "bind-key -T copy-mode x list-windows",
+            "bind-key -T custom F2 'rename-window \"two words\"'",
+            "bind-key -T custom F3 'list-sessions; list-clients'",
+            "bind q list-panes",
+        ] {
+            execute_text(&mut state, client, command).unwrap();
+        }
+
+        let prefix = execute_text(&mut state, client, "list-keys -T prefix").unwrap();
+        assert_eq!(prefix.matches(" -T prefix q ").count(), 1);
+        assert!(prefix.contains(" -T prefix q list-panes"));
+        assert!(execute_text(&mut state, client, "list-keys -T root")
+            .unwrap()
+            .contains(" -T root C-a list-clients"));
+        assert!(execute_text(&mut state, client, "list-keys -T copy-mode")
+            .unwrap()
+            .contains(" -T copy-mode x list-windows"));
+
+        let all = execute_text(&mut state, client, "list-keys").unwrap();
+        for line in all.lines() {
+            let parsed = parse_command_text(line).unwrap();
+            if line.contains(" -T custom F3 ") {
+                assert!(matches!(
+                    &parsed[0],
+                    Command::BindKey { commands, .. } if commands.len() == 2
+                ));
+            }
+        }
+        let table_positions = [" -T root ", " -T prefix ", " -T copy-mode ", " -T custom "]
+            .map(|table| all.find(table).unwrap());
+        assert!(table_positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn unbind_all_is_table_scoped_and_binding_errors_are_bounded() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        execute_text(&mut state, client, "bind-key -n q list-sessions").unwrap();
+        execute_text(&mut state, client, "unbind -a").unwrap();
+
+        assert!(execute_text(&mut state, client, "list-keys -T prefix")
+            .unwrap()
+            .is_empty());
+        assert!(execute_text(&mut state, client, "list-keys -T root")
+            .unwrap()
+            .contains(" -T root q list-sessions"));
+
+        for invalid in [
+            "bind-key -n -T prefix q list-sessions",
+            "bind-key NotAKey list-sessions",
+            "bind-key q",
+            "unbind-key",
+            "unbind-key -a q",
+            "unbind-key -n -T prefix q",
+            "list-keys -T ''",
+        ] {
+            assert!(parse_command_text(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

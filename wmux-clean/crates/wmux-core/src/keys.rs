@@ -340,6 +340,29 @@ impl KeyTableName {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KeyTableTarget(String);
+
+impl KeyTableTarget {
+    pub fn parse(name: impl Into<String>) -> Result<Self, KeyParseError> {
+        let name = name.into();
+        validate_table_name(&name)?;
+        Ok(Self(name))
+    }
+
+    pub fn prefix() -> Self {
+        Self("prefix".to_string())
+    }
+
+    pub fn root() -> Self {
+        Self("root".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyBinding {
     pub key: KeyCode,
@@ -432,14 +455,7 @@ impl KeyTables {
         if let Some(table) = self.named(name) {
             return Ok(table);
         }
-        if name.is_empty() || name.contains('\0') {
-            return Err(KeyParseError::new("invalid key table name"));
-        }
-        if name.len() > MAX_KEY_TABLE_NAME_BYTES {
-            return Err(KeyParseError::new(format!(
-                "key table name exceeds {MAX_KEY_TABLE_NAME_BYTES} bytes"
-            )));
-        }
+        validate_table_name(name)?;
         if self.tables.len() == MAX_KEY_TABLES {
             return Err(KeyParseError::new("too many key tables"));
         }
@@ -449,6 +465,16 @@ impl KeyTables {
         Ok(id)
     }
 
+    pub fn tables(&self) -> impl Iterator<Item = &KeyTable> {
+        self.tables.iter()
+    }
+
+    pub fn name(&self, table: KeyTableName) -> Option<&str> {
+        self.names
+            .iter()
+            .find_map(|(name, id)| (*id == table).then_some(name.as_str()))
+    }
+
     pub const fn prefix(&self) -> KeyCode {
         self.prefix
     }
@@ -456,6 +482,18 @@ impl KeyTables {
     pub const fn repeat_time_ms(&self) -> u64 {
         self.repeat_time_ms
     }
+}
+
+fn validate_table_name(name: &str) -> Result<(), KeyParseError> {
+    if name.is_empty() || name.contains('\0') {
+        return Err(KeyParseError::new("invalid key table name"));
+    }
+    if name.len() > MAX_KEY_TABLE_NAME_BYTES {
+        return Err(KeyParseError::new(format!(
+            "key table name exceeds {MAX_KEY_TABLE_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn build_tmux_defaults() -> KeyTables {
@@ -653,7 +691,7 @@ mod tests {
 
     use super::{
         route_key, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
-        KeyModifiers, KeyTable, KeyTableName, KeyTables, MAX_KEY_NAME_BYTES,
+        KeyModifiers, KeyTable, KeyTableName, KeyTableTarget, KeyTables, MAX_KEY_NAME_BYTES,
         MAX_KEY_TABLE_NAME_BYTES,
     };
     use crate::{parse_command_text, ClientInput, ServerState};
@@ -739,6 +777,19 @@ mod tests {
         assert!(tables
             .ensure_named(&"x".repeat(MAX_KEY_TABLE_NAME_BYTES + 1))
             .is_err());
+    }
+
+    #[test]
+    fn binding_table_targets_are_bounded_without_changing_compact_runtime_ids() {
+        assert_eq!(KeyTableTarget::parse("prefix").unwrap().as_str(), "prefix");
+        assert!(KeyTableTarget::parse("").is_err());
+        assert!(KeyTableTarget::parse("x".repeat(MAX_KEY_TABLE_NAME_BYTES + 1)).is_err());
+
+        let mut tables = KeyTables::tmux_defaults();
+        let custom = tables.ensure_named("custom").unwrap();
+        assert_eq!(tables.name(custom), Some("custom"));
+        assert_eq!(tables.tables().last().unwrap().name(), custom);
+        assert_eq!(size_of::<KeyTableName>(), 2);
     }
 
     #[test]

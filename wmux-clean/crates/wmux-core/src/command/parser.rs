@@ -4,12 +4,23 @@ use super::{
 };
 
 pub const MAX_COMMANDS: usize = 256;
+pub const MAX_NESTED_COMMAND_DEPTH: usize = 32;
 
 pub fn parse_command_text(input: &str) -> Result<CommandList, CommandParseError> {
-    parse_tokens(lex(input)?)
+    parse_command_text_at(input, 0)
 }
 
 pub fn parse_command_argv(argv: &[String]) -> Result<CommandList, CommandParseError> {
+    parse_command_argv_at(argv, 0)
+}
+
+fn parse_command_text_at(input: &str, depth: usize) -> Result<CommandList, CommandParseError> {
+    check_depth(depth)?;
+    parse_tokens(lex(input)?, depth)
+}
+
+fn parse_command_argv_at(argv: &[String], depth: usize) -> Result<CommandList, CommandParseError> {
+    check_depth(depth)?;
     let mut offset = 0;
     let tokens = argv
         .iter()
@@ -32,7 +43,7 @@ pub fn parse_command_argv(argv: &[String]) -> Result<CommandList, CommandParseEr
             }
         })
         .collect();
-    parse_tokens(tokens)
+    parse_tokens(tokens, depth)
 }
 
 pub fn parse_command(argv: &[String]) -> Result<Command, CommandParseError> {
@@ -43,7 +54,56 @@ pub fn parse_command(argv: &[String]) -> Result<Command, CommandParseError> {
     Ok(list[0].clone())
 }
 
-fn parse_tokens(tokens: Vec<Token>) -> Result<CommandList, CommandParseError> {
+pub(super) fn parse_nested_command(
+    argv: &[String],
+    depth: usize,
+) -> Result<CommandList, CommandParseError> {
+    let nested = depth + 1;
+    if argv.len() == 1 {
+        parse_command_text_at(&argv[0], nested)
+    } else {
+        parse_command_argv_at(argv, nested)
+    }
+}
+
+pub fn quote_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| !character.is_whitespace() && !";#'\"\\".contains(character))
+    {
+        return argument.to_string();
+    }
+
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    for character in argument.chars() {
+        match character {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn check_depth(depth: usize) -> Result<(), CommandParseError> {
+    if depth > MAX_NESTED_COMMAND_DEPTH {
+        Err(CommandParseError::new(
+            "nested command depth exceeds 32 levels",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_tokens(tokens: Vec<Token>, depth: usize) -> Result<CommandList, CommandParseError> {
     if tokens.is_empty() {
         return Err(CommandParseError::new("empty command"));
     }
@@ -62,11 +122,11 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<CommandList, CommandParseError> {
                 if words.is_empty() {
                     return Err(CommandParseError::at("empty command", token.span));
                 }
-                finish_command(&mut parsed, &mut words, &mut command_span)?;
+                finish_command(&mut parsed, &mut words, &mut command_span, depth)?;
             }
         }
     }
-    finish_command(&mut parsed, &mut words, &mut command_span)?;
+    finish_command(&mut parsed, &mut words, &mut command_span, depth)?;
     CommandList::new(parsed)
 }
 
@@ -74,6 +134,7 @@ fn finish_command(
     parsed: &mut Vec<super::Command>,
     words: &mut Vec<String>,
     span: &mut Option<SourceSpan>,
+    depth: usize,
 ) -> Result<(), CommandParseError> {
     if words.is_empty() {
         return Ok(());
@@ -85,7 +146,8 @@ fn finish_command(
         ));
     }
     let command_span = span.take().expect("nonempty command has a span");
-    let command = parse_single_command(words).map_err(|error| error.with_span(command_span))?;
+    let command =
+        parse_single_command(words, depth).map_err(|error| error.with_span(command_span))?;
     parsed.push(command);
     words.clear();
     Ok(())
@@ -93,7 +155,10 @@ fn finish_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command_argv, parse_command_text, MAX_COMMANDS};
+    use super::{
+        parse_command_argv, parse_command_text, quote_argument, MAX_COMMANDS,
+        MAX_NESTED_COMMAND_DEPTH,
+    };
     use crate::Command;
 
     #[test]
@@ -141,6 +206,33 @@ mod tests {
         assert_eq!(
             parse_command_text(&rejected).unwrap_err().message,
             "command list exceeds 256 commands"
+        );
+    }
+
+    #[test]
+    fn quoted_arguments_roundtrip_and_nested_command_depth_is_bounded() {
+        for argument in [
+            "",
+            "plain",
+            "two words",
+            "semi;colon",
+            "#hash",
+            "a\\b\"c",
+            "λ",
+        ] {
+            let parsed =
+                parse_command_text(&format!("rename-window {}", quote_argument(argument))).unwrap();
+            assert!(matches!(&parsed[0], Command::RenameWindow { name } if name == argument));
+        }
+
+        let mut argv = Vec::new();
+        for _ in 0..=MAX_NESTED_COMMAND_DEPTH {
+            argv.extend(["bind-key".to_string(), "x".to_string()]);
+        }
+        argv.push("list-sessions".to_string());
+        assert_eq!(
+            parse_command_argv(&argv).unwrap_err().message,
+            "nested command depth exceeds 32 levels"
         );
     }
 }
