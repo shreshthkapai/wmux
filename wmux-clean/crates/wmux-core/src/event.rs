@@ -4,7 +4,6 @@ use wmux_platform::MouseEvent;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientInput {
     Bytes(Vec<u8>),
-    Key(KeyEvent),
     Paste(Vec<u8>),
 }
 
@@ -15,7 +14,6 @@ impl ClientInput {
     pub fn into_pty_bytes(self, bracketed_paste: bool) -> Vec<u8> {
         match self {
             Self::Bytes(bytes) => bytes,
-            Self::Key(event) => event.raw,
             Self::Paste(bytes) if bracketed_paste => {
                 let mut payload = Vec::with_capacity(bytes.len() + 12);
                 payload.extend_from_slice(b"\x1b[200~");
@@ -46,6 +44,10 @@ pub enum ServerEvent {
         client: ClientId,
         input: ClientInput,
     },
+    ClientKey {
+        client: ClientId,
+        event: KeyEvent,
+    },
     ClientMouse {
         client: ClientId,
         event: MouseEvent,
@@ -73,6 +75,7 @@ impl ServerEvent {
             Self::PtyOutput { .. } => "pty-output",
             Self::PtyExited { .. } => "pty-exited",
             Self::ClientInput { .. } => "client-input",
+            Self::ClientKey { .. } => "client-key",
             Self::ClientMouse { .. } => "client-mouse",
             Self::ClientResize { .. } => "client-resize",
             Self::ClientWritable { .. } => "client-writable",
@@ -107,6 +110,10 @@ mod tests {
                 client: ClientId::new(2),
                 input: ClientInput::Bytes(b"input".to_vec()),
             },
+            ServerEvent::ClientKey {
+                client: ClientId::new(2),
+                event: KeyEvent::new(KeyCode::escape(), vec![0x1b]),
+            },
             ServerEvent::ClientMouse {
                 client: ClientId::new(2),
                 event: MouseEvent {
@@ -140,6 +147,7 @@ mod tests {
                 "pty-output",
                 "pty-exited",
                 "client-input",
+                "client-key",
                 "client-mouse",
                 "client-resize",
                 "client-writable",
@@ -150,14 +158,10 @@ mod tests {
     }
 
     #[test]
-    fn pane_input_translation_preserves_keys_and_applies_bracketed_paste() {
+    fn pane_input_translation_preserves_raw_bytes_and_applies_bracketed_paste() {
         assert_eq!(
             ClientInput::Bytes(b"\x1b[A".to_vec()).into_pty_bytes(true),
             b"\x1b[A"
-        );
-        assert_eq!(
-            ClientInput::Key(KeyEvent::new(KeyCode::escape(), vec![0x1b])).into_pty_bytes(true),
-            b"\x1b"
         );
         assert_eq!(
             ClientInput::Paste(b"abc".to_vec()).into_pty_bytes(false),

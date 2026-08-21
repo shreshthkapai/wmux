@@ -1,8 +1,9 @@
 use std::{fmt::Write as _, io::Cursor};
 
 use wmux_core::{
-    build_window_scene, render_full_scene, ClientInput, Color, RenderState, Screen, ServerState,
-    Style, TerminalEngine,
+    build_window_scene, render_full_scene, route_key, ClientInput, Color, Command, CommandQueue,
+    CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, KeyTableName,
+    RenderState, Screen, ServerState, Style, TerminalEngine,
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 use wmux_protocol::{
@@ -11,7 +12,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xe393_9713_9974_294a;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x0891_e689_383d_d436;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -33,6 +34,7 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         resize_reflow_case(),
         malformed_input_case()?,
         key_and_paste_case(),
+        semantic_key_routing_case()?,
         mouse_routing_case(),
         unicode_terminal_text_case()?,
         terminal_modes_and_title_case()?,
@@ -259,6 +261,110 @@ fn key_and_paste_case() -> CaseResult {
     }
 }
 
+fn semantic_key_routing_case() -> Result<CaseResult, String> {
+    let mut state = ServerState::new();
+    let first = state.add_client();
+    let second = state.add_client();
+    let prefix = || KeyEvent::new(KeyCode::ctrl('b'), vec![0x02]);
+
+    if route_key(&mut state, first, InputMode::Normal, prefix(), 0) != InputRoute::Consumed {
+        return Err("prefix key was not consumed".to_string());
+    }
+    if state.clients[&second].key_table != KeyTableName::ROOT {
+        return Err("one client's prefix changed another client".to_string());
+    }
+    let second_passthrough = match route_key(
+        &mut state,
+        second,
+        InputMode::Normal,
+        KeyEvent::new(KeyCode::character('c', KeyModifiers::NONE), b"c".to_vec()),
+        1,
+    ) {
+        InputRoute::PaneBytes(bytes) => bytes,
+        _ => return Err("unprefixed key did not pass through".to_string()),
+    };
+    let first_commands = match route_key(
+        &mut state,
+        first,
+        InputMode::Normal,
+        KeyEvent::new(KeyCode::character('c', KeyModifiers::NONE), b"c".to_vec()),
+        2,
+    ) {
+        InputRoute::Commands(commands) => commands,
+        _ => return Err("prefixed key did not resolve its binding".to_string()),
+    };
+
+    if route_key(&mut state, second, InputMode::Normal, prefix(), 3) != InputRoute::Consumed {
+        return Err("second prefix key was not consumed".to_string());
+    }
+    let second_commands = match route_key(
+        &mut state,
+        second,
+        InputMode::Normal,
+        KeyEvent::new(KeyCode::character('n', KeyModifiers::NONE), b"n".to_vec()),
+        4,
+    ) {
+        InputRoute::Commands(commands) => commands,
+        _ => return Err("second binding did not resolve".to_string()),
+    };
+
+    let unicode = match route_key(
+        &mut state,
+        first,
+        InputMode::Normal,
+        KeyEvent::new(
+            KeyCode::character('λ', KeyModifiers::NONE),
+            "λ".as_bytes().to_vec(),
+        ),
+        5,
+    ) {
+        InputRoute::PaneBytes(bytes) => bytes,
+        _ => return Err("unbound Unicode key did not pass through".to_string()),
+    };
+    let paste = ClientInput::Paste(b"paste".to_vec()).into_pty_bytes(true);
+
+    let mut queue = CommandQueue::default();
+    queue
+        .push_list(first, first_commands, CommandSource::KeyBinding)
+        .map_err(|error| error.to_string())?;
+    queue
+        .push_list(second, second_commands, CommandSource::KeyBinding)
+        .map_err(|error| error.to_string())?;
+    let first_queued = queue.pop().ok_or("first binding was not queued")?;
+    if first_queued.client != first || !matches!(first_queued.command, Command::NewWindow { .. }) {
+        return Err("first binding queue order changed".to_string());
+    }
+    let first_sequence = first_queued.sequence;
+    let first_completion = queue
+        .finish(first_queued, Ok(String::new()))
+        .ok_or("first binding did not complete")?;
+    if first_completion.requires_reply() {
+        return Err("binding completion unexpectedly requires a reply".to_string());
+    }
+    let second_queued = queue.pop().ok_or("second binding was not queued")?;
+    if second_queued.client != second
+        || !matches!(second_queued.command, Command::SelectWindow { .. })
+        || second_queued.sequence <= first_sequence
+    {
+        return Err("second binding queue order changed".to_string());
+    }
+    let second_sequence = second_queued.sequence;
+    let _ = queue.finish(second_queued, Ok(String::new()));
+
+    let mut hash = Fnv64::new();
+    hash.bytes(&second_passthrough);
+    hash.bytes(&unicode);
+    hash.bytes(&paste);
+    hash.u64(first_sequence);
+    hash.u64(second_sequence);
+    hash.byte(state.clients[&first].key_table.raw() as u8);
+    hash.byte(state.clients[&second].key_table.raw() as u8);
+    Ok(CaseResult {
+        name: "semantic-key-routing",
+        fingerprint: hash.finish(),
+    })
+}
+
 fn unicode_terminal_text_case() -> Result<CaseResult, String> {
     let fixture = "\u{3bb}> cafe\u{301} \u{2764}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} \u{1f1ec}\u{1f1e7} \u{754c}";
     let mut screen = Screen::new(48, 4);
@@ -482,7 +588,7 @@ mod tests {
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 10);
+        assert_eq!(report.cases.len(), 11);
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 

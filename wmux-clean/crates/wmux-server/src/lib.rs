@@ -24,9 +24,10 @@ use tokio::{
 use wmux_config::{config_path, WmuxConfig};
 use wmux_core::{
     build_window_scene_with_viewports, build_window_structure, execute, parse_command_text,
-    render_damage_from_structure, render_diff_scene_with_capabilities, ClientId, ClientInput,
-    Command, CommandEffect, CommandList, CommandQueue, CommandSource, CopyMode, CopyModeResult,
-    Line, PaneId, PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
+    render_damage_from_structure, render_diff_scene_with_capabilities, route_key, BareKey,
+    ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue, CommandSource,
+    CopyMode, CopyModeResult, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
+    PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
     RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
 };
 use wmux_platform::{
@@ -34,7 +35,7 @@ use wmux_platform::{
 };
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
-    FRAME_HEADER_LEN, MAX_FRAME, VERSION,
+    WireKeyCode, WireKeyEvent, FRAME_HEADER_LEN, MAX_FRAME, VERSION,
 };
 use wmux_windows::{
     conpty::{spawn_shell, ConptyPane, PlatformEventReceiver, PlatformNotifier},
@@ -373,9 +374,9 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
             client,
             input: ClientInput::Bytes(bytes),
         },
-        Message::Key(event) => ServerEvent::ClientInput {
-            client,
-            input: ClientInput::Bytes(event.raw),
+        Message::Key(event) => match core_key_event(event) {
+            Ok(event) => ServerEvent::ClientKey { client, event },
+            Err(message) => return Some(OwnerMessage::InvalidCommand { client, message }),
         },
         Message::Paste(bytes) => ServerEvent::ClientInput {
             client,
@@ -458,6 +459,32 @@ fn parse_command_line(raw: &str) -> io::Result<CommandList> {
     parse_command_text(raw).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
+fn core_key_event(event: WireKeyEvent) -> Result<KeyEvent, String> {
+    let modifiers = KeyModifiers::from_bits(event.modifiers.bits())
+        .ok_or_else(|| "wire key contains unsupported modifiers".to_string())?;
+    let bare = match event.code {
+        WireKeyCode::Char(character) => BareKey::Char(character),
+        WireKeyCode::Left => BareKey::Left,
+        WireKeyCode::Right => BareKey::Right,
+        WireKeyCode::Up => BareKey::Up,
+        WireKeyCode::Down => BareKey::Down,
+        WireKeyCode::Home => BareKey::Home,
+        WireKeyCode::End => BareKey::End,
+        WireKeyCode::PageUp => BareKey::PageUp,
+        WireKeyCode::PageDown => BareKey::PageDown,
+        WireKeyCode::Backspace => BareKey::Backspace,
+        WireKeyCode::Delete => BareKey::Delete,
+        WireKeyCode::Insert => BareKey::Insert,
+        WireKeyCode::Enter => BareKey::Enter,
+        WireKeyCode::Tab => BareKey::Tab,
+        WireKeyCode::BackTab => BareKey::BackTab,
+        WireKeyCode::Escape => BareKey::Escape,
+        WireKeyCode::Function(number) => BareKey::Function(number),
+    };
+    let code = KeyCode::try_new(bare, modifiers).map_err(|error| error.to_string())?;
+    Ok(KeyEvent::new(code, event.raw))
+}
+
 struct Runtime {
     state: ServerState,
     queue: CommandQueue,
@@ -469,6 +496,8 @@ struct Runtime {
     history_growth: Vec<(PaneId, u64)>,
     io: Option<TokioHandle>,
     owner_tx: Option<mpsc::Sender<OwnerMessage>>,
+    #[cfg(test)]
+    test_inputs: Vec<(PaneId, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -491,6 +520,8 @@ impl Runtime {
             history_growth: Vec::new(),
             io: None,
             owner_tx: None,
+            #[cfg(test)]
+            test_inputs: Vec::new(),
         }
     }
 
@@ -507,6 +538,14 @@ impl Runtime {
 
     fn ensure_platform_pane(&mut self, pane_id: PaneId, size: TerminalSize) -> io::Result<()> {
         if self.platform_panes.contains_key(&pane_id) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.io.is_none() {
+            let (_sender, receiver) = async_mpsc::channel(1);
+            self.platform_panes
+                .insert(pane_id, PlatformPane::test(receiver, size));
+            self.output_ring.push_back(pane_id);
             return Ok(());
         }
         let env_overrides = self.config.pane_environment(pane_id.raw());
@@ -655,6 +694,8 @@ impl Runtime {
             .is_some_and(|pane| pane.screen.bracketed_paste());
         let bytes = input.into_pty_bytes(bracketed);
         trace_bytes("pane_input", pane_id, &bytes);
+        #[cfg(test)]
+        self.test_inputs.push((pane_id, bytes.clone()));
         if let Some(conpty) = self
             .platform_panes
             .get_mut(&pane_id)
@@ -1082,6 +1123,7 @@ impl Outbound {
 struct ServerOwner {
     runtime: Runtime,
     clients: BTreeMap<ClientId, ClientView>,
+    started_at: Instant,
     shutdown: ShutdownState,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
@@ -1103,6 +1145,7 @@ impl ServerOwner {
         Self {
             runtime: Runtime::with_native_io(config, io, owner_tx),
             clients: BTreeMap::new(),
+            started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: Some(shutdown_tx),
         }
@@ -1113,6 +1156,7 @@ impl ServerOwner {
         Self {
             runtime: Runtime::with_config(config),
             clients: BTreeMap::new(),
+            started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: None,
         }
@@ -1315,11 +1359,19 @@ impl ServerOwner {
                     .is_some_and(|view| view.copy_mode.is_some())
                 {
                     if let ClientInput::Bytes(bytes) = input {
-                        self.handle_copy_mode_key(client, &bytes);
+                        self.handle_copy_mode_key(client, bytes);
                     }
                 } else if let Some(pane) = self.active_pane_for_client(client) {
                     self.runtime.write_pane_input(pane, input)?;
                 }
+            }
+            ServerEvent::ClientKey { client, event } => {
+                let now_ms = self
+                    .started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.handle_client_key_at(client, event, now_ms)?;
             }
             ServerEvent::ClientMouse { client, event } => {
                 self.handle_client_mouse(client, event)?;
@@ -1363,6 +1415,53 @@ impl ServerOwner {
                 self.send_critical(client, Message::CommandErr(error.to_string()));
             }
         }
+    }
+
+    fn handle_client_key_at(
+        &mut self,
+        client: ClientId,
+        event: KeyEvent,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        if let Some(view) = self.clients.get_mut(&client) {
+            view.scheduler.note_input(Instant::now());
+        }
+        let mode = if self
+            .clients
+            .get(&client)
+            .is_some_and(|view| view.copy_mode.is_some())
+        {
+            InputMode::CopyMode
+        } else {
+            InputMode::Normal
+        };
+        match route_key(&mut self.runtime.state, client, mode, event, now_ms) {
+            InputRoute::PaneBytes(bytes) => {
+                if let Some(pane) = self.active_pane_for_client(client) {
+                    self.runtime
+                        .write_pane_input(pane, ClientInput::Bytes(bytes))?;
+                }
+            }
+            InputRoute::Commands(commands) => {
+                self.enqueue_command_list(client, commands, CommandSource::KeyBinding);
+            }
+            InputRoute::CopyModeKey(event) => {
+                self.handle_copy_mode_key(client, event.raw);
+            }
+            InputRoute::Consumed => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn handle_wire_key_at(
+        &mut self,
+        client: ClientId,
+        event: WireKeyEvent,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        let event = core_key_event(event).map_err(io::Error::other)?;
+        self.handle_client_key_at(client, event, now_ms)
     }
 
     fn process_command_queue(&mut self, budget: usize) -> bool {
@@ -1579,7 +1678,7 @@ impl ServerOwner {
         Ok(())
     }
 
-    fn handle_copy_mode_key(&mut self, client: ClientId, bytes: &[u8]) {
+    fn handle_copy_mode_key(&mut self, client: ClientId, bytes: Vec<u8>) {
         let Some(mut mode) = self
             .clients
             .get_mut(&client)
@@ -1595,7 +1694,7 @@ impl ServerOwner {
         }) else {
             return;
         };
-        let result = mode.handle_key(bytes, &lines, rows);
+        let result = mode.handle_key(&bytes, &lines, rows);
         let clipboard = match result {
             CopyModeResult::Continue => None,
             CopyModeResult::Cancel => Some(None),
@@ -2257,13 +2356,215 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
     use wmux_config::WmuxConfig;
-    use wmux_core::{Command, CommandList, CommandSource, ServerEvent, SplitDirection};
+    use wmux_core::{
+        parse_command_text, Command, CommandList, CommandSource, KeyBinding, KeyCode, KeyTableName,
+        ServerEvent, SplitDirection,
+    };
     use wmux_platform::{
         MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
         TerminalSize,
     };
     use wmux_protocol::{Message, TerminalCapabilities, VERSION};
+    use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
     use wmux_windows::pipe::{connect_async, Endpoint, NamedPipeClient};
+
+    fn attached_owner() -> (ServerOwner, wmux_core::ClientId, wmux_core::PaneId) {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("keys", 80, 24);
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(client, view);
+        let (_pane_tx, pane_rx) = mpsc::channel(1);
+        owner.runtime.platform_panes.insert(
+            created.pane,
+            PlatformPane::test(pane_rx, TerminalSize::new(80, 24)),
+        );
+        (owner, client, created.pane)
+    }
+
+    fn wire_char(character: char, modifiers: WireKeyModifiers, raw: &[u8]) -> WireKeyEvent {
+        WireKeyEvent {
+            code: WireKeyCode::Char(character),
+            modifiers,
+            raw: raw.to_vec(),
+        }
+    }
+
+    #[test]
+    fn server_owned_key_prefix_executes_without_platform_input() {
+        let (mut owner, client, _) = attached_owner();
+        assert!(owner.clients[&client]
+            .scheduler
+            .input_priority_until
+            .is_none());
+
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('b', WireKeyModifiers::CONTROL, &[0x02]),
+                0,
+            )
+            .unwrap();
+        owner
+            .handle_wire_key_at(client, wire_char('c', WireKeyModifiers::NONE, b"c"), 1)
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.runtime.state.windows.len(), 2);
+        assert!(owner.runtime.test_inputs.is_empty());
+        assert!(owner.clients[&client]
+            .scheduler
+            .input_priority_until
+            .is_some());
+    }
+
+    #[test]
+    fn server_owned_key_unbound_utf8_and_paste_reach_the_pane_once() {
+        let (mut owner, client, pane) = attached_owner();
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('λ', WireKeyModifiers::NONE, "λ".as_bytes()),
+                0,
+            )
+            .unwrap();
+        owner
+            .handle_event(ServerEvent::ClientInput {
+                client,
+                input: wmux_core::ClientInput::Paste(b"abc".to_vec()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            owner.runtime.test_inputs,
+            [(pane, "λ".as_bytes().to_vec()), (pane, b"abc".to_vec())]
+        );
+    }
+
+    #[test]
+    fn server_owned_key_prefix_copy_repeat_and_expiry_are_client_scoped() {
+        let (mut owner, first, pane) = attached_owner();
+        let second = owner.runtime.state.add_client();
+        let session = owner.runtime.state.sessions.keys().next().copied().unwrap();
+        owner.runtime.state.attach_client(second, session).unwrap();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(second, view);
+
+        owner
+            .handle_wire_key_at(first, wire_char('b', WireKeyModifiers::CONTROL, &[0x02]), 0)
+            .unwrap();
+        owner
+            .handle_wire_key_at(second, wire_char('c', WireKeyModifiers::NONE, b"c"), 1)
+            .unwrap();
+        assert_eq!(owner.runtime.test_inputs, [(pane, b"c".to_vec())]);
+        assert_eq!(
+            owner.runtime.state.clients[&first].key_table,
+            KeyTableName::PREFIX
+        );
+        assert_eq!(
+            owner.runtime.state.clients[&second].key_table,
+            KeyTableName::ROOT
+        );
+
+        owner.enter_copy_mode(second).unwrap();
+        owner
+            .handle_wire_key_at(second, wire_char('q', WireKeyModifiers::NONE, b"q"), 2)
+            .unwrap();
+        assert!(owner.clients[&second].copy_mode.is_none());
+        assert_eq!(owner.runtime.test_inputs.len(), 1);
+
+        owner
+            .handle_wire_key_at(first, wire_char('c', WireKeyModifiers::NONE, b"c"), 501)
+            .unwrap();
+        assert_eq!(
+            owner.runtime.test_inputs.last(),
+            Some(&(pane, b"c".to_vec()))
+        );
+
+        owner
+            .runtime
+            .state
+            .key_tables
+            .table_mut(KeyTableName::PREFIX)
+            .unwrap()
+            .bind(KeyBinding {
+                key: KeyCode::parse("Right").unwrap(),
+                repeatable: true,
+                commands: parse_command_text("resize-pane -R").unwrap(),
+            });
+        owner
+            .handle_wire_key_at(
+                first,
+                wire_char('b', WireKeyModifiers::CONTROL, &[0x02]),
+                600,
+            )
+            .unwrap();
+        owner
+            .handle_wire_key_at(
+                first,
+                WireKeyEvent {
+                    code: WireKeyCode::Right,
+                    modifiers: WireKeyModifiers::NONE,
+                    raw: b"\x1b[C".to_vec(),
+                },
+                601,
+            )
+            .unwrap();
+        assert!(owner.runtime.state.clients[&first]
+            .repeat_deadline_ms
+            .is_some());
+        assert!(!owner.runtime.queue.is_empty());
+    }
+
+    #[test]
+    fn server_owned_key_disconnect_drops_pending_binding_commands() {
+        let (mut owner, client, _) = attached_owner();
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('b', WireKeyModifiers::CONTROL, &[0x02]),
+                0,
+            )
+            .unwrap();
+        owner
+            .handle_wire_key_at(client, wire_char('c', WireKeyModifiers::NONE, b"c"), 1)
+            .unwrap();
+        assert!(!owner.runtime.queue.is_empty());
+
+        owner.disconnect_client(client, true);
+
+        assert!(owner.runtime.queue.is_empty());
+    }
+
+    #[test]
+    fn server_owned_key_conversion_moves_raw_bytes_and_rejects_invalid_functions() {
+        let mut raw = Vec::with_capacity(32);
+        raw.extend_from_slice("λ".as_bytes());
+        let pointer = raw.as_ptr();
+        let event = super::core_key_event(WireKeyEvent {
+            code: WireKeyCode::Char('λ'),
+            modifiers: WireKeyModifiers::ALT,
+            raw,
+        })
+        .unwrap();
+
+        assert_eq!(event.raw.as_ptr(), pointer);
+        assert!(super::core_key_event(WireKeyEvent {
+            code: WireKeyCode::Function(0),
+            modifiers: WireKeyModifiers::NONE,
+            raw: Vec::new(),
+        })
+        .is_err());
+    }
 
     #[test]
     fn shutdown_transaction_notifies_clients_and_clears_platform_panes() {
@@ -2779,10 +3080,10 @@ mod tests {
         owner.enter_copy_mode(first).unwrap();
         assert!(owner.clients[&first].copy_mode.is_some());
         assert!(owner.clients[&second].copy_mode.is_none());
-        owner.handle_copy_mode_key(first, b"g");
-        owner.handle_copy_mode_key(first, b" ");
-        owner.handle_copy_mode_key(first, b"$");
-        owner.handle_copy_mode_key(first, b"\r");
+        owner.handle_copy_mode_key(first, b"g".to_vec());
+        owner.handle_copy_mode_key(first, b" ".to_vec());
+        owner.handle_copy_mode_key(first, b"$".to_vec());
+        owner.handle_copy_mode_key(first, b"\r".to_vec());
 
         assert!(owner.clients[&first].copy_mode.is_none());
         let outbound = first_rx.try_recv().unwrap();
