@@ -21,6 +21,7 @@ The command exits nonzero if a required scenario is absent or any gate fails.
 | Allocation-free prefix dispatch | `key-prefix-binding` must sustain 5M pairs/s with zero measured allocations |
 | Fair queue throughput | `command-queue` must sustain 2M pre-parsed commands/s across 8 clients |
 | Shared parser throughput | `command-text` must sustain 200K four-command lists/s |
+| Allocation-free platform dispatch | `platform-dispatch` must submit exactly 10M trait-object resize requests at 20M operations/s or better with zero measured allocations |
 
 Parser throughput for both Codex and Claude fixtures must remain above 40 MB/s.
 The thresholds are intentionally conservative enough for shared CI runners but

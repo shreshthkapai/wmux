@@ -87,3 +87,26 @@ requires the same commit to update contract tests, deterministic conformance,
 this document, and the aggregate fingerprint. No shared crate may import
 Windows or Unix APIs, native crates, handles, descriptors, SIDs, UIDs, signals,
 or runtime-specific native objects.
+
+## Phase 5 verification evidence
+
+The final Windows verification on 2026-08-21 produced:
+
+- 283 workspace unit tests passed, including 35 server and 36 Windows-adapter
+  tests;
+- format and workspace clippy with warnings denied passed;
+- every fuzz binary compiled and passed clippy with warnings denied;
+- 14 portable conformance cases passed with aggregate fingerprint
+  `f71b72b35879a1c6`;
+- shared core, platform, protocol, config, server library, client library, and
+  conformance compile checks passed;
+- native-import source audits found no matches in shared library sources;
+- the complete release performance gate passed, with `platform-dispatch`
+  completing 10,000,000 operations in 68.906 ms at 145,124,611
+  operations/second, zero allocations, and zero violations.
+
+The researched reference revisions were tmux
+`7b833d07d9f1b58343fc88d7de3c2e0bd9f9aa8c` and zellij
+`82c4a24d701ecf9a48aa01bcc5c0bb3882747fe7`. Extra in-scope work was limited
+to making benchmark allocation measurement per-thread and refreshing the fuzz
+lockfile after `wmux-platform` gained its OS-neutral Tokio stream dependency.

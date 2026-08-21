@@ -200,16 +200,16 @@ cargo run -p wmux-bench --release -- --suite full --gate
 - Consumes: existing `PtyBackend`, `TerminalBackend`, `PlatformRequest`, and `PlatformEvent`.
 - Produces: the minimal semantic contract required by both ConPTY and Unix PTYs, plus a platform-neutral server runtime entry point.
 
-- [ ] Audit every direct `wmux-windows` import in client/server and classify it as PTY, terminal, IPC, credential, daemon, clock, or filesystem behavior.
-- [ ] Extend the platform contract only for semantics required by both implementations: endpoint discovery, listener/connection streams, peer identity, terminal resize events, child exit, pane closure, and backend error classification.
-- [ ] Keep `PlatformPaneId` opaque and ensure no native handle, descriptor, or process identifier becomes core identity.
-- [ ] Refactor server construction to accept backend implementations rather than selecting Windows types inside the owner loop.
-- [ ] Refactor client construction to accept terminal and IPC backends while preserving the same attach protocol.
-- [ ] Move platform-neutral server tests out of Windows-only build paths.
-- [ ] Expand `wmux-conformance` with lifecycle scripts for create, attach, type, split, resize, detach, background output, reattach, kill-pane, kill-session, and kill-server.
-- [ ] Define an expected-differences registry; OS differences must be explicit entries, never scattered conditional assertions.
-- [ ] Add compile checks proving `wmux-core`, `wmux-protocol`, `wmux-config`, `wmux-server`, and `wmux-conformance` build without Windows features.
-- [ ] Freeze the contract for the Unix bring-up. Any later contract change requires Windows and Unix tests in the same change.
+- [x] Audit every direct `wmux-windows` import in client/server and classify it as PTY, terminal, IPC, credential, daemon, clock, or filesystem behavior.
+- [x] Extend the platform contract only for semantics required by both implementations: endpoint discovery, listener/connection streams, peer identity, terminal resize events, child exit, pane closure, and backend error classification.
+- [x] Keep `PlatformPaneId` opaque and ensure no native handle, descriptor, or process identifier becomes core identity.
+- [x] Refactor server construction to accept backend implementations rather than selecting Windows types inside the owner loop.
+- [x] Refactor client construction to accept terminal and IPC backends while preserving the same attach protocol.
+- [x] Move platform-neutral server tests out of Windows-only build paths.
+- [x] Expand `wmux-conformance` with lifecycle scripts for create, attach, type, split, resize, detach, background output, reattach, kill-pane, kill-session, and kill-server.
+- [x] Define an expected-differences registry; OS differences must be explicit entries, never scattered conditional assertions.
+- [x] Add compile checks proving `wmux-core`, `wmux-protocol`, `wmux-config`, `wmux-server`, and `wmux-conformance` build without Windows features.
+- [x] Freeze the contract for the Unix bring-up. Any later contract change requires Windows and Unix tests in the same change.
 
 **Exit gate:** A mock backend can run the complete server lifecycle and no shared crate imports native APIs.
 

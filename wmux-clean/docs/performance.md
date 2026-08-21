@@ -271,3 +271,16 @@ to 101.46 MiB for detached output. The history resize p95 previously fluctuated
 from a 35.6 us median to 44.8 us; no resize code changed, and both remain far
 below the 5 ms gate. The full release performance gate and all correctness and
 conformance tests remain mandatory.
+
+## Phase 5 Platform Dispatch Gate
+
+The frozen `PtyBackend` seam is measured directly through a trait object. The
+full workload submits 10,000,000 deterministic resize requests, checks every
+submission through a rolling checksum, and measures allocations on the
+workload thread so parallel test-harness activity cannot contaminate results.
+
+The final Windows release run on 2026-08-21 completed in 68.906 ms at
+145,124,611 operations/second with zero allocations, zero allocated bytes, and
+zero semantic violations. The enforced floor is 20,000,000 operations/second.
+This is adapter-dispatch evidence, not an end-to-end PTY throughput comparison;
+the existing parser, render, backlog, queue, and latency gates remain required.
