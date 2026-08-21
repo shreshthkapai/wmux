@@ -3,6 +3,7 @@ pub mod copy_mode;
 pub mod event;
 pub mod grid;
 pub mod ids;
+pub mod keys;
 pub mod layout;
 pub mod render;
 pub mod screen;
@@ -19,6 +20,11 @@ pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
 pub use grid::{Cell, Color, Grid, Line, Style};
 pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, WinlinkId};
+pub use keys::{
+    route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
+    KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTables, MAX_KEY_NAME_BYTES,
+    MAX_KEY_TABLE_NAME_BYTES,
+};
 pub use layout::{LayoutNode, Rect, ResizeDirection, SplitDirection};
 pub use render::{
     build_window_scene, build_window_scene_with_retained_panes, build_window_scene_with_viewports,

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ClientId, LayoutNode, PaneId, Rect, ResizeDirection, Screen, SessionGroupId, SessionId,
-    SplitDirection, TerminalEngine, WindowId, WinlinkId,
+    ClientId, ConfirmationState, KeyCode, KeyTableName, KeyTables, LayoutNode, PaneId, Rect,
+    ResizeDirection, Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId,
+    WinlinkId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,6 +12,11 @@ pub struct Client {
     pub attached_session: Option<SessionId>,
     pub previous_session: Option<SessionId>,
     pub attached_pane: Option<PaneId>,
+    pub key_table: KeyTableName,
+    pub prefix_deadline_ms: Option<u64>,
+    pub repeat_deadline_ms: Option<u64>,
+    pub last_repeatable_key: Option<KeyCode>,
+    pub confirmation: Option<ConfirmationState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +105,7 @@ pub struct ServerState {
     pub winlinks: BTreeMap<WinlinkId, Winlink>,
     pub windows: BTreeMap<WindowId, Window>,
     pub panes: BTreeMap<PaneId, Pane>,
+    pub key_tables: KeyTables,
     pending_pane_resizes: BTreeMap<PaneId, PaneResize>,
 }
 
@@ -112,6 +119,7 @@ impl ServerState {
             winlinks: BTreeMap::new(),
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
+            key_tables: KeyTables::tmux_defaults(),
             pending_pane_resizes: BTreeMap::new(),
         }
     }
@@ -125,6 +133,11 @@ impl ServerState {
                 attached_session: None,
                 previous_session: None,
                 attached_pane: None,
+                key_table: KeyTableName::ROOT,
+                prefix_deadline_ms: None,
+                repeat_deadline_ms: None,
+                last_repeatable_key: None,
+                confirmation: None,
             },
         );
         id

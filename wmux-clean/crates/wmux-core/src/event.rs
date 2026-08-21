@@ -1,9 +1,10 @@
-use crate::{ClientId, Command, PaneId, TimerId};
+use crate::{ClientId, Command, KeyEvent, PaneId, TimerId};
 use wmux_platform::MouseEvent;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientInput {
     Bytes(Vec<u8>),
+    Key(KeyEvent),
     Paste(Vec<u8>),
 }
 
@@ -14,6 +15,7 @@ impl ClientInput {
     pub fn into_pty_bytes(self, bracketed_paste: bool) -> Vec<u8> {
         match self {
             Self::Bytes(bytes) => bytes,
+            Self::Key(event) => event.raw,
             Self::Paste(bytes) if bracketed_paste => {
                 let mut payload = Vec::with_capacity(bytes.len() + 12);
                 payload.extend_from_slice(b"\x1b[200~");
@@ -83,7 +85,7 @@ impl ServerEvent {
 #[cfg(test)]
 mod tests {
     use super::ServerEvent;
-    use crate::{ClientId, ClientInput, Command, PaneId, TimerId};
+    use crate::{ClientId, ClientInput, Command, KeyCode, KeyEvent, PaneId, TimerId};
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -152,6 +154,10 @@ mod tests {
         assert_eq!(
             ClientInput::Bytes(b"\x1b[A".to_vec()).into_pty_bytes(true),
             b"\x1b[A"
+        );
+        assert_eq!(
+            ClientInput::Key(KeyEvent::new(KeyCode::escape(), vec![0x1b])).into_pty_bytes(true),
+            b"\x1b"
         );
         assert_eq!(
             ClientInput::Paste(b"abc".to_vec()).into_pty_bytes(false),
