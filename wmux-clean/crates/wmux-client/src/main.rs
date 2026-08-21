@@ -20,7 +20,7 @@ use wmux_cli::{ConfigAction, Invocation, ServerInvocation, StartupPolicy};
 use wmux_config::{config_path, WmuxConfig};
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
-    FRAME_HEADER_LEN, VERSION,
+    WireKeyEvent, FRAME_HEADER_LEN, VERSION,
 };
 use wmux_windows::{
     console,
@@ -220,7 +220,6 @@ async fn attach_io_loop(
     mut last_size: wmux_platform::TerminalSize,
     capabilities: TerminalCapabilities,
 ) -> io::Result<()> {
-    let mut prefix = false;
     let mut resize_check = tokio::time::interval(Duration::from_millis(500));
     resize_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -258,18 +257,14 @@ async fn attach_io_loop(
                     "terminal input worker stopped unexpectedly",
                 ))??;
                 match input {
-                ConsoleInput::Key(bytes) => {
-                    if handle_key(writer, &bytes, &mut prefix, &done).await? {
-                        return Ok(());
-                    }
+                ConsoleInput::Key(event) => {
+                    send_key(writer, event).await?;
                 }
                 ConsoleInput::Paste(text) => {
                     send_paste(writer, paste_bytes(&text)).await?;
-                    prefix = false;
                 }
                 ConsoleInput::Mouse(event) => {
                     send_async_message(writer, Message::Mouse(event)).await?;
-                    prefix = false;
                 }
                 ConsoleInput::Resize(size) => {
                     if size != last_size {
@@ -337,95 +332,16 @@ fn classify_attached_inbound(message: Option<Message>) -> AttachedInbound {
     }
 }
 
-async fn handle_key(
-    writer: &mut (impl AsyncWrite + Unpin),
-    bytes: &[u8],
-    prefix: &mut bool,
-    done: &Arc<AtomicBool>,
-) -> io::Result<bool> {
+async fn send_key(writer: &mut (impl AsyncWrite + Unpin), event: WireKeyEvent) -> io::Result<()> {
     if trace_enabled() {
         trace_client(format_args!(
             "key bytes={} hex={} text={:?}",
-            bytes.len(),
-            hex(bytes),
-            text(bytes)
+            event.raw.len(),
+            hex(&event.raw),
+            text(&event.raw)
         ));
     }
-
-    let mut pending = Vec::with_capacity(bytes.len() + 1);
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if *prefix {
-            if byte == b'd' || byte == b'D' {
-                send_async_message(writer, Message::Detach).await?;
-                done.store(true, Ordering::SeqCst);
-                return Ok(true);
-            }
-            if let Some((command, consumed)) = prefix_command_sequence(&bytes[index..]) {
-                send_async_message(writer, Message::Command(command)).await?;
-                *prefix = false;
-                index += consumed;
-                continue;
-            }
-            if byte == 0x02 {
-                pending.push(0x02);
-            } else {
-                pending.push(0x02);
-                pending.push(byte);
-            }
-            *prefix = false;
-            index += 1;
-        } else if byte == 0x02 {
-            *prefix = true;
-            index += 1;
-        } else {
-            pending.push(byte);
-            index += 1;
-        }
-    }
-
-    if !pending.is_empty() {
-        // Until the Windows adapter supplies one semantic event per key, keep
-        // legacy client-side batches on the explicitly byte-oriented tag.
-        send_async_message(writer, Message::Input(pending)).await?;
-    }
-    Ok(false)
-}
-
-fn prefix_command_sequence(bytes: &[u8]) -> Option<(String, usize)> {
-    let first = *bytes.first()?;
-    if first.is_ascii_digit() {
-        return Some((format!("select-window -t {}", first as char), 1));
-    }
-    if bytes.starts_with(b"\x1b[A") {
-        return Some(("select-pane -U".to_string(), 3));
-    }
-    if bytes.starts_with(b"\x1b[B") {
-        return Some(("select-pane -D".to_string(), 3));
-    }
-    if bytes.starts_with(b"\x1b[C") {
-        return Some(("select-pane -R".to_string(), 3));
-    }
-    if bytes.starts_with(b"\x1b[D") {
-        return Some(("select-pane -L".to_string(), 3));
-    }
-
-    match first {
-        b'%' => Some(("split-window -h".to_string(), 1)),
-        b'"' => Some(("split-window -v".to_string(), 1)),
-        b'c' | b'C' => Some(("new-window".to_string(), 1)),
-        b'n' | b'N' => Some(("next-window".to_string(), 1)),
-        b'p' | b'P' => Some(("previous-window".to_string(), 1)),
-        b'l' | b'L' => Some(("last-window".to_string(), 1)),
-        b'z' | b'Z' => Some(("resize-pane -Z".to_string(), 1)),
-        b'[' => Some(("copy-mode".to_string(), 1)),
-        b'x' | b'X' => Some(("kill-pane".to_string(), 1)),
-        b'&' => Some(("kill-window".to_string(), 1)),
-        b'o' | b'O' => Some(("select-pane -D".to_string(), 1)),
-        b';' => Some(("last-pane".to_string(), 1)),
-        _ => None,
-    }
+    send_async_message(writer, Message::Key(event)).await
 }
 
 async fn send_paste(writer: &mut (impl AsyncWrite + Unpin), bytes: Vec<u8>) -> io::Result<()> {
@@ -757,12 +673,12 @@ fn terminal_capabilities() -> TerminalCapabilities {
 mod tests {
     use super::{
         classify_attached_inbound, connect_with_startup_policy, handshake_read_error,
-        no_server_message, prefix_command_sequence, protocol_error, read_inbound_messages,
-        retry_delays, write_async_message, AttachedInbound,
+        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
+        send_key, write_async_message, AttachedInbound,
     };
     use std::{cell::Cell, future::ready, io};
     use wmux_cli::StartupPolicy;
-    use wmux_protocol::Message;
+    use wmux_protocol::{Message, WireKeyCode, WireKeyEvent, WireKeyModifiers};
 
     #[test]
     fn connection_diagnostics_name_the_endpoint_and_protocol_versions() {
@@ -873,43 +789,20 @@ mod tests {
         assert_eq!(spawns.get(), 0);
     }
 
-    #[test]
-    fn prefix_numbers_select_windows_by_index() {
-        assert_eq!(
-            prefix_command_sequence(b"0"),
-            Some(("select-window -t 0".to_string(), 1))
-        );
-        assert_eq!(
-            prefix_command_sequence(b"9"),
-            Some(("select-window -t 9".to_string(), 1))
-        );
-    }
+    #[tokio::test]
+    async fn attached_client_forwards_semantic_keys_without_binding_policy() {
+        let expected = WireKeyEvent {
+            code: WireKeyCode::Char('b'),
+            modifiers: WireKeyModifiers::CONTROL,
+            raw: vec![0x02],
+        };
+        let (mut client, mut server) = tokio::io::duplex(64);
 
-    #[test]
-    fn prefix_arrows_select_panes_by_direction() {
-        assert_eq!(
-            prefix_command_sequence(b"\x1b[A"),
-            Some(("select-pane -U".to_string(), 3))
-        );
-        assert_eq!(
-            prefix_command_sequence(b"\x1b[B"),
-            Some(("select-pane -D".to_string(), 3))
-        );
-        assert_eq!(
-            prefix_command_sequence(b"\x1b[C"),
-            Some(("select-pane -R".to_string(), 3))
-        );
-        assert_eq!(
-            prefix_command_sequence(b"\x1b[D"),
-            Some(("select-pane -L".to_string(), 3))
-        );
-    }
+        send_key(&mut client, expected.clone()).await.unwrap();
 
-    #[test]
-    fn prefix_left_bracket_enters_tmux_copy_mode() {
         assert_eq!(
-            prefix_command_sequence(b"["),
-            Some(("copy-mode".to_string(), 1))
+            read_async_message(&mut server).await.unwrap(),
+            Some(Message::Key(expected))
         );
     }
 

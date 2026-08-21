@@ -10,10 +10,11 @@ use std::{
     time::Duration,
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers, TerminalSize};
+use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConsoleInput {
-    Key(Vec<u8>),
+    Key(WireKeyEvent),
     Paste(String),
     Mouse(MouseEvent),
     Resize(TerminalSize),
@@ -237,7 +238,61 @@ impl Drop for GlobalMemoryGuard {
     }
 }
 
-fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
+fn encode_key_event(key: KeyEvent) -> Option<WireKeyEvent> {
+    let raw = encode_key_bytes(key)?;
+    let mut modifiers = wire_key_modifiers(key.modifiers);
+    let code = match key.code {
+        KeyCode::Char(ch) if ch.is_ascii_uppercase() => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                modifiers |= WireKeyModifiers::SHIFT;
+            }
+            WireKeyCode::Char(ch.to_ascii_lowercase())
+        }
+        KeyCode::Char(ch) => WireKeyCode::Char(ch),
+        KeyCode::Left => WireKeyCode::Left,
+        KeyCode::Right => WireKeyCode::Right,
+        KeyCode::Up => WireKeyCode::Up,
+        KeyCode::Down => WireKeyCode::Down,
+        KeyCode::Home => WireKeyCode::Home,
+        KeyCode::End => WireKeyCode::End,
+        KeyCode::PageUp => WireKeyCode::PageUp,
+        KeyCode::PageDown => WireKeyCode::PageDown,
+        KeyCode::Backspace => WireKeyCode::Backspace,
+        KeyCode::Delete => WireKeyCode::Delete,
+        KeyCode::Insert => WireKeyCode::Insert,
+        KeyCode::Enter => WireKeyCode::Enter,
+        KeyCode::Tab => WireKeyCode::Tab,
+        KeyCode::BackTab => WireKeyCode::BackTab,
+        KeyCode::Esc => WireKeyCode::Escape,
+        KeyCode::F(number) if (1..=24).contains(&number) => WireKeyCode::Function(number),
+        _ => return None,
+    };
+
+    Some(WireKeyEvent {
+        code,
+        modifiers,
+        raw,
+    })
+}
+
+fn wire_key_modifiers(modifiers: KeyModifiers) -> WireKeyModifiers {
+    let mut wire = WireKeyModifiers::NONE;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        wire |= WireKeyModifiers::SHIFT;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        wire |= WireKeyModifiers::ALT;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        wire |= WireKeyModifiers::CONTROL;
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        wire |= WireKeyModifiers::SUPER;
+    }
+    wire
+}
+
+fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -453,15 +508,112 @@ extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
 
     #[test]
+    fn normalized_key_keeps_semantic_identity_and_application_bytes() {
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('B'), KeyModifiers::CONTROL)),
+            Some(WireKeyEvent {
+                code: WireKeyCode::Char('b'),
+                modifiers: WireKeyModifiers::CONTROL,
+                raw: vec![0x02],
+            })
+        );
+    }
+
+    #[test]
+    fn multibyte_and_navigation_keys_are_one_semantic_event() {
+        let unicode = encode_key_event(key(KeyCode::Char('λ'), KeyModifiers::ALT)).unwrap();
+        assert_eq!(unicode.code, WireKeyCode::Char('λ'));
+        assert_eq!(unicode.modifiers, WireKeyModifiers::ALT);
+        assert_eq!(unicode.raw, [0x1b, 0xce, 0xbb]);
+
+        let up = encode_key_event(key(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+        assert_eq!(up.code, WireKeyCode::Up);
+        assert_eq!(up.modifiers, WireKeyModifiers::NONE);
+        assert_eq!(up.raw, b"\x1b[A");
+    }
+
+    #[test]
+    fn normalizes_supported_key_codes_and_modifiers() {
+        let shifted = encode_key_event(key(KeyCode::Char('A'), KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(shifted.code, WireKeyCode::Char('a'));
+        assert_eq!(shifted.modifiers, WireKeyModifiers::SHIFT);
+        assert_eq!(shifted.raw, b"A");
+
+        let super_key = encode_key_event(key(KeyCode::Char('k'), KeyModifiers::SUPER)).unwrap();
+        assert_eq!(super_key.code, WireKeyCode::Char('k'));
+        assert_eq!(super_key.modifiers, WireKeyModifiers::SUPER);
+        assert_eq!(super_key.raw, b"k");
+
+        let back_tab = encode_key_event(key(KeyCode::BackTab, KeyModifiers::SHIFT)).unwrap();
+        assert_eq!(back_tab.code, WireKeyCode::BackTab);
+        assert_eq!(back_tab.modifiers, WireKeyModifiers::SHIFT);
+        assert_eq!(back_tab.raw, b"\x1b[Z");
+    }
+
+    #[test]
+    fn normalizes_control_and_fixed_keys() {
+        let cases = [
+            (
+                key(KeyCode::Char(' '), KeyModifiers::CONTROL),
+                WireKeyCode::Char(' '),
+                WireKeyModifiers::CONTROL,
+                vec![0x00],
+            ),
+            (
+                key(KeyCode::Backspace, KeyModifiers::CONTROL),
+                WireKeyCode::Backspace,
+                WireKeyModifiers::CONTROL,
+                vec![0x08],
+            ),
+            (
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                WireKeyCode::Enter,
+                WireKeyModifiers::NONE,
+                vec![b'\r'],
+            ),
+            (
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                WireKeyCode::Escape,
+                WireKeyModifiers::NONE,
+                vec![0x1b],
+            ),
+        ];
+
+        for (input, code, modifiers, raw) in cases {
+            assert_eq!(
+                encode_key_event(input),
+                Some(WireKeyEvent {
+                    code,
+                    modifiers,
+                    raw,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_supported_function_keys() {
+        let f1 = encode_key_event(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert_eq!(f1.code, WireKeyCode::Function(1));
+        assert_eq!(f1.raw, b"\x1bOP");
+
+        let f12 = encode_key_event(key(KeyCode::F(12), KeyModifiers::ALT)).unwrap();
+        assert_eq!(f12.code, WireKeyCode::Function(12));
+        assert_eq!(f12.modifiers, WireKeyModifiers::ALT);
+        assert_eq!(f12.raw, b"\x1b[24~");
+    }
+
+    #[test]
     fn encodes_printable_character() {
         assert_eq!(
-            encode_key_event(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            encode_key_bytes(key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Some(b"a".to_vec())
         );
     }
@@ -469,7 +621,7 @@ mod tests {
     #[test]
     fn encodes_ctrl_b_as_prefix_byte() {
         assert_eq!(
-            encode_key_event(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            encode_key_bytes(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             Some(vec![0x02])
         );
     }
@@ -477,7 +629,7 @@ mod tests {
     #[test]
     fn encodes_ctrl_c_from_virtual_key_without_unicode_char() {
         assert_eq!(
-            encode_key_event(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            encode_key_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(vec![0x03])
         );
     }
@@ -485,7 +637,7 @@ mod tests {
     #[test]
     fn encodes_backspace() {
         assert_eq!(
-            encode_key_event(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            encode_key_bytes(key(KeyCode::Backspace, KeyModifiers::NONE)),
             Some(vec![0x7f])
         );
     }
@@ -493,7 +645,7 @@ mod tests {
     #[test]
     fn encodes_ctrl_backspace_as_legacy_ctrl_h() {
         assert_eq!(
-            encode_key_event(key(KeyCode::Backspace, KeyModifiers::CONTROL)),
+            encode_key_bytes(key(KeyCode::Backspace, KeyModifiers::CONTROL)),
             Some(vec![0x08])
         );
     }

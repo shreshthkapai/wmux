@@ -491,4 +491,5 @@ dependencies = [
  "tokio",
  "windows-sys 0.61.2",
  "wmux-platform",
+ "wmux-protocol",
 ]
