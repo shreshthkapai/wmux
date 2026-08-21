@@ -15,7 +15,8 @@ pub mod text;
 pub use command::{
     execute, parse_command, parse_command_argv, parse_command_text, quote_argument,
     resolve_command_name, Command, CommandCompletion, CommandEffect, CommandList, CommandOutcome,
-    CommandParseError, CommandQueue, CommandSource, QueuedCommand, SourcePosition, SourceSpan,
+    CommandParseError, CommandQueue, CommandSource, QueuedCommand, SendKey, SessionSelector,
+    SourcePosition, SourceSpan,
 };
 pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
@@ -28,7 +29,8 @@ pub use keys::{
 };
 pub use layout::{LayoutNode, Rect, ResizeDirection, SplitDirection};
 pub use render::{
-    build_window_scene, build_window_scene_with_retained_panes, build_window_scene_with_viewports,
+    build_window_scene, build_window_scene_with_client_overlay,
+    build_window_scene_with_retained_panes, build_window_scene_with_viewports,
     build_window_structure, render_damage_from_structure, render_diff, render_diff_scene,
     render_diff_scene_with_capabilities, render_full, render_full_scene,
     render_full_scene_with_capabilities, PaneSceneOverrides, PaneSpan, PaneViewport,

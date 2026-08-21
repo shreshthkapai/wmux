@@ -201,6 +201,161 @@ impl KeyCode {
     pub const fn modifiers(self) -> KeyModifiers {
         KeyModifiers(((self.0 >> MODIFIER_SHIFT) & 0x0f) as u8)
     }
+
+    pub fn append_terminal_bytes(self, output: &mut Vec<u8>) {
+        let modifiers = self.modifiers();
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        let control = modifiers.contains(KeyModifiers::CONTROL);
+        let shift = modifiers.contains(KeyModifiers::SHIFT);
+        let special_modifiers = terminal_modifier_parameter(modifiers);
+
+        match self.bare_key() {
+            BareKey::Char(mut character) => {
+                if alt {
+                    output.push(0x1b);
+                }
+                if control {
+                    if let Some(byte) = control_byte(character) {
+                        output.push(byte);
+                        return;
+                    }
+                }
+                if shift && character.is_ascii_lowercase() {
+                    character = character.to_ascii_uppercase();
+                }
+                let mut encoded = [0; 4];
+                output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            }
+            BareKey::Space => {
+                if alt {
+                    output.push(0x1b);
+                }
+                output.push(if control { 0 } else { b' ' });
+            }
+            BareKey::Backspace => {
+                if alt {
+                    output.push(0x1b);
+                }
+                output.push(if control { 0x08 } else { 0x7f });
+            }
+            BareKey::Enter => append_simple_key(output, b'\r', alt),
+            BareKey::Tab if shift => output.extend_from_slice(b"\x1b[Z"),
+            BareKey::Tab => append_simple_key(output, b'\t', alt),
+            BareKey::BackTab => output.extend_from_slice(b"\x1b[Z"),
+            BareKey::Escape => output.push(0x1b),
+            BareKey::Left => append_csi_final(output, b'D', special_modifiers),
+            BareKey::Right => append_csi_final(output, b'C', special_modifiers),
+            BareKey::Up => append_csi_final(output, b'A', special_modifiers),
+            BareKey::Down => append_csi_final(output, b'B', special_modifiers),
+            BareKey::Home => append_csi_final(output, b'H', special_modifiers),
+            BareKey::End => append_csi_final(output, b'F', special_modifiers),
+            BareKey::Insert => append_csi_tilde(output, 2, special_modifiers),
+            BareKey::Delete => append_csi_tilde(output, 3, special_modifiers),
+            BareKey::PageUp => append_csi_tilde(output, 5, special_modifiers),
+            BareKey::PageDown => append_csi_tilde(output, 6, special_modifiers),
+            BareKey::Function(number) => append_function_key(output, number, special_modifiers),
+        }
+    }
+}
+
+fn append_simple_key(output: &mut Vec<u8>, byte: u8, alt: bool) {
+    if alt {
+        output.push(0x1b);
+    }
+    output.push(byte);
+}
+
+fn control_byte(character: char) -> Option<u8> {
+    if character.is_ascii_alphabetic() {
+        return Some((character.to_ascii_lowercase() as u8) & 0x1f);
+    }
+    match character {
+        ' ' | '@' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+fn terminal_modifier_parameter(modifiers: KeyModifiers) -> u8 {
+    1 + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL))
+        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER))
+}
+
+fn append_csi_final(output: &mut Vec<u8>, final_byte: u8, modifiers: u8) {
+    output.extend_from_slice(b"\x1b[");
+    if modifiers != 1 {
+        output.extend_from_slice(b"1;");
+        append_decimal(output, modifiers);
+    }
+    output.push(final_byte);
+}
+
+fn append_csi_tilde(output: &mut Vec<u8>, number: u8, modifiers: u8) {
+    output.extend_from_slice(b"\x1b[");
+    append_decimal(output, number);
+    if modifiers != 1 {
+        output.push(b';');
+        append_decimal(output, modifiers);
+    }
+    output.push(b'~');
+}
+
+fn append_function_key(output: &mut Vec<u8>, number: u8, modifiers: u8) {
+    let final_byte = match number {
+        1 => Some(b'P'),
+        2 => Some(b'Q'),
+        3 => Some(b'R'),
+        4 => Some(b'S'),
+        _ => None,
+    };
+    if let Some(final_byte) = final_byte {
+        if modifiers == 1 {
+            output.extend_from_slice(b"\x1bO");
+        } else {
+            output.extend_from_slice(b"\x1b[1;");
+            append_decimal(output, modifiers);
+        }
+        output.push(final_byte);
+        return;
+    }
+    let number = match number {
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        13 => 25,
+        14 => 26,
+        15 => 28,
+        16 => 29,
+        17 => 31,
+        18 => 32,
+        19 => 33,
+        20 => 34,
+        21 => 42,
+        22 => 43,
+        23 => 44,
+        24 => 45,
+        _ => unreachable!("validated function key range"),
+    };
+    append_csi_tilde(output, number, modifiers);
+}
+
+fn append_decimal(output: &mut Vec<u8>, value: u8) {
+    if value >= 10 {
+        output.push(b'0' + value / 10);
+    }
+    output.push(b'0' + value % 10);
 }
 
 impl fmt::Debug for KeyCode {
@@ -521,8 +676,8 @@ fn build_tmux_defaults() -> KeyTables {
         ("l", "last-window"),
         ("z", "resize-pane -Z"),
         ("[", "copy-mode"),
-        ("x", "kill-pane"),
-        ("&", "kill-window"),
+        ("x", "confirm-before -p 'kill-pane? (y/n)' kill-pane"),
+        ("&", "confirm-before -p 'kill-window? (y/n)' kill-window"),
         ("o", "select-pane -D"),
         (";", "last-pane"),
         ("Up", "select-pane -U"),
@@ -694,7 +849,7 @@ mod tests {
         KeyModifiers, KeyTable, KeyTableName, KeyTableTarget, KeyTables, MAX_KEY_NAME_BYTES,
         MAX_KEY_TABLE_NAME_BYTES,
     };
-    use crate::{parse_command_text, ClientInput, ServerState};
+    use crate::{parse_command_text, ClientInput, Command, ServerState};
 
     fn binding(key: KeyCode, repeatable: bool, command: &str) -> KeyBinding {
         KeyBinding {
@@ -790,6 +945,42 @@ mod tests {
         assert_eq!(tables.name(custom), Some("custom"));
         assert_eq!(tables.tables().last().unwrap().name(), custom);
         assert_eq!(size_of::<KeyTableName>(), 2);
+    }
+
+    #[test]
+    fn terminal_key_encoding_is_static_bounded_and_modifier_aware() {
+        for (key, expected) in [
+            ("C-a", b"\x01".as_slice()),
+            ("S-a", b"A".as_slice()),
+            ("M-x", b"\x1bx".as_slice()),
+            ("Left", b"\x1b[D".as_slice()),
+            ("C-Left", b"\x1b[1;5D".as_slice()),
+            ("F12", b"\x1b[24~".as_slice()),
+            ("S-F2", b"\x1b[1;2Q".as_slice()),
+        ] {
+            let mut encoded = Vec::new();
+            KeyCode::parse(key)
+                .unwrap()
+                .append_terminal_bytes(&mut encoded);
+            assert_eq!(encoded, expected, "wrong encoding for {key}");
+        }
+    }
+
+    #[test]
+    fn destructive_defaults_are_parsed_confirmation_commands() {
+        let tables = KeyTables::tmux_defaults();
+        for key in ["x", "&"] {
+            let binding = tables
+                .table(KeyTableName::PREFIX)
+                .unwrap()
+                .get(KeyCode::parse(key).unwrap())
+                .unwrap();
+            assert!(matches!(
+                &binding.commands[0],
+                Command::ConfirmBefore { commands, .. }
+                    if matches!(&commands[0], Command::KillPane | Command::KillWindow)
+            ));
+        }
     }
 
     #[test]

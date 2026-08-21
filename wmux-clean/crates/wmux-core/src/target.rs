@@ -255,10 +255,14 @@ impl<'a> TargetResolver<'a> {
                 .ok_or_else(|| not_found(TargetKind::Window, raw))?;
             (session, winlink)
         } else if let Some((session_spec, window_spec)) = raw.split_once(':') {
-            if session_spec.is_empty() || window_spec.is_empty() {
+            if window_spec.is_empty() {
                 return Err(invalid(raw, "qualified window target is incomplete"));
             }
-            let session = self.session_id(context, session_spec)?;
+            let session = if session_spec.is_empty() {
+                required(context.current_session, TargetKind::Session, raw)?
+            } else {
+                self.session_id(context, session_spec)?
+            };
             (session, self.winlink_in_session(session, window_spec, raw)?)
         } else {
             let session = required(context.current_session, TargetKind::Session, raw)?;
@@ -320,16 +324,17 @@ impl<'a> TargetResolver<'a> {
 
         let (session, winlink, window, pane_spec) =
             if let Some((session_spec, rest)) = raw.split_once(':') {
-                if session_spec.is_empty() {
-                    return Err(invalid(raw, "qualified pane target has no session"));
-                }
                 let (window_spec, pane_spec) = rest
                     .rsplit_once('.')
                     .ok_or_else(|| invalid(raw, "qualified pane target has no pane"))?;
                 if window_spec.is_empty() || pane_spec.is_empty() {
                     return Err(invalid(raw, "qualified pane target is incomplete"));
                 }
-                let session = self.session_id(context, session_spec)?;
+                let session = if session_spec.is_empty() {
+                    required(context.current_session, TargetKind::Session, raw)?
+                } else {
+                    self.session_id(context, session_spec)?
+                };
                 let winlink = self.winlink_in_session(session, window_spec, raw)?;
                 let window = self.state.winlinks[&winlink].window;
                 (session, winlink, window, pane_spec)
@@ -759,6 +764,16 @@ mod tests {
             .unwrap();
         assert_eq!(qualified.winlink, Some(fixture.first_winlink));
         assert_eq!(qualified.pane, Some(fixture.first_pane));
+
+        let current_qualified = resolver
+            .resolve(
+                &context,
+                TargetKind::Pane,
+                &TargetSpec::parse(":0.0").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(current_qualified.session, Some(fixture.session));
+        assert_eq!(current_qualified.pane, Some(fixture.first_pane));
 
         let relative = resolver
             .resolve(

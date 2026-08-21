@@ -199,6 +199,7 @@ pub fn build_window_scene(
             viewports: &[],
             previous: None,
         },
+        None,
     )
 }
 
@@ -288,7 +289,18 @@ pub fn build_window_scene_with_viewports(
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
 ) -> Option<Scene> {
-    build_window_scene_inner(state, session, cols, rows, overrides)
+    build_window_scene_inner(state, session, cols, rows, overrides, None)
+}
+
+pub fn build_window_scene_with_client_overlay(
+    state: &ServerState,
+    session: SessionId,
+    cols: u16,
+    rows: u16,
+    overrides: PaneSceneOverrides<'_>,
+    confirmation_prompt: Option<&str>,
+) -> Option<Scene> {
+    build_window_scene_inner(state, session, cols, rows, overrides, confirmation_prompt)
 }
 
 fn build_window_scene_inner(
@@ -297,6 +309,7 @@ fn build_window_scene_inner(
     cols: u16,
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
+    confirmation_prompt: Option<&str>,
 ) -> Option<Scene> {
     let structure = build_window_structure(state, session, cols, rows)?;
     let mut lines = vec![Line::blank(cols); rows.max(1) as usize];
@@ -372,6 +385,11 @@ fn build_window_scene_inner(
         }
     }
 
+    if let Some(prompt) = confirmation_prompt {
+        draw_confirmation_prompt(&mut lines, cols, prompt);
+        cursor_visible = false;
+    }
+
     Some(Scene {
         cols: cols.max(1),
         rows: rows.max(1),
@@ -381,6 +399,26 @@ fn build_window_scene_inner(
         cursor_visible,
         cursor_style,
     })
+}
+
+fn draw_confirmation_prompt(lines: &mut [Line], cols: u16, prompt: &str) {
+    let Some(line) = lines.last_mut() else {
+        return;
+    };
+    *line = Line::blank(cols);
+    let mut column = 0_u16;
+    for character in prompt.chars() {
+        let width = crate::scalar_width(character).min(2);
+        if width == 0 {
+            continue;
+        }
+        let width = u16::from(width);
+        if column.saturating_add(width) > cols.max(1) {
+            break;
+        }
+        line.set(column, character, width as u8, Style::default());
+        column += width;
+    }
 }
 
 pub fn render_damage_from_structure(
@@ -1110,10 +1148,11 @@ fn clip_cell_to_width(cell: Cell, column: u16, cols: u16) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_window_scene, build_window_scene_with_retained_panes,
-        build_window_scene_with_viewports, build_window_structure, draw_screen,
-        render_damage_from_structure, render_diff, render_full_scene_with_capabilities,
-        PaneSceneOverrides, PaneViewport, RenderCapabilities, RenderState, RetainedPaneFrame,
+        build_window_scene, build_window_scene_with_client_overlay,
+        build_window_scene_with_retained_panes, build_window_scene_with_viewports,
+        build_window_structure, draw_screen, render_damage_from_structure, render_diff,
+        render_full_scene_with_capabilities, PaneSceneOverrides, PaneViewport, RenderCapabilities,
+        RenderState, RetainedPaneFrame,
     };
     use crate::{Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
     use std::collections::BTreeMap;
@@ -1363,6 +1402,38 @@ mod tests {
 
         assert_eq!(scene.lines[0].text(), "old one");
         assert!(!scene.cursor_visible);
+    }
+
+    #[test]
+    fn confirmation_overlay_clips_the_last_scene_line_without_mutating_the_pane() {
+        let mut server = ServerState::new();
+        let created = server.create_session("confirm", 8, 3);
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"pane data");
+        let authoritative = pane.screen.render_line(2).unwrap().clone();
+        let previous = RenderState::new(8, 3);
+
+        let scene = build_window_scene_with_client_overlay(
+            &server,
+            created.session,
+            8,
+            3,
+            PaneSceneOverrides {
+                previous_frame_panes: &[],
+                retained_frames: &[],
+                viewports: &[],
+                previous: Some(&previous),
+            },
+            Some("kill λ pane?"),
+        )
+        .unwrap();
+
+        assert_eq!(scene.lines[2].text(), "kill λ p");
+        assert!(!scene.cursor_visible);
+        assert_eq!(
+            server.pane(created.pane).unwrap().screen.render_line(2),
+            Some(&authoritative)
+        );
     }
 
     #[test]

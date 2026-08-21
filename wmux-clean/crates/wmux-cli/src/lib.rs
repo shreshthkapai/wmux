@@ -45,8 +45,13 @@ pub const HELP: &str = "Usage: wmux [--help|-h] [--version|-V] [command [argumen
 \n\
 Commands:\n\
   bind-key|bind [-nr] [-T table] key command [arguments]\n\
+  confirm-before|confirm [-p prompt] command [arguments]\n\
   config path|show|effective\n\
   list-keys|lsk [-T table]\n\
+  refresh-client\n\
+  send-keys|send [-l] [-N repeat] [-t target-pane] key [key ...]\n\
+  send-prefix [-t target-pane]\n\
+  switch-client [-lnp | -t target-session]\n\
   unbind-key|unbind [-an] [-T table] [key]\n";
 
 pub fn version_line() -> String {
@@ -199,5 +204,14 @@ mod tests {
 
         let unbind = server(&["unbind", "q"]);
         assert_eq!(unbind.argv, args(&["unbind-key", "q"]));
+
+        let send = server(&["send", "Enter"]);
+        assert_eq!(send.argv, args(&["send-keys", "Enter"]));
+
+        let confirm = server(&["confirm", "kill-pane"]);
+        assert_eq!(confirm.argv, args(&["confirm-before", "kill-pane"]));
+
+        let switch = server(&["switchc", "-n"]);
+        assert_eq!(switch.argv, args(&["switch-client", "-n"]));
     }
 }

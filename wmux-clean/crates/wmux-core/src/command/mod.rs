@@ -20,6 +20,10 @@ pub use parser::{
     parse_command, parse_command_argv, parse_command_text, quote_argument, MAX_COMMANDS,
 };
 
+const MAX_CONFIRM_PROMPT_BYTES: usize = 4 * 1024;
+const MAX_SEND_BYTES: usize = 1024 * 1024;
+const MAX_SEND_REPEAT: u16 = 10_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandList(Arc<[Command]>);
 
@@ -122,6 +126,57 @@ pub enum Command {
     ListKeys {
         table: Option<KeyTableTarget>,
     },
+    SendKeys {
+        target: Option<TargetSpec>,
+        keys: Vec<SendKey>,
+        literal: bool,
+        repeat: u16,
+    },
+    SendPrefix {
+        target: Option<TargetSpec>,
+    },
+    SwitchClient {
+        target: SessionSelector,
+    },
+    RefreshClient,
+    ConfirmBefore {
+        prompt: String,
+        commands: CommandList,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SendKey {
+    Key(KeyCode),
+    Literal(String),
+}
+
+impl SendKey {
+    fn append_bytes(&self, output: &mut Vec<u8>) {
+        match self {
+            Self::Key(key) => key.append_terminal_bytes(output),
+            Self::Literal(text) => output.extend_from_slice(text.as_bytes()),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Key(key) => {
+                let mut bytes = Vec::with_capacity(16);
+                key.append_terminal_bytes(&mut bytes);
+                bytes.len()
+            }
+            Self::Literal(text) => text.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionSelector {
+    Target(TargetSpec),
+    Next,
+    Previous,
+    Last,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,6 +430,54 @@ pub(super) fn execute_state_command(
     queued: QueuedCommand,
 ) -> CommandResult {
     match queued.command {
+        Command::SendKeys { target, .. } | Command::SendPrefix { target } => {
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Pane,
+                target.as_ref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let Some(pane) = resolved.pane else {
+                return error_result(queued.sequence, "no matching pane");
+            };
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: Some(pane),
+            }
+        }
+        Command::SwitchClient { target } => {
+            let session = match target {
+                SessionSelector::Target(target) => {
+                    resolve_session_target(state, queued.client, Some(&target))
+                }
+                SessionSelector::Last => {
+                    let target = TargetSpec::parse("{last}").expect("literal target is valid");
+                    resolve_session_target(state, queued.client, Some(&target))
+                }
+                SessionSelector::Next => adjacent_session(state, queued.client, false),
+                SessionSelector::Previous => adjacent_session(state, queued.client, true),
+            };
+            match session {
+                Ok(session) => attach_result(state, queued.sequence, queued.client, session),
+                Err(error) => error_result(queued.sequence, error),
+            }
+        }
+        Command::RefreshClient | Command::ConfirmBefore { .. } => {
+            if !state.clients.contains_key(&queued.client) {
+                return error_result(queued.sequence, "no matching client");
+            }
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: None,
+            }
+        }
         Command::BindKey {
             table,
             key,
@@ -809,6 +912,34 @@ pub(super) fn execute_state_command(
     }
 }
 
+fn adjacent_session(
+    state: &ServerState,
+    client: ClientId,
+    reverse: bool,
+) -> Result<SessionId, TargetError> {
+    let context = ResolveContext::for_client(state, client)?;
+    let current = context
+        .current_session
+        .ok_or_else(|| TargetError::NotFound {
+            kind: TargetKind::Session,
+            target: "{current}".to_string(),
+        })?;
+    let sessions = state.sessions.keys().copied().collect::<Vec<_>>();
+    let position = sessions
+        .iter()
+        .position(|session| *session == current)
+        .ok_or_else(|| TargetError::NotFound {
+            kind: TargetKind::Session,
+            target: current.raw().to_string(),
+        })?;
+    let next = if reverse {
+        position.checked_sub(1).unwrap_or(sessions.len() - 1)
+    } else {
+        (position + 1) % sessions.len()
+    };
+    Ok(sessions[next])
+}
+
 fn error_result(sequence: u64, message: impl std::fmt::Display) -> CommandResult {
     CommandResult {
         sequence,
@@ -922,6 +1053,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: None,
     },
     CommandEntry {
+        name: "confirm-before",
+        alias: Some("confirm"),
+    },
+    CommandEntry {
         name: "detach-client",
         alias: Some("detach"),
     },
@@ -994,6 +1129,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("resizep"),
     },
     CommandEntry {
+        name: "refresh-client",
+        alias: Some("refresh"),
+    },
+    CommandEntry {
         name: "rotate-window",
         alias: Some("rotatew"),
     },
@@ -1006,6 +1145,14 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("selectw"),
     },
     CommandEntry {
+        name: "send-keys",
+        alias: Some("send"),
+    },
+    CommandEntry {
+        name: "send-prefix",
+        alias: None,
+    },
+    CommandEntry {
         name: "split-window",
         alias: Some("splitw"),
     },
@@ -1016,6 +1163,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "swap-pane",
         alias: Some("swapp"),
+    },
+    CommandEntry {
+        name: "switch-client",
+        alias: Some("switchc"),
     },
     CommandEntry {
         name: "unbind-key",
@@ -1060,6 +1211,14 @@ pub(super) fn parse_single_command(
         "bind-key" => parse_bind_key(argv, depth),
         "unbind-key" => parse_unbind_key(argv),
         "list-keys" => parse_list_keys(argv),
+        "send-keys" => parse_send_keys(argv),
+        "send-prefix" => parse_send_prefix(argv),
+        "switch-client" => parse_switch_client(argv),
+        "refresh-client" => {
+            validate_arguments(argv, &[], &[], 0)?;
+            Ok(Command::RefreshClient)
+        }
+        "confirm-before" => parse_confirm_before(argv, depth),
         "start-server" => {
             validate_arguments(argv, &[], &[], 0)?;
             Ok(Command::StartServer)
@@ -1257,6 +1416,173 @@ fn parse_bind_key(argv: &[String], depth: usize) -> Result<Command, CommandParse
         repeatable,
         commands,
     })
+}
+
+fn parse_send_keys(argv: &[String]) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut literal = false;
+    let mut repeat = 1_u16;
+    let mut target = None;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-l" => literal = true,
+            "-N" => {
+                let raw = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -N"))?;
+                repeat = raw.parse::<u16>().map_err(|_| {
+                    CommandParseError::new("send-keys repeat must be between 1 and 10000")
+                })?;
+                if !(1..=MAX_SEND_REPEAT).contains(&repeat) {
+                    return Err(CommandParseError::new(
+                        "send-keys repeat must be between 1 and 10000",
+                    ));
+                }
+                index += 1;
+            }
+            "-t" => {
+                let raw = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+                target = Some(
+                    TargetSpec::parse(raw.clone())
+                        .map_err(|error| CommandParseError::new(error.to_string()))?,
+                );
+                index += 1;
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    let raw_keys = argv
+        .get(index..)
+        .filter(|keys| !keys.is_empty())
+        .ok_or_else(|| CommandParseError::new("send-keys requires at least one key"))?;
+    let keys = raw_keys
+        .iter()
+        .map(|raw| {
+            if literal {
+                SendKey::Literal(raw.clone())
+            } else {
+                KeyCode::parse(raw)
+                    .map(SendKey::Key)
+                    .unwrap_or_else(|_| SendKey::Literal(raw.clone()))
+            }
+        })
+        .collect::<Vec<_>>();
+    let bytes_per_repeat = keys
+        .iter()
+        .try_fold(0_usize, |total, key| total.checked_add(key.encoded_len()));
+    let total_bytes = bytes_per_repeat.and_then(|bytes| bytes.checked_mul(usize::from(repeat)));
+    if total_bytes.is_none_or(|bytes| bytes > MAX_SEND_BYTES) {
+        return Err(CommandParseError::new(
+            "send-keys encoded output exceeds 1048576 bytes",
+        ));
+    }
+    Ok(Command::SendKeys {
+        target,
+        keys,
+        literal,
+        repeat,
+    })
+}
+
+fn parse_send_prefix(argv: &[String]) -> Result<Command, CommandParseError> {
+    match argv {
+        [_] => Ok(Command::SendPrefix { target: None }),
+        [_, option, raw] if option == "-t" => Ok(Command::SendPrefix {
+            target: Some(
+                TargetSpec::parse(raw.clone())
+                    .map_err(|error| CommandParseError::new(error.to_string()))?,
+            ),
+        }),
+        [_, option] if option == "-t" => Err(CommandParseError::new("missing argument for -t")),
+        [_, option, ..] if option.starts_with('-') => {
+            Err(CommandParseError::new(format!("unknown option: {option}")))
+        }
+        _ => Err(CommandParseError::new("invalid send-prefix arguments")),
+    }
+}
+
+fn parse_switch_client(argv: &[String]) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut selector = None;
+    while let Some(argument) = argv.get(index) {
+        let candidate = match argument.as_str() {
+            "-n" => SessionSelector::Next,
+            "-p" => SessionSelector::Previous,
+            "-l" => SessionSelector::Last,
+            "-t" => {
+                let raw = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+                index += 1;
+                SessionSelector::Target(
+                    TargetSpec::parse(raw.clone())
+                        .map_err(|error| CommandParseError::new(error.to_string()))?,
+                )
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => return Err(CommandParseError::new("invalid switch-client arguments")),
+        };
+        if selector.replace(candidate).is_some() {
+            return Err(CommandParseError::new(
+                "switch-client selectors are mutually exclusive",
+            ));
+        }
+        index += 1;
+    }
+    Ok(Command::SwitchClient {
+        target: selector.unwrap_or_else(|| SessionSelector::Target(TargetSpec::current())),
+    })
+}
+
+fn parse_confirm_before(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut prompt = None;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-p" => {
+                prompt = Some(
+                    argv.get(index + 1)
+                        .ok_or_else(|| CommandParseError::new("missing argument for -p"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => break,
+        }
+    }
+    let nested = argv
+        .get(index..)
+        .filter(|commands| !commands.is_empty())
+        .ok_or_else(|| CommandParseError::new("confirm-before requires a command"))?;
+    let commands = parser::parse_nested_command(nested, depth)?;
+    let prompt = prompt.unwrap_or_else(|| {
+        let formatted = format_command(&commands[0]);
+        let name = formatted
+            .split_once(' ')
+            .map_or(formatted.as_str(), |(name, _)| name);
+        format!("Confirm '{name}'? (y/n)")
+    });
+    if prompt.len() > MAX_CONFIRM_PROMPT_BYTES {
+        return Err(CommandParseError::new(
+            "confirmation prompt exceeds 4096 bytes",
+        ));
+    }
+    Ok(Command::ConfirmBefore { prompt, commands })
 }
 
 fn parse_unbind_key(argv: &[String]) -> Result<Command, CommandParseError> {
@@ -1523,6 +1849,62 @@ fn format_command(command: &Command) -> String {
             }
             "list-keys"
         }
+        Command::SendKeys {
+            target,
+            keys,
+            literal,
+            repeat,
+        } => {
+            if *literal {
+                arguments.push("-l".to_string());
+            }
+            if *repeat != 1 {
+                arguments.extend(["-N".to_string(), repeat.to_string()]);
+            }
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            arguments.extend(keys.iter().map(|key| match key {
+                SendKey::Key(key) => key.to_string(),
+                SendKey::Literal(text) => text.clone(),
+            }));
+            "send-keys"
+        }
+        Command::SendPrefix { target } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "send-prefix"
+        }
+        Command::SwitchClient { target } => {
+            match target {
+                SessionSelector::Target(target) => {
+                    arguments.extend(["-t".to_string(), target.to_string()]);
+                }
+                SessionSelector::Next => arguments.push("-n".to_string()),
+                SessionSelector::Previous => arguments.push("-p".to_string()),
+                SessionSelector::Last => arguments.push("-l".to_string()),
+            }
+            "switch-client"
+        }
+        Command::RefreshClient => "refresh-client",
+        Command::ConfirmBefore { prompt, commands } => {
+            arguments.extend(["-p".to_string(), prompt.clone()]);
+            let nested = format_command_list(commands);
+            let nested = if commands.len() == 1 {
+                nested
+            } else {
+                quote_argument(&nested)
+            };
+            return format!(
+                "confirm-before {} {nested}",
+                arguments
+                    .iter()
+                    .map(|argument| quote_argument(argument))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
     };
 
     if arguments.is_empty() {
@@ -1610,8 +1992,8 @@ fn resize_amount(argv: &[String]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute, parse_command, parse_command_text, Command, CommandEffect, CommandQueue,
-        CommandSource,
+        execute, parse_command, parse_command_argv, parse_command_text, Command, CommandEffect,
+        CommandQueue, CommandSource,
     };
     use crate::{
         build_window_scene, render_full_scene, KeyCode, RenderState, ServerState, SplitDirection,
@@ -1663,6 +2045,136 @@ mod tests {
             }
         }
         Ok(output)
+    }
+
+    fn execute_one(
+        state: &mut ServerState,
+        client: crate::ClientId,
+        raw: &str,
+    ) -> super::CommandOutcome {
+        let commands = parse_command_text(raw).unwrap();
+        assert_eq!(commands.len(), 1);
+        execute(
+            state,
+            super::QueuedCommand {
+                invocation: 1,
+                sequence: 1,
+                client,
+                command: commands[0].clone(),
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
+            },
+        )
+    }
+
+    #[test]
+    fn send_keys_and_send_prefix_emit_exact_targeted_bytes() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        let literal = execute_one(&mut state, client, "send-keys -t :0.0 -l 'λ x'");
+        assert_eq!(
+            literal.effects.as_slice(),
+            [super::CommandEffect::PaneInput {
+                pane: created.pane,
+                bytes: "λ x".as_bytes().to_vec(),
+            }]
+        );
+        let literal_parts = execute_one(&mut state, client, "send -l one ' two'");
+        assert_eq!(
+            literal_parts.effects.as_slice(),
+            [super::CommandEffect::PaneInput {
+                pane: created.pane,
+                bytes: b"one two".to_vec(),
+            }]
+        );
+
+        let named = execute_one(&mut state, client, "send-keys -N 2 -t :0.0 Enter C-a");
+        assert_eq!(
+            named.effects.as_slice(),
+            [super::CommandEffect::PaneInput {
+                pane: created.pane,
+                bytes: b"\r\x01\r\x01".to_vec(),
+            }]
+        );
+
+        let prefix = execute_one(&mut state, client, "send-prefix -t :0.0");
+        assert_eq!(
+            prefix.effects.as_slice(),
+            [super::CommandEffect::PaneInput {
+                pane: created.pane,
+                bytes: vec![0x02],
+            }]
+        );
+    }
+
+    #[test]
+    fn switch_refresh_and_confirmation_are_client_scoped() {
+        let mut state = ServerState::new();
+        let first = state.add_client();
+        let second = state.add_client();
+        let alpha = state.create_session("alpha", 80, 24);
+        let beta = state.create_session("beta", 80, 24);
+        let gamma = state.create_session("gamma", 80, 24);
+        state.attach_client(first, alpha.session).unwrap();
+        state.attach_client(second, alpha.session).unwrap();
+
+        assert!(execute_one(&mut state, first, "switch-client -n").ok);
+        assert_eq!(state.clients[&first].attached_session, Some(beta.session));
+        assert_eq!(state.clients[&second].attached_session, Some(alpha.session));
+        assert!(execute_one(&mut state, first, "switch-client -p").ok);
+        assert_eq!(state.clients[&first].attached_session, Some(alpha.session));
+        assert!(execute_one(&mut state, first, "switch-client -t gamma").ok);
+        assert_eq!(state.clients[&first].attached_session, Some(gamma.session));
+        assert!(execute_one(&mut state, first, "switch-client -l").ok);
+        assert_eq!(state.clients[&first].attached_session, Some(alpha.session));
+
+        assert_eq!(
+            execute_one(&mut state, first, "refresh-client")
+                .effects
+                .as_slice(),
+            [super::CommandEffect::RefreshClient { client: first }]
+        );
+
+        let confirmation = execute_one(
+            &mut state,
+            first,
+            "confirm-before -p 'kill pane? (y/n)' kill-pane",
+        );
+        assert!(matches!(
+            confirmation.effects.as_slice(),
+            [super::CommandEffect::Confirm { client, prompt, commands }]
+                if *client == first && prompt == "kill pane? (y/n)" && commands.len() == 1
+        ));
+    }
+
+    #[test]
+    fn send_and_confirmation_limits_reject_before_state_mutation() {
+        for invalid in [
+            "send-keys -N 0 x",
+            "send-keys -N 10001 x",
+            "send-keys -N nope x",
+            "send-keys -l",
+            "switch-client -n -p",
+            "refresh-client extra",
+            "confirm-before",
+        ] {
+            assert!(parse_command_text(invalid).is_err(), "accepted {invalid:?}");
+        }
+
+        let oversized_prompt = "x".repeat(4 * 1024 + 1);
+        assert!(parse_command_argv(&[
+            "confirm-before".to_string(),
+            "-p".to_string(),
+            oversized_prompt,
+            "kill-pane".to_string(),
+        ])
+        .is_err());
+
+        assert!(parse_command_text(&format!("send-keys -l -N 10000 {}", "x".repeat(105))).is_err());
+        assert!(parse_command_text(&format!("send-keys -l -N 10000 {}", "x".repeat(104))).is_ok());
     }
 
     #[test]

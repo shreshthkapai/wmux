@@ -23,7 +23,7 @@ use tokio::{
 };
 use wmux_config::{config_path, WmuxConfig};
 use wmux_core::{
-    build_window_scene_with_viewports, build_window_structure, execute, parse_command_text,
+    build_window_scene_with_client_overlay, build_window_structure, execute, parse_command_text,
     render_damage_from_structure, render_diff_scene_with_capabilities, route_key, BareKey,
     ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue, CommandSource,
     CopyMode, CopyModeResult, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
@@ -1435,7 +1435,28 @@ impl ServerOwner {
         } else {
             InputMode::Normal
         };
-        match route_key(&mut self.runtime.state, client, mode, event, now_ms) {
+        let had_confirmation = self
+            .runtime
+            .state
+            .clients
+            .get(&client)
+            .is_some_and(|client| client.confirmation.is_some());
+        let route = route_key(&mut self.runtime.state, client, mode, event, now_ms);
+        let confirmation_closed = had_confirmation
+            && self
+                .runtime
+                .state
+                .clients
+                .get(&client)
+                .is_some_and(|client| client.confirmation.is_none());
+        if confirmation_closed {
+            if let Some(view) = self.clients.get_mut(&client) {
+                view.full_render = true;
+                view.render_state.invalidate();
+                view.request_immediate_render(Instant::now());
+            }
+        }
+        match route {
             InputRoute::PaneBytes(bytes) => {
                 if let Some(pane) = self.active_pane_for_client(client) {
                     self.runtime
@@ -1552,10 +1573,10 @@ impl ServerOwner {
                 if let Some(view) = self.clients.get_mut(&client) {
                     if should_attach && !view.attached {
                         view.attached = true;
-                        view.full_render = true;
-                        view.render_state.invalidate();
-                        view.structure = None;
                     }
+                    view.full_render = true;
+                    view.render_state.invalidate();
+                    view.structure = None;
                 }
                 if self.clients.get(&client).is_some_and(|view| view.attached) {
                     self.commit_layout_transaction(client, size)?;
@@ -1570,8 +1591,17 @@ impl ServerOwner {
                 prompt,
                 commands,
             } => {
+                let mut installed = false;
                 if let Some(client) = self.runtime.state.clients.get_mut(&client) {
                     client.confirmation = Some(wmux_core::ConfirmationState { prompt, commands });
+                    installed = true;
+                }
+                if installed {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.full_render = true;
+                        view.render_state.invalidate();
+                        view.request_immediate_render(Instant::now());
+                    }
                 }
                 Ok(false)
             }
@@ -1883,6 +1913,12 @@ impl ServerOwner {
                 self.clients.insert(client, view);
                 continue;
             };
+            let confirmation_active = self
+                .runtime
+                .state
+                .clients
+                .get(&client)
+                .is_some_and(|client| client.confirmation.is_some());
             let Some(structure) = build_window_structure(
                 &self.runtime.state,
                 session,
@@ -1911,6 +1947,7 @@ impl ServerOwner {
             if !view.full_render
                 && view.scroll_offsets.is_empty()
                 && view.copy_mode.is_none()
+                && !confirmation_active
                 && pane_generations.iter().all(|(pane, generation)| {
                     view.consumed_generations.get(pane) == Some(generation)
                 })
@@ -1932,6 +1969,7 @@ impl ServerOwner {
             } else if self.runtime.resize_repaint_holds.is_empty()
                 && view.scroll_offsets.is_empty()
                 && view.copy_mode.is_none()
+                && !confirmation_active
             {
                 render_damage_from_structure(
                     &self.runtime.state,
@@ -2105,9 +2143,15 @@ fn render_full_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
+    let confirmation_prompt = runtime
+        .state
+        .clients
+        .get(&client)
+        .and_then(|client| client.confirmation.as_ref())
+        .map(|confirmation| confirmation.prompt.clone());
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
-    let Some(scene) = build_window_scene_with_viewports(
+    let Some(scene) = build_window_scene_with_client_overlay(
         &runtime.state,
         session,
         size.cols,
@@ -2118,6 +2162,7 @@ fn render_full_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
+        confirmation_prompt.as_deref(),
     ) else {
         return Vec::new();
     };
@@ -2136,9 +2181,15 @@ fn render_diff_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
+    let confirmation_prompt = runtime
+        .state
+        .clients
+        .get(&client)
+        .and_then(|client| client.confirmation.as_ref())
+        .map(|confirmation| confirmation.prompt.clone());
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
-    let Some(scene) = build_window_scene_with_viewports(
+    let Some(scene) = build_window_scene_with_client_overlay(
         &runtime.state,
         session,
         size.cols,
@@ -2149,6 +2200,7 @@ fn render_diff_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
+        confirmation_prompt.as_deref(),
     ) else {
         return Vec::new();
     };
@@ -2426,6 +2478,88 @@ mod tests {
     }
 
     #[test]
+    fn destructive_prefix_binding_prompts_rejects_and_only_then_accepts() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("confirm", 80, 24);
+        let killed = owner
+            .runtime
+            .state
+            .split_pane(created.window, None, SplitDirection::LeftRight, 80, 24)
+            .unwrap();
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let authoritative_last_line = owner.runtime.state.panes[&killed]
+            .screen
+            .render_line(23)
+            .unwrap()
+            .clone();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(client, view);
+        for pane in [created.pane, killed] {
+            let (_pane_tx, pane_rx) = mpsc::channel(1);
+            owner
+                .runtime
+                .platform_panes
+                .insert(pane, PlatformPane::test(pane_rx, TerminalSize::new(40, 24)));
+        }
+
+        for (character, modifiers, raw) in [
+            ('b', WireKeyModifiers::CONTROL, b"\x02".as_slice()),
+            ('x', WireKeyModifiers::NONE, b"x".as_slice()),
+        ] {
+            owner
+                .handle_wire_key_at(client, wire_char(character, modifiers, raw), 0)
+                .unwrap();
+        }
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.runtime.state.clients[&client].confirmation.is_some());
+        assert!(owner.render_due_clients(Instant::now()));
+        let prompt_frame = outbound_rx.try_recv().unwrap();
+        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+            panic!("expected confirmation render");
+        };
+        assert!(String::from_utf8_lossy(bytes).contains("kill-pane? (y/n)"));
+        assert_eq!(
+            owner.runtime.state.panes[&killed].screen.render_line(23),
+            Some(&authoritative_last_line)
+        );
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .drained(prompt_frame.wire_len());
+
+        owner
+            .handle_wire_key_at(client, wire_char('n', WireKeyModifiers::NONE, b"n"), 1)
+            .unwrap();
+        assert!(owner.runtime.state.clients[&client].confirmation.is_none());
+        assert!(owner.runtime.state.panes.contains_key(&killed));
+        assert!(owner.clients[&client].full_render);
+
+        for (character, modifiers, raw) in [
+            ('b', WireKeyModifiers::CONTROL, b"\x02".as_slice()),
+            ('x', WireKeyModifiers::NONE, b"x".as_slice()),
+        ] {
+            owner
+                .handle_wire_key_at(client, wire_char(character, modifiers, raw), 2)
+                .unwrap();
+        }
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        owner
+            .handle_wire_key_at(client, wire_char('y', WireKeyModifiers::NONE, b"y"), 3)
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(!owner.runtime.state.panes.contains_key(&killed));
+        assert!(owner.runtime.state.panes.contains_key(&created.pane));
+    }
+
+    #[test]
     fn server_owned_key_unbound_utf8_and_paste_reach_the_pane_once() {
         let (mut owner, client, pane) = attached_owner();
         owner
@@ -2663,6 +2797,37 @@ mod tests {
         assert!(owner.process_command_queue(1));
         assert!(owner.clients[&client].copy_mode.is_some());
         assert!(!owner.runtime.queue.is_empty());
+    }
+
+    #[test]
+    fn refresh_client_invalidates_only_the_requesting_clients_baseline() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("refresh", 80, 24);
+        let first = owner.runtime.state.add_client();
+        let second = owner.runtime.state.add_client();
+        for client in [first, second] {
+            owner
+                .runtime
+                .state
+                .attach_client(client, created.session)
+                .unwrap();
+            let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+            let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+            view.attached = true;
+            view.full_render = false;
+            owner.clients.insert(client, view);
+        }
+        owner.enqueue_command_list(
+            first,
+            parse_command_text("refresh-client").unwrap(),
+            CommandSource::KeyBinding,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.clients[&first].full_render);
+        assert!(!owner.clients[&second].full_render);
+        assert!(owner.clients[&first].scheduler.deadline.is_some());
+        assert!(owner.clients[&second].scheduler.deadline.is_none());
     }
 
     #[test]
