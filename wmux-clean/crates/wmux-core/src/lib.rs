@@ -7,6 +7,7 @@ pub mod layout;
 pub mod render;
 pub mod screen;
 pub mod state;
+pub mod target;
 pub mod terminal;
 pub mod text;
 
@@ -31,6 +32,9 @@ pub use screen::{
     Screen, MAX_TITLE_BYTES,
 };
 pub use state::{Client, Pane, PaneResize, ServerState, Session, SessionGroup, Window, Winlink};
+pub use target::{
+    ResolveContext, ResolvedTarget, TargetError, TargetKind, TargetResolver, TargetSpec,
+};
 pub use terminal::{
     CsiParams, TerminalBatch, TerminalEngine, TerminalEvent, TerminalOperation, MAX_OSC_BYTES,
 };

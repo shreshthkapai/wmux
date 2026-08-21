@@ -9,6 +9,7 @@ use crate::{
 pub struct Client {
     pub id: ClientId,
     pub attached_session: Option<SessionId>,
+    pub previous_session: Option<SessionId>,
     pub attached_pane: Option<PaneId>,
 }
 
@@ -122,6 +123,7 @@ impl ServerState {
             Client {
                 id,
                 attached_session: None,
+                previous_session: None,
                 attached_pane: None,
             },
         );
@@ -329,6 +331,12 @@ impl ServerState {
     pub fn attach_client(&mut self, client: ClientId, session: SessionId) -> Option<PaneId> {
         let pane = self.active_pane_for_session(session)?;
         let client = self.clients.get_mut(&client)?;
+        if let Some(previous) = client
+            .attached_session
+            .filter(|previous| *previous != session)
+        {
+            client.previous_session = Some(previous);
+        }
         client.attached_session = Some(session);
         client.attached_pane = Some(pane);
         Some(pane)
@@ -347,6 +355,13 @@ impl ServerState {
             .values()
             .find(|winlink| winlink.session == session && winlink.index == index)?
             .id;
+        self.select_winlink(session, winlink)
+    }
+
+    pub fn select_winlink(&mut self, session: SessionId, winlink: WinlinkId) -> Option<PaneId> {
+        if self.winlinks.get(&winlink)?.session != session {
+            return None;
+        }
         let session_state = self.sessions.get_mut(&session)?;
         if session_state.active_winlink != winlink {
             session_state.previous_winlink = Some(session_state.active_winlink);
@@ -640,6 +655,9 @@ impl ServerState {
                 client.attached_session = None;
                 client.attached_pane = None;
             }
+            if client.previous_session == Some(session) {
+                client.previous_session = None;
+            }
         }
         if let Some(group_id) = removed.group {
             let remove_group = if let Some(group) = self.session_groups.get_mut(&group_id) {
@@ -668,17 +686,6 @@ impl ServerState {
         self.winlinks
             .get(&session.active_winlink)
             .map(|winlink| winlink.window)
-    }
-
-    pub fn find_session(&self, target: Option<&str>) -> Option<SessionId> {
-        match target {
-            Some(target) => self
-                .sessions
-                .values()
-                .find(|session| session.name == target || session.id.raw().to_string() == target)
-                .map(|session| session.id),
-            None => self.sessions.keys().next().copied(),
-        }
     }
 
     pub fn pane_mut(&mut self, pane: PaneId) -> Option<&mut Pane> {

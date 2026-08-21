@@ -1,6 +1,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use crate::{ClientId, PaneId, ResizeDirection, ServerState, SessionId, SplitDirection};
+use crate::{
+    ClientId, PaneId, ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId,
+    SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
+};
 
 mod execute;
 mod lexer;
@@ -49,14 +52,14 @@ pub enum Command {
     ListClients,
     ListSessions,
     ListWindows {
-        target: Option<String>,
+        target: Option<TargetSpec>,
     },
     ListPanes {
-        target: Option<String>,
+        target: Option<TargetSpec>,
     },
     NewSession {
         name: Option<String>,
-        group: Option<String>,
+        group: Option<TargetSpec>,
         attach: bool,
         attach_if_exists: bool,
         cols: u16,
@@ -70,7 +73,7 @@ pub enum Command {
         detached: bool,
     },
     SelectWindow {
-        target: WindowTarget,
+        target: TargetSpec,
     },
     SelectPane {
         target: PaneTarget,
@@ -91,27 +94,18 @@ pub enum Command {
     KillPane,
     KillWindow,
     KillSession {
-        target: Option<String>,
+        target: Option<TargetSpec>,
     },
     AttachSession {
-        target: Option<String>,
+        target: Option<TargetSpec>,
     },
     CopyMode,
     DetachClient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WindowTarget {
-    Index(u16),
-    Next,
-    Previous,
-    Last,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaneTarget {
-    Active,
-    Last,
+    Target(TargetSpec),
     Direction(ResizeDirection),
 }
 
@@ -195,8 +189,9 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             attached_pane: None,
         },
         Command::ListWindows { target } => {
-            let Some(session) = state.find_session(target.as_deref()) else {
-                return error_result(queued.sequence, "no matching session");
+            let session = match resolve_session_target(state, queued.client, target.as_ref()) {
+                Ok(session) => session,
+                Err(error) => return error_result(queued.sequence, error),
             };
             match state.list_windows(session) {
                 Some(message) => CommandResult {
@@ -209,10 +204,16 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::ListPanes { target } => {
-            let Some(session) = state.find_session(target.as_deref()) else {
-                return error_result(queued.sequence, "no matching session");
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Session,
+                target.as_ref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
             };
-            let Some(window) = state.active_window_for_session(session) else {
+            let Some(window) = resolved.window else {
                 return error_result(queued.sequence, "session has no active window");
             };
             match state.list_panes(window) {
@@ -234,15 +235,16 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             rows,
         } => {
             let name = name.unwrap_or_else(|| "default".to_string());
-            if let Some(existing) = state.find_session(Some(&name)) {
+            if let Some(existing) = TargetResolver::new(state).find_exact_session(&name) {
                 if attach_if_exists {
                     return attach_result(state, queued.sequence, queued.client, existing);
                 }
                 return error_result(queued.sequence, format!("duplicate session: {name}"));
             }
             let created = if let Some(group) = group {
-                let Some(target) = state.find_session(Some(&group)) else {
-                    return error_result(queued.sequence, "no matching session group target");
+                let target = match resolve_session_target(state, queued.client, Some(&group)) {
+                    Ok(target) => target,
+                    Err(error) => return error_result(queued.sequence, error),
                 };
                 match state.create_grouped_session(name, target) {
                     Some(created) => created,
@@ -265,8 +267,9 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::NewWindow { name } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
+            let session = match resolve_session_target(state, queued.client, None) {
+                Ok(session) => session,
+                Err(error) => return error_result(queued.sequence, error),
             };
             match state.create_window(session, name, 80, 24) {
                 Some(created) => {
@@ -285,13 +288,16 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             direction,
             detached,
         } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Pane, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window), target) =
+                (resolved.session, resolved.window, resolved.pane)
+            else {
+                return error_result(queued.sequence, "no active pane");
             };
-            let Some(window) = state.active_window_for_session(session) else {
-                return error_result(queued.sequence, "session has no active window");
-            };
-            let target = state.windows.get(&window).map(|window| window.active_pane);
             match state.split_pane(window, target, direction, 80, 24) {
                 Some(pane) => {
                     if !detached {
@@ -308,16 +314,19 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::SelectWindow { target } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Window,
+                Some(&target),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
             };
-            let selected = match target {
-                WindowTarget::Index(index) => state.select_window(session, index),
-                WindowTarget::Next => state.select_next_window(session, false),
-                WindowTarget::Previous => state.select_next_window(session, true),
-                WindowTarget::Last => state.select_last_window(session),
+            let (Some(session), Some(winlink)) = (resolved.session, resolved.winlink) else {
+                return error_result(queued.sequence, "no matching window");
             };
-            match selected {
+            match state.select_winlink(session, winlink) {
                 Some(pane) => {
                     let _ = state.attach_client(queued.client, session);
                     CommandResult {
@@ -331,19 +340,42 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::SelectPane { target } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
-                return error_result(queued.sequence, "session has no active window");
-            };
             let selected = match target {
-                PaneTarget::Active => state.windows.get(&window).map(|window| window.active_pane),
-                PaneTarget::Last => state.select_last_pane(window),
-                PaneTarget::Direction(direction) => state.select_adjacent_pane(window, direction),
+                PaneTarget::Target(target) => {
+                    let resolved = match resolve_command_target(
+                        state,
+                        queued.client,
+                        TargetKind::Pane,
+                        Some(&target),
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => return error_result(queued.sequence, error),
+                    };
+                    let (Some(session), Some(window), Some(pane)) =
+                        (resolved.session, resolved.window, resolved.pane)
+                    else {
+                        return error_result(queued.sequence, "no matching pane");
+                    };
+                    (session, state.select_pane(window, pane))
+                }
+                PaneTarget::Direction(direction) => {
+                    let resolved = match resolve_command_target(
+                        state,
+                        queued.client,
+                        TargetKind::Window,
+                        None,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => return error_result(queued.sequence, error),
+                    };
+                    let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
+                        return error_result(queued.sequence, "session has no active window");
+                    };
+                    (session, state.select_adjacent_pane(window, direction))
+                }
             };
             match selected {
-                Some(pane) => {
+                (session, Some(pane)) => {
                     let _ = state.attach_client(queued.client, session);
                     CommandResult {
                         sequence: queued.sequence,
@@ -352,14 +384,16 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
                         attached_pane: Some(pane),
                     }
                 }
-                None => error_result(queued.sequence, "no matching pane"),
+                (_, None) => error_result(queued.sequence, "no matching pane"),
             }
         }
         Command::ResizePane { target, amount } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             match target {
@@ -379,10 +413,12 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::RenameWindow { name } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             state.rename_window(window, name);
@@ -394,10 +430,12 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::RotateWindow { reverse } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             state.rotate_window(window, reverse);
@@ -409,10 +447,12 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::SwapPane { direction } => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             state.swap_active_pane(window, direction);
@@ -424,10 +464,12 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::KillPane => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(pane) = state.active_pane_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Pane, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(pane)) = (resolved.session, resolved.pane) else {
                 return error_result(queued.sequence, "no active pane");
             };
             if state.kill_pane(pane).is_none() {
@@ -441,10 +483,12 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::KillWindow => {
-            let Some(session) = attached_or_first_session(state, queued.client) else {
-                return error_result(queued.sequence, "no sessions");
-            };
-            let Some(window) = state.active_window_for_session(session) else {
+            let resolved =
+                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result(queued.sequence, error),
+                };
+            let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             if state.kill_window(window).is_none() {
@@ -458,8 +502,9 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::KillSession { target } => {
-            let Some(session) = state.find_session(target.as_deref()) else {
-                return error_result(queued.sequence, "no matching session");
+            let session = match resolve_session_target(state, queued.client, target.as_ref()) {
+                Ok(session) => session,
+                Err(error) => return error_result(queued.sequence, error),
             };
             if state.kill_session(session).is_none() {
                 return error_result(queued.sequence, "no matching session");
@@ -472,13 +517,9 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
             }
         }
         Command::AttachSession { target } => {
-            let Some(session) = state.find_session(target.as_deref()) else {
-                return CommandResult {
-                    sequence: queued.sequence,
-                    ok: false,
-                    message: "no matching session".to_string(),
-                    attached_pane: None,
-                };
+            let session = match resolve_session_target(state, queued.client, target.as_ref()) {
+                Ok(session) => session,
+                Err(error) => return error_result(queued.sequence, error),
             };
             attach_result(state, queued.sequence, queued.client, session)
         }
@@ -494,11 +535,11 @@ pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> 
     }
 }
 
-fn error_result(sequence: u64, message: impl Into<String>) -> CommandResult {
+fn error_result(sequence: u64, message: impl std::fmt::Display) -> CommandResult {
     CommandResult {
         sequence,
         ok: false,
-        message: message.into(),
+        message: message.to_string(),
         attached_pane: None,
     }
 }
@@ -525,12 +566,28 @@ fn attach_result(
     }
 }
 
-fn attached_or_first_session(state: &ServerState, client: ClientId) -> Option<SessionId> {
-    state
-        .clients
-        .get(&client)
-        .and_then(|client| client.attached_session)
-        .or_else(|| state.sessions.keys().next().copied())
+fn resolve_command_target(
+    state: &ServerState,
+    client: ClientId,
+    kind: TargetKind,
+    target: Option<&TargetSpec>,
+) -> Result<ResolvedTarget, TargetError> {
+    let context = ResolveContext::for_client(state, client)?;
+    let current = TargetSpec::current();
+    TargetResolver::new(state).resolve(&context, kind, target.unwrap_or(&current))
+}
+
+fn resolve_session_target(
+    state: &ServerState,
+    client: ClientId,
+    target: Option<&TargetSpec>,
+) -> Result<SessionId, TargetError> {
+    resolve_command_target(state, client, TargetKind::Session, target)?
+        .session
+        .ok_or_else(|| TargetError::NotFound {
+            kind: TargetKind::Session,
+            target: target.map_or_else(|| "{current}".to_string(), ToString::to_string),
+        })
 }
 
 struct CommandEntry {
@@ -683,10 +740,10 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
         "list-clients" => Ok(Command::ListClients),
         "list-sessions" => Ok(Command::ListSessions),
         "list-windows" => Ok(Command::ListWindows {
-            target: flag_value(argv, "-t"),
+            target: target_flag_value(argv, "-t")?,
         }),
         "list-panes" => Ok(Command::ListPanes {
-            target: flag_value(argv, "-t"),
+            target: target_flag_value(argv, "-t")?,
         }),
         "detach-client" => Ok(Command::DetachClient),
         "copy-mode" => {
@@ -695,7 +752,7 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
         }
         "new-session" => {
             let name = flag_value(argv, "-s");
-            let group = flag_value(argv, "-t");
+            let group = target_flag_value(argv, "-t")?;
             Ok(Command::NewSession {
                 name,
                 group,
@@ -706,7 +763,7 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
             })
         }
         "attach-session" => {
-            let target = flag_value(argv, "-t");
+            let target = target_flag_value(argv, "-t")?;
             Ok(Command::AttachSession { target })
         }
         "new-window" => Ok(Command::NewWindow {
@@ -722,28 +779,29 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
         }),
         "select-window" => {
             let target = if has_flag(argv, "-n") {
-                WindowTarget::Next
+                TargetSpec::parse("+1")
             } else if has_flag(argv, "-p") {
-                WindowTarget::Previous
+                TargetSpec::parse("-1")
             } else if has_flag(argv, "-l") {
-                WindowTarget::Last
+                TargetSpec::parse("{last}")
             } else {
-                let index = flag_value(argv, "-t")
-                    .and_then(|value| parse_window_index(&value))
-                    .or_else(|| argv.get(1).and_then(|value| parse_window_index(value)))
-                    .unwrap_or(0);
-                WindowTarget::Index(index)
-            };
+                TargetSpec::parse(
+                    flag_value(argv, "-t")
+                        .or_else(|| argv.get(1).cloned())
+                        .unwrap_or_else(|| "0".to_string()),
+                )
+            }
+            .map_err(|error| CommandParseError::new(error.to_string()))?;
             Ok(Command::SelectWindow { target })
         }
         "next-window" => Ok(Command::SelectWindow {
-            target: WindowTarget::Next,
+            target: TargetSpec::parse("+1").expect("literal target is valid"),
         }),
         "previous-window" => Ok(Command::SelectWindow {
-            target: WindowTarget::Previous,
+            target: TargetSpec::parse("-1").expect("literal target is valid"),
         }),
         "last-window" => Ok(Command::SelectWindow {
-            target: WindowTarget::Last,
+            target: TargetSpec::parse("{last}").expect("literal target is valid"),
         }),
         "select-pane" => Ok(Command::SelectPane {
             target: if has_flag(argv, "-L") {
@@ -755,13 +813,17 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
             } else if has_flag(argv, "-D") {
                 PaneTarget::Direction(ResizeDirection::Down)
             } else if has_flag(argv, "-l") {
-                PaneTarget::Last
+                PaneTarget::Target(TargetSpec::parse("{last}").expect("literal target is valid"))
             } else {
-                PaneTarget::Active
+                PaneTarget::Target(
+                    target_flag_value(argv, "-t")?.unwrap_or_else(TargetSpec::current),
+                )
             },
         }),
         "last-pane" => Ok(Command::SelectPane {
-            target: PaneTarget::Last,
+            target: PaneTarget::Target(
+                TargetSpec::parse("{last}").expect("literal target is valid"),
+            ),
         }),
         "resize-pane" => Ok(Command::ResizePane {
             target: if has_flag(argv, "-Z") {
@@ -807,7 +869,7 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
         "kill-session" => {
             validate_arguments(argv, &[], &["-t"], 0)?;
             Ok(Command::KillSession {
-                target: flag_value(argv, "-t"),
+                target: target_flag_value(argv, "-t")?,
             })
         }
         _ => unreachable!("resolved command is missing a parser: {command}"),
@@ -817,6 +879,13 @@ pub(super) fn parse_single_command(argv: &[String]) -> Result<Command, CommandPa
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
     argv.windows(2)
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
+}
+
+fn target_flag_value(argv: &[String], flag: &str) -> Result<Option<TargetSpec>, CommandParseError> {
+    flag_value(argv, flag)
+        .map(TargetSpec::parse)
+        .transpose()
+        .map_err(|error| CommandParseError::new(error.to_string()))
 }
 
 fn has_flag(argv: &[String], flag: &str) -> bool {
@@ -862,10 +931,6 @@ fn validate_arguments(
     Ok(())
 }
 
-fn parse_window_index(value: &str) -> Option<u16> {
-    value.rsplit(':').next()?.parse::<u16>().ok()
-}
-
 fn resize_amount(argv: &[String]) -> u16 {
     for flag in ["-L", "-R", "-U", "-D"] {
         if let Some(value) = flag_value(argv, flag) {
@@ -882,7 +947,14 @@ fn resize_amount(argv: &[String]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{execute, parse_command, Command, CommandQueue};
-    use crate::{build_window_scene, render_full_scene, RenderState, ServerState, SplitDirection};
+    use crate::{
+        build_window_scene, render_full_scene, RenderState, ServerState, SplitDirection,
+        TargetResolver, TargetSpec,
+    };
+
+    fn target(raw: &str) -> TargetSpec {
+        TargetSpec::parse(raw).unwrap()
+    }
 
     #[test]
     fn command_queue_executes_deterministically() {
@@ -1169,7 +1241,7 @@ mod tests {
                 client,
                 command: Command::NewSession {
                     name: Some("G2".to_string()),
-                    group: Some("G1".to_string()),
+                    group: Some(target("G1")),
                     attach: true,
                     attach_if_exists: false,
                     cols: 80,
@@ -1178,8 +1250,12 @@ mod tests {
             },
         );
         assert!(second.ok);
-        let g1 = state.find_session(Some("G1")).unwrap();
-        let g2 = state.find_session(Some("G2")).unwrap();
+        let g1 = TargetResolver::new(&state)
+            .find_exact_session("G1")
+            .unwrap();
+        let g2 = TargetResolver::new(&state)
+            .find_exact_session("G2")
+            .unwrap();
         assert_eq!(state.session_groups.len(), 1);
         assert_eq!(
             state.active_window_for_session(g1),
@@ -1223,7 +1299,7 @@ mod tests {
             .unwrap(),
             Command::NewSession {
                 name: Some("test".to_string()),
-                group: Some("base".to_string()),
+                group: Some(target("base")),
                 attach: false,
                 attach_if_exists: true,
                 cols: 80,
@@ -1238,7 +1314,7 @@ mod tests {
             ])
             .unwrap(),
             Command::AttachSession {
-                target: Some("test".to_string())
+                target: Some(target("test"))
             }
         );
         assert_eq!(
@@ -1255,13 +1331,13 @@ mod tests {
         assert_eq!(
             parse_command(&["lsw".to_string(), "-t".to_string(), "test".to_string()]).unwrap(),
             Command::ListWindows {
-                target: Some("test".to_string())
+                target: Some(target("test"))
             }
         );
         assert_eq!(
             parse_command(&["lsp".to_string(), "-t".to_string(), "test".to_string()]).unwrap(),
             Command::ListPanes {
-                target: Some("test".to_string())
+                target: Some(target("test"))
             }
         );
         assert_eq!(
@@ -1281,6 +1357,56 @@ mod tests {
         assert_eq!(
             parse_command(&["kill-server".to_string()]).unwrap(),
             Command::KillServer
+        );
+    }
+
+    #[test]
+    fn window_and_pane_selectors_parse_once_as_target_specs() {
+        assert_eq!(
+            parse_command(&["next-window".to_string()]).unwrap(),
+            Command::SelectWindow {
+                target: target("+1")
+            }
+        );
+        assert_eq!(
+            parse_command(&["previous-window".to_string()]).unwrap(),
+            Command::SelectWindow {
+                target: target("-1")
+            }
+        );
+        assert_eq!(
+            parse_command(&["last-window".to_string()]).unwrap(),
+            Command::SelectWindow {
+                target: target("{last}")
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "select-window".to_string(),
+                "-t".to_string(),
+                "work:logs".to_string(),
+            ])
+            .unwrap(),
+            Command::SelectWindow {
+                target: target("work:logs")
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "select-pane".to_string(),
+                "-t".to_string(),
+                "work:0.1".to_string(),
+            ])
+            .unwrap(),
+            Command::SelectPane {
+                target: super::PaneTarget::Target(target("work:0.1"))
+            }
+        );
+        assert_eq!(
+            parse_command(&["last-pane".to_string()]).unwrap(),
+            Command::SelectPane {
+                target: super::PaneTarget::Target(target("{last}"))
+            }
         );
     }
 
@@ -1348,13 +1474,15 @@ mod tests {
                 sequence: 1,
                 client,
                 command: Command::KillSession {
-                    target: Some("test".to_string()),
+                    target: Some(target("test")),
                 },
             },
         );
 
         assert!(result.ok);
         assert!(result.message.is_empty());
-        assert!(state.find_session(Some("test")).is_none());
+        assert!(TargetResolver::new(&state)
+            .find_exact_session("test")
+            .is_none());
     }
 }
