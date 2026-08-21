@@ -23,11 +23,11 @@ use tokio::{
 };
 use wmux_config::{config_path, WmuxConfig};
 use wmux_core::{
-    build_window_scene_with_viewports, build_window_structure, execute, parse_command,
+    build_window_scene_with_viewports, build_window_structure, execute, parse_command_text,
     render_damage_from_structure, render_diff_scene_with_capabilities, ClientId, ClientInput,
-    Command, CommandQueue, CopyMode, CopyModeResult, Line, PaneId, PaneSceneOverrides,
-    PaneViewport, RenderCapabilities, RenderState, RetainedPaneFrame, ServerEvent, ServerState,
-    StructuralScene, Style,
+    Command, CommandEffect, CommandList, CommandQueue, CommandSource, CopyMode, CopyModeResult,
+    Line, PaneId, PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
+    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
 };
 use wmux_platform::{
     MouseButton, MouseEvent, MouseEventKind, PlatformEvent, PlatformPaneId, TerminalSize,
@@ -51,6 +51,7 @@ const REDRAW_CYCLE_DELAY: Duration = Duration::from_millis(1);
 const RESIZE_REPAINT_QUIET: Duration = Duration::from_millis(16);
 const RESIZE_REPAINT_MAX: Duration = Duration::from_millis(120);
 const CONTROL_EVENTS_PER_TURN: usize = 256;
+const COMMANDS_PER_TURN: usize = 64;
 const CLIENT_OUTPUT_MESSAGES: usize = 64;
 const CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CLIENT_MAX_FRAME_BYTES: usize = FRAME_HEADER_LEN + MAX_FRAME;
@@ -197,6 +198,11 @@ enum OwnerMessage {
         reply: oneshot::Sender<ClientId>,
     },
     Event(ServerEvent),
+    Commands {
+        client: ClientId,
+        commands: CommandList,
+        source: CommandSource,
+    },
     InvalidCommand {
         client: ClientId,
         message: String,
@@ -349,7 +355,13 @@ async fn write_vectored_frame(
 fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
     let event = match message {
         Message::Command(raw) => match parse_command_line(&raw) {
-            Ok(command) => ServerEvent::Command { client, command },
+            Ok(commands) => {
+                return Some(OwnerMessage::Commands {
+                    client,
+                    commands,
+                    source: CommandSource::ClientRequest,
+                });
+            }
             Err(error) => {
                 return Some(OwnerMessage::InvalidCommand {
                     client,
@@ -371,14 +383,22 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
         },
         Message::Mouse(event) => ServerEvent::ClientMouse { client, event },
         Message::Resize { cols, rows } => ServerEvent::ClientResize { client, cols, rows },
-        Message::Detach => ServerEvent::Command {
-            client,
-            command: Command::DetachClient,
-        },
-        Message::Shutdown => ServerEvent::Command {
-            client,
-            command: Command::KillServer,
-        },
+        Message::Detach => {
+            return Some(OwnerMessage::Commands {
+                client,
+                commands: CommandList::new(vec![Command::DetachClient])
+                    .expect("one command is within the list bound"),
+                source: CommandSource::ClientRequest,
+            });
+        }
+        Message::Shutdown => {
+            return Some(OwnerMessage::Commands {
+                client,
+                commands: CommandList::new(vec![Command::KillServer])
+                    .expect("one command is within the list bound"),
+                source: CommandSource::ClientRequest,
+            });
+        }
         _ => return None,
     };
     Some(OwnerMessage::Event(event))
@@ -434,12 +454,8 @@ async fn handshake(
     }
 }
 
-fn parse_command_line(raw: &str) -> io::Result<Command> {
-    let argv = raw
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    parse_command(&argv).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+fn parse_command_line(raw: &str) -> io::Result<CommandList> {
+    parse_command_text(raw).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 struct Runtime {
@@ -487,13 +503,6 @@ impl Runtime {
         runtime.io = Some(io);
         runtime.owner_tx = Some(owner_tx);
         runtime
-    }
-
-    fn submit(&mut self, client: ClientId, command: Command) -> wmux_core::CommandResult {
-        let sequence = self.queue.push(client, command);
-        let queued = self.queue.pop().expect("queued command exists");
-        debug_assert_eq!(queued.sequence, sequence);
-        execute(&mut self.state, queued)
     }
 
     fn ensure_platform_pane(&mut self, pane_id: PaneId, size: TerminalSize) -> io::Result<()> {
@@ -1134,6 +1143,10 @@ impl ServerOwner {
                 continue;
             }
 
+            if self.process_command_queue(COMMANDS_PER_TURN) {
+                did_work = true;
+            }
+
             let output = self.runtime.process_output_round(OutputBudget::default());
             self.anchor_scrolled_views();
             if output.changed {
@@ -1244,6 +1257,15 @@ impl ServerOwner {
                     eprintln!("server event error: {error}");
                 }
             }
+            OwnerMessage::Commands {
+                client,
+                commands,
+                source,
+            } => {
+                if !self.is_shutting_down() {
+                    self.enqueue_command_list(client, commands, source);
+                }
+            }
             OwnerMessage::InvalidCommand { client, message } => {
                 if !self.is_shutting_down() {
                     self.send_critical(client, Message::CommandErr(message));
@@ -1320,83 +1342,169 @@ impl ServerOwner {
                     }
                 }
             }
-            ServerEvent::Command { client, command } => self.handle_command(client, command)?,
+            ServerEvent::Command { client, command } => self.enqueue_command_list(
+                client,
+                CommandList::new(vec![command]).expect("one command is within the list bound"),
+                CommandSource::ClientRequest,
+            ),
             ServerEvent::Timer { .. } => {}
         }
         Ok(())
     }
 
-    fn handle_command(&mut self, client: ClientId, command: Command) -> io::Result<()> {
-        if matches!(command, Command::CopyMode) {
-            let result = self.enter_copy_mode(client);
-            self.send_critical(
+    fn enqueue_command_list(
+        &mut self,
+        client: ClientId,
+        commands: CommandList,
+        source: CommandSource,
+    ) {
+        if let Err(error) = self.runtime.queue.push_list(client, commands, source) {
+            if matches!(source, CommandSource::ClientRequest) {
+                self.send_critical(client, Message::CommandErr(error.to_string()));
+            }
+        }
+    }
+
+    fn process_command_queue(&mut self, budget: usize) -> bool {
+        let mut processed = false;
+        for _ in 0..budget {
+            let Some(queued) = self.runtime.queue.pop() else {
+                break;
+            };
+            processed = true;
+            let outcome = execute(&mut self.runtime.state, &queued);
+            let mut terminal_response_sent = false;
+            let mut effect_error = None;
+
+            if outcome.ok {
+                for effect in outcome.effects {
+                    match self.apply_command_effect(&queued, effect, &outcome.message) {
+                        Ok(sent) => terminal_response_sent |= sent,
+                        Err(error) => {
+                            effect_error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let result = match effect_error {
+                Some(error) => Err(error),
+                None if outcome.ok => Ok(outcome.message),
+                None => Err(outcome.message),
+            };
+            let completion = self.runtime.queue.finish(queued, result);
+            if !terminal_response_sent {
+                if let Some(completion) = completion {
+                    self.send_command_completion(completion);
+                }
+            }
+            if self.is_shutting_down() {
+                break;
+            }
+        }
+        processed
+    }
+
+    fn apply_command_effect(
+        &mut self,
+        queued: &QueuedCommand,
+        effect: CommandEffect,
+        success_message: &str,
+    ) -> io::Result<bool> {
+        match effect {
+            CommandEffect::EnsurePane { pane } => {
+                let size = self.pane_size(pane).unwrap_or(TerminalSize::new(80, 24));
+                self.runtime.ensure_platform_pane(pane, size)?;
+                self.runtime.apply_pending_pane_resizes()?;
+                Ok(false)
+            }
+            CommandEffect::PaneInput { pane, bytes } => {
+                self.runtime
+                    .write_pane_input(pane, ClientInput::Bytes(bytes))?;
+                Ok(false)
+            }
+            CommandEffect::EnterCopyMode { client } => {
+                self.enter_copy_mode(client).map_err(io::Error::other)?;
+                Ok(false)
+            }
+            CommandEffect::RefreshClient { client } => {
+                let destroyed = self.client_session_is_destroyed(client);
+                if destroyed && matches!(queued.source, CommandSource::ClientRequest) {
+                    self.send_critical(client, Message::CommandOk(success_message.to_string()));
+                }
+                if self
+                    .close_clients_with_destroyed_sessions()
+                    .contains(&client)
+                {
+                    return Ok(destroyed);
+                }
+
+                let should_attach = self
+                    .runtime
+                    .state
+                    .clients
+                    .get(&client)
+                    .is_some_and(|client| client.attached_session.is_some());
+                let size = self
+                    .clients
+                    .get(&client)
+                    .map_or(TerminalSize::new(80, 24), |view| view.size);
+                if let Some(view) = self.clients.get_mut(&client) {
+                    if should_attach && !view.attached {
+                        view.attached = true;
+                        view.full_render = true;
+                        view.render_state.invalidate();
+                        view.structure = None;
+                    }
+                }
+                if self.clients.get(&client).is_some_and(|view| view.attached) {
+                    self.commit_layout_transaction(client, size)?;
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.request_render(Instant::now(), RenderCause::Structural);
+                    }
+                }
+                Ok(false)
+            }
+            CommandEffect::Confirm {
                 client,
-                match result {
-                    Ok(()) => Message::CommandOk(String::new()),
-                    Err(message) => Message::CommandErr(message),
-                },
-            );
-            return Ok(());
-        }
-        let attach = is_attach_command(&command);
-        let detach = matches!(command, Command::DetachClient);
-        let shutdown = matches!(command, Command::KillServer);
-        let result = self.runtime.submit(client, command);
-        let response = if result.ok {
-            Message::CommandOk(result.message.clone())
-        } else {
-            Message::CommandErr(result.message.clone())
-        };
-
-        if shutdown && result.ok {
-            self.begin_shutdown(client, response);
-            return Ok(());
-        }
-        self.send_critical(client, response);
-        if !result.ok {
-            return Ok(());
-        }
-        if detach {
-            self.disconnect_client(client, false);
-            return Ok(());
-        }
-        if self
-            .close_clients_with_destroyed_sessions()
-            .contains(&client)
-        {
-            return Ok(());
-        }
-        if attach {
-            let size = self
-                .clients
-                .get(&client)
-                .map_or(TerminalSize::new(80, 24), |view| view.size);
-            if let Some(view) = self.clients.get_mut(&client) {
-                view.attached = true;
-                view.full_render = true;
-                view.render_state.invalidate();
-                view.structure = None;
-                view.request_immediate_render(Instant::now());
+                prompt,
+                commands,
+            } => {
+                if let Some(client) = self.runtime.state.clients.get_mut(&client) {
+                    client.confirmation = Some(wmux_core::ConfirmationState { prompt, commands });
+                }
+                Ok(false)
             }
-            self.commit_layout_transaction(client, size)?;
-            return Ok(());
-        }
-
-        if self.clients.get(&client).is_some_and(|view| view.attached) {
-            let size = self
-                .clients
-                .get(&client)
-                .map_or(TerminalSize::new(80, 24), |view| view.size);
-            self.commit_layout_transaction(client, size)?;
-            if let Some(view) = self.clients.get_mut(&client) {
-                view.request_render(Instant::now(), RenderCause::Structural);
+            CommandEffect::DetachClient { client } => {
+                if matches!(queued.source, CommandSource::ClientRequest) {
+                    self.send_critical(client, Message::CommandOk(success_message.to_string()));
+                }
+                self.disconnect_client(client, false);
+                Ok(true)
             }
-        } else if let Some(pane) = result.attached_pane {
-            let size = self.pane_size(pane).unwrap_or(TerminalSize::new(80, 24));
-            self.runtime.ensure_platform_pane(pane, size)?;
-            self.runtime.apply_pending_pane_resizes()?;
+            CommandEffect::Shutdown { requester } => {
+                let response = if matches!(queued.source, CommandSource::ClientRequest) {
+                    Message::CommandOk(success_message.to_string())
+                } else {
+                    Message::Shutdown
+                };
+                self.begin_shutdown(requester, response);
+                Ok(true)
+            }
         }
-        Ok(())
+    }
+
+    fn send_command_completion(&mut self, completion: wmux_core::CommandCompletion) {
+        match completion.result {
+            Ok(message) if completion.requires_reply() => {
+                self.send_critical(completion.client, Message::CommandOk(message));
+            }
+            Ok(_) => {}
+            Err(message) => {
+                self.send_critical(completion.client, Message::CommandErr(message));
+            }
+        }
     }
 
     fn active_pane_for_client(&self, client: ClientId) -> Option<PaneId> {
@@ -1843,16 +1951,10 @@ impl ServerOwner {
     fn close_clients_with_destroyed_sessions(&mut self) -> Vec<ClientId> {
         let clients = self
             .clients
-            .iter()
-            .filter_map(|(client_id, view)| {
-                (view.attached
-                    && self
-                        .runtime
-                        .state
-                        .clients
-                        .get(client_id)
-                        .is_none_or(|client| client.attached_session.is_none()))
-                .then_some(*client_id)
+            .keys()
+            .filter_map(|client_id| {
+                self.client_session_is_destroyed(*client_id)
+                    .then_some(*client_id)
             })
             .collect::<Vec<_>>();
         if clients.is_empty() {
@@ -1863,9 +1965,20 @@ impl ServerOwner {
             if let Some(mut view) = self.clients.remove(client_id) {
                 let _ = view.try_enqueue(Outbound::Shutdown(Message::Shutdown));
             }
+            self.runtime.queue.remove_client(*client_id);
             self.runtime.state.remove_client(*client_id);
         }
         clients
+    }
+
+    fn client_session_is_destroyed(&self, client: ClientId) -> bool {
+        self.clients.get(&client).is_some_and(|view| view.attached)
+            && self
+                .runtime
+                .state
+                .clients
+                .get(&client)
+                .is_none_or(|client| client.attached_session.is_none())
     }
 
     fn disconnect_client(&mut self, client: ClientId, submit_detach: bool) {
@@ -1873,18 +1986,12 @@ impl ServerOwner {
             return;
         }
         if submit_detach {
-            let _ = self.runtime.submit(client, Command::DetachClient);
+            self.runtime.state.detach_client(client);
         }
         self.clients.remove(&client);
+        self.runtime.queue.remove_client(client);
         self.runtime.state.remove_client(client);
     }
-}
-
-fn is_attach_command(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::NewSession { attach: true, .. } | Command::AttachSession { .. }
-    )
 }
 
 fn render_full_for_client(
@@ -2145,12 +2252,12 @@ mod tests {
     use super::{
         collect_pane_events, read_async_message, run_async_at, write_async_message,
         write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, PlatformPane,
-        RenderCause, Runtime, ServerOwner, PER_PANE_OUTPUT_TIME,
+        RenderCause, Runtime, ServerOwner, COMMANDS_PER_TURN, PER_PANE_OUTPUT_TIME,
     };
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
     use wmux_config::WmuxConfig;
-    use wmux_core::{Command, ServerEvent, SplitDirection};
+    use wmux_core::{Command, CommandList, CommandSource, ServerEvent, SplitDirection};
     use wmux_platform::{
         MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
         TerminalSize,
@@ -2186,6 +2293,7 @@ mod tests {
                 command: Command::KillServer,
             })
             .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
 
         assert!(owner.is_shutting_down());
         assert!(matches!(
@@ -2198,6 +2306,75 @@ mod tests {
         ));
         assert!(owner.runtime.platform_panes.is_empty());
         assert!(owner.runtime.output_ring.is_empty());
+    }
+
+    #[test]
+    fn command_queue_budget_yields_and_emits_one_list_completion() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound_tx, TerminalCapabilities::default()),
+        );
+        let commands = CommandList::new(vec![Command::ListClients; COMMANDS_PER_TURN + 1]).unwrap();
+        owner.enqueue_command_list(client, commands, CommandSource::ClientRequest);
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(!owner.runtime.queue.is_empty());
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.runtime.queue.is_empty());
+        let Outbound::Message(Message::CommandOk(message)) = outbound_rx.try_recv().unwrap() else {
+            panic!("expected one command-list completion");
+        };
+        assert_eq!(message.lines().count(), COMMANDS_PER_TURN + 1);
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn command_effects_apply_before_the_next_list_command() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("copy", 80, 24);
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(client, view);
+        owner.enqueue_command_list(
+            client,
+            CommandList::new(vec![Command::CopyMode, Command::ListClients]).unwrap(),
+            CommandSource::ClientRequest,
+        );
+
+        assert!(owner.process_command_queue(1));
+        assert!(owner.clients[&client].copy_mode.is_some());
+        assert!(!owner.runtime.queue.is_empty());
+    }
+
+    #[test]
+    fn protocol_command_text_is_parsed_as_one_atomic_list() {
+        let commands = super::parse_command_line(
+            "rename-window -n 'alpha beta'; list-windows # trailing comment",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            Command::RenameWindow { name } if name == "alpha beta"
+        ));
     }
 
     #[tokio::test]
@@ -3007,6 +3184,7 @@ mod tests {
                 command: Command::ListSessions,
             })
             .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
 
         let Outbound::Message(wmux_protocol::Message::CommandOk(response)) =
             outbound_rx.try_recv().unwrap()
@@ -3153,6 +3331,7 @@ mod tests {
                 command: Command::KillPane,
             })
             .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
 
         assert!(!owner.clients.contains_key(&client));
         assert!(!owner.runtime.state.sessions.contains_key(&created.session));

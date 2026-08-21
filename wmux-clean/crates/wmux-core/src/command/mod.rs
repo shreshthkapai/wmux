@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc};
+use smallvec::SmallVec;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     ClientId, PaneId, ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId,
@@ -117,47 +121,242 @@ pub enum ResizeTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedCommand {
+    pub invocation: u64,
     pub sequence: u64,
     pub client: ClientId,
     pub command: Command,
+    pub source: CommandSource,
+    pub final_in_list: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandResult {
+pub struct CommandCompletion {
+    pub invocation: u64,
+    pub client: ClientId,
+    pub source: CommandSource,
+    pub result: Result<String, String>,
+}
+
+impl CommandCompletion {
+    pub const fn requires_reply(&self) -> bool {
+        matches!(self.source, CommandSource::ClientRequest)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandSource {
+    ClientRequest,
+    KeyBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutcome {
+    pub ok: bool,
+    pub message: String,
+    pub effects: SmallVec<[CommandEffect; 2]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandEffect {
+    EnsurePane {
+        pane: PaneId,
+    },
+    PaneInput {
+        pane: PaneId,
+        bytes: Vec<u8>,
+    },
+    EnterCopyMode {
+        client: ClientId,
+    },
+    RefreshClient {
+        client: ClientId,
+    },
+    Confirm {
+        client: ClientId,
+        prompt: String,
+        commands: CommandList,
+    },
+    DetachClient {
+        client: ClientId,
+    },
+    Shutdown {
+        requester: ClientId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CommandResult {
     pub sequence: u64,
     pub ok: bool,
     pub message: String,
     pub attached_pane: Option<PaneId>,
 }
 
+#[derive(Debug)]
+struct PendingInvocation {
+    id: u64,
+    source: CommandSource,
+    commands: CommandList,
+    next: usize,
+    messages: String,
+}
+
 #[derive(Debug, Default)]
 pub struct CommandQueue {
+    next_invocation: u64,
     next_sequence: u64,
-    pending: VecDeque<QueuedCommand>,
+    pending: BTreeMap<ClientId, VecDeque<PendingInvocation>>,
+    ready: VecDeque<ClientId>,
+    ready_set: BTreeSet<ClientId>,
+    active: BTreeMap<ClientId, u64>,
 }
 
 impl CommandQueue {
-    pub fn push(&mut self, client: ClientId, command: Command) -> u64 {
-        self.next_sequence += 1;
-        let sequence = self.next_sequence;
-        self.pending.push_back(QueuedCommand {
-            sequence,
-            client,
-            command,
-        });
-        sequence
+    pub fn push_list(
+        &mut self,
+        client: ClientId,
+        commands: CommandList,
+        source: CommandSource,
+    ) -> Result<u64, CommandParseError> {
+        if commands.is_empty() {
+            return Err(CommandParseError::new("command list is empty"));
+        }
+        if commands.len() > MAX_COMMANDS {
+            return Err(CommandParseError::new("command list exceeds 256 commands"));
+        }
+
+        self.next_invocation = self
+            .next_invocation
+            .checked_add(1)
+            .expect("command invocation ID space exhausted");
+        let invocation = self.next_invocation;
+        self.pending
+            .entry(client)
+            .or_default()
+            .push_back(PendingInvocation {
+                id: invocation,
+                source,
+                commands,
+                next: 0,
+                messages: String::new(),
+            });
+        self.mark_ready(client);
+        Ok(invocation)
     }
 
     pub fn pop(&mut self) -> Option<QueuedCommand> {
-        self.pending.pop_front()
+        while let Some(client) = self.ready.pop_front() {
+            self.ready_set.remove(&client);
+            if self.active.contains_key(&client) {
+                continue;
+            }
+            let invocation = self.pending.get_mut(&client)?.front_mut()?;
+            let command = invocation.commands[invocation.next].clone();
+            invocation.next += 1;
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("command sequence ID space exhausted");
+            let queued = QueuedCommand {
+                invocation: invocation.id,
+                sequence: self.next_sequence,
+                client,
+                command,
+                source: invocation.source,
+                final_in_list: invocation.next == invocation.commands.len(),
+            };
+            self.active.insert(client, invocation.id);
+            return Some(queued);
+        }
+        None
+    }
+
+    pub fn finish(
+        &mut self,
+        command: QueuedCommand,
+        result: Result<String, String>,
+    ) -> Option<CommandCompletion> {
+        if self.active.remove(&command.client) != Some(command.invocation) {
+            return None;
+        }
+
+        let mut completion = None;
+        let mut remove_client_queue = false;
+        if let Some(invocations) = self.pending.get_mut(&command.client) {
+            let invocation = invocations.front_mut()?;
+            if invocation.id != command.invocation {
+                return None;
+            }
+
+            match result {
+                Err(message) => {
+                    completion = Some(CommandCompletion {
+                        invocation: invocation.id,
+                        client: command.client,
+                        source: invocation.source,
+                        result: Err(message),
+                    });
+                    invocations.pop_front();
+                }
+                Ok(message) => {
+                    if !message.is_empty() {
+                        if !invocation.messages.is_empty() {
+                            invocation.messages.push('\n');
+                        }
+                        invocation.messages.push_str(&message);
+                    }
+                    if command.final_in_list {
+                        let invocation = invocations.pop_front().expect("front was checked above");
+                        completion = Some(CommandCompletion {
+                            invocation: invocation.id,
+                            client: command.client,
+                            source: invocation.source,
+                            result: Ok(invocation.messages),
+                        });
+                    }
+                }
+            }
+            remove_client_queue = invocations.is_empty();
+        }
+
+        if remove_client_queue {
+            self.pending.remove(&command.client);
+        } else {
+            self.mark_ready(command.client);
+        }
+        completion
+    }
+
+    pub fn remove_client(&mut self, client: ClientId) -> Vec<u64> {
+        self.active.remove(&client);
+        self.ready.retain(|ready| *ready != client);
+        self.ready_set.remove(&client);
+        self.pending
+            .remove(&client)
+            .map(|invocations| {
+                invocations
+                    .into_iter()
+                    .map(|invocation| invocation.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    fn mark_ready(&mut self, client: ClientId) {
+        if !self.active.contains_key(&client) && self.ready_set.insert(client) {
+            self.ready.push_back(client);
+        }
+    }
 }
 
-pub(super) fn execute_legacy(state: &mut ServerState, queued: QueuedCommand) -> CommandResult {
+pub(super) fn execute_state_command(
+    state: &mut ServerState,
+    queued: QueuedCommand,
+) -> CommandResult {
     match queued.command {
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
             sequence: queued.sequence,
@@ -946,7 +1145,10 @@ fn resize_amount(argv: &[String]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, parse_command, Command, CommandQueue};
+    use super::{
+        execute, parse_command, parse_command_text, Command, CommandEffect, CommandQueue,
+        CommandSource,
+    };
     use crate::{
         build_window_scene, render_full_scene, RenderState, ServerState, SplitDirection,
         TargetResolver, TargetSpec,
@@ -956,44 +1158,142 @@ mod tests {
         TargetSpec::parse(raw).unwrap()
     }
 
+    fn list(raw: &str) -> super::CommandList {
+        parse_command_text(raw).unwrap()
+    }
+
+    fn ensured_pane(outcome: &super::CommandOutcome) -> Option<crate::PaneId> {
+        outcome.effects.iter().find_map(|effect| match effect {
+            CommandEffect::EnsurePane { pane } => Some(*pane),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn command_lists_are_round_robin_across_clients_and_ordered_within_each_client() {
+        let mut queue = CommandQueue::default();
+        let a = crate::ClientId::new(1);
+        let b = crate::ClientId::new(2);
+        queue
+            .push_list(
+                a,
+                list("new-window -n a1; new-window -n a2"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+        queue
+            .push_list(
+                b,
+                list("new-window -n b1; new-window -n b2"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+
+        let mut names = Vec::new();
+        while let Some(command) = queue.pop() {
+            let Command::NewWindow { name } = &command.command else {
+                panic!("expected new-window");
+            };
+            names.push(name.clone().unwrap());
+            let _ = queue.finish(command, Ok(String::new()));
+        }
+
+        assert_eq!(names, ["a1", "b1", "a2", "b2"]);
+    }
+
+    #[test]
+    fn one_failed_list_does_not_remove_another_clients_work() {
+        let mut queue = CommandQueue::default();
+        let a = crate::ClientId::new(1);
+        let b = crate::ClientId::new(2);
+        queue
+            .push_list(
+                a,
+                list("new-window -n a1; new-window -n a2"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+        queue
+            .push_list(b, list("new-window -n b1"), CommandSource::KeyBinding)
+            .unwrap();
+
+        let failed = queue.pop().unwrap();
+        let completion = queue.finish(failed, Err("no target".to_string())).unwrap();
+
+        assert_eq!(completion.result, Err("no target".to_string()));
+        assert_eq!(queue.pop().unwrap().client, b);
+        assert!(queue.remove_client(a).is_empty());
+    }
+
+    #[test]
+    fn queue_sequences_are_monotonic_and_disconnect_is_isolated() {
+        let mut queue = CommandQueue::default();
+        let a = crate::ClientId::new(1);
+        let b = crate::ClientId::new(2);
+        let a_invocation = queue
+            .push_list(
+                a,
+                list("list-sessions; list-clients"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+        let b_invocation = queue
+            .push_list(b, list("list-windows"), CommandSource::KeyBinding)
+            .unwrap();
+        let first = queue.pop().unwrap();
+        let _ = queue.finish(first.clone(), Ok("sessions".to_string()));
+        let second = queue.pop().unwrap();
+
+        assert!(first.sequence < second.sequence);
+        assert_eq!(queue.remove_client(a), vec![a_invocation]);
+        let completion = queue.finish(second, Ok(String::new())).unwrap();
+        assert_eq!(completion.invocation, b_invocation);
+        assert!(!completion.requires_reply());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn empty_lists_are_rejected_and_active_disconnects_are_cancelled() {
+        let mut queue = CommandQueue::default();
+        let client = crate::ClientId::new(1);
+        assert!(queue
+            .push_list(
+                client,
+                super::CommandList::new(Vec::new()).unwrap(),
+                CommandSource::ClientRequest,
+            )
+            .is_err());
+
+        let invocation = queue
+            .push_list(client, list("list-sessions"), CommandSource::ClientRequest)
+            .unwrap();
+        let active = queue.pop().unwrap();
+        assert_eq!(queue.remove_client(client), vec![invocation]);
+        assert!(queue.finish(active, Ok(String::new())).is_none());
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn command_queue_executes_deterministically() {
         let mut state = ServerState::new();
         let client = state.add_client();
         let mut queue = CommandQueue::default();
 
-        let first = queue.push(
-            client,
-            Command::NewSession {
-                name: Some("a".to_string()),
-                group: None,
-                attach: true,
-                attach_if_exists: false,
-                cols: 80,
-                rows: 24,
-            },
-        );
-        let second = queue.push(client, Command::StartServer);
-
-        assert_eq!(queue.pop().unwrap().sequence, first);
-        let result = execute(
-            &mut state,
-            super::QueuedCommand {
-                sequence: first,
+        queue
+            .push_list(
                 client,
-                command: Command::NewSession {
-                    name: Some("a".to_string()),
-                    group: None,
-                    attach: true,
-                    attach_if_exists: false,
-                    cols: 80,
-                    rows: 24,
-                },
-            },
-        );
+                list("new-session -s a; start-server"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+
+        let first = queue.pop().unwrap();
+        assert_eq!(first.sequence, 1);
+        let result = execute(&mut state, &first);
         assert!(result.ok);
-        assert!(result.attached_pane.is_some());
-        assert_eq!(queue.pop().unwrap().sequence, second);
+        assert!(ensured_pane(&result).is_some());
+        assert!(queue.finish(first, Ok(result.message)).is_none());
+        assert_eq!(queue.pop().unwrap().sequence, 2);
     }
 
     #[test]
@@ -1004,8 +1304,11 @@ mod tests {
         let first = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("test".to_string()),
                     group: None,
@@ -1019,8 +1322,11 @@ mod tests {
         let second = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 2,
                 sequence: 2,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("test".to_string()),
                     group: None,
@@ -1036,7 +1342,7 @@ mod tests {
         assert!(!second.ok);
         assert_eq!(second.message, "duplicate session: test");
         assert_eq!(state.sessions.len(), 1);
-        assert!(second.attached_pane.is_none());
+        assert!(second.effects.is_empty());
     }
 
     #[test]
@@ -1047,8 +1353,11 @@ mod tests {
         let first = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("test".to_string()),
                     group: None,
@@ -1059,11 +1368,15 @@ mod tests {
                 },
             },
         );
+        let first_pane = state.clients[&client].attached_pane;
         let second = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 2,
                 sequence: 2,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("test".to_string()),
                     group: None,
@@ -1078,7 +1391,8 @@ mod tests {
         assert!(first.ok);
         assert!(second.ok);
         assert_eq!(state.sessions.len(), 1);
-        assert_eq!(first.attached_pane, second.attached_pane);
+        assert!(ensured_pane(&first).is_some());
+        assert_eq!(first_pane, state.clients[&client].attached_pane);
     }
 
     #[test]
@@ -1089,8 +1403,11 @@ mod tests {
         let result = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("detached".to_string()),
                     group: None,
@@ -1103,7 +1420,7 @@ mod tests {
         );
 
         assert!(result.ok);
-        assert!(result.attached_pane.is_some());
+        assert!(ensured_pane(&result).is_some());
         assert!(state
             .clients
             .get(&client)
@@ -1120,8 +1437,11 @@ mod tests {
         let new_session = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("work".to_string()),
                     group: None,
@@ -1137,8 +1457,11 @@ mod tests {
         let new_window = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 2,
                 sequence: 2,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewWindow {
                     name: Some("edit".to_string()),
                 },
@@ -1149,8 +1472,11 @@ mod tests {
         let split = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 3,
                 sequence: 3,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::SplitWindow {
                     direction: SplitDirection::TopBottom,
                     detached: false,
@@ -1162,8 +1488,11 @@ mod tests {
         let windows = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 4,
                 sequence: 4,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::ListWindows { target: None },
             },
         );
@@ -1172,8 +1501,11 @@ mod tests {
         let panes = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 5,
                 sequence: 5,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::ListPanes { target: None },
             },
         );
@@ -1221,8 +1553,11 @@ mod tests {
         let first = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("G1".to_string()),
                     group: None,
@@ -1237,8 +1572,11 @@ mod tests {
         let second = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 2,
                 sequence: 2,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::NewSession {
                     name: Some("G2".to_string()),
                     group: Some(target("G1")),
@@ -1471,8 +1809,11 @@ mod tests {
         let result = execute(
             &mut state,
             super::QueuedCommand {
+                invocation: 1,
                 sequence: 1,
                 client,
+                source: CommandSource::ClientRequest,
+                final_in_list: true,
                 command: Command::KillSession {
                     target: Some(target("test")),
                 },

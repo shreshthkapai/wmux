@@ -14,7 +14,8 @@ pub mod text;
 
 pub use command::{
     execute, parse_command, parse_command_argv, parse_command_text, resolve_command_name, Command,
-    CommandList, CommandParseError, CommandQueue, CommandResult, SourcePosition, SourceSpan,
+    CommandCompletion, CommandEffect, CommandList, CommandOutcome, CommandParseError, CommandQueue,
+    CommandSource, QueuedCommand, SourcePosition, SourceSpan,
 };
 pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
