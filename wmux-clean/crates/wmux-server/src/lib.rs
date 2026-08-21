@@ -500,6 +500,7 @@ struct Runtime {
 struct TestPtyState {
     requests: Vec<PlatformRequest>,
     events: BTreeMap<PlatformPaneId, VecDeque<PlatformEvent>>,
+    notifier: Option<wmux_platform::PlatformNotifier>,
 }
 
 #[cfg(test)]
@@ -509,17 +510,22 @@ struct TestPtyHandle(Arc<std::sync::Mutex<TestPtyState>>);
 #[cfg(test)]
 impl TestPtyHandle {
     fn emit(&self, pane: PlatformPaneId, event: PlatformEvent) {
-        self.0
-            .lock()
-            .unwrap()
-            .events
-            .entry(pane)
-            .or_default()
-            .push_back(event);
+        let notifier = {
+            let mut state = self.0.lock().unwrap();
+            state.events.entry(pane).or_default().push_back(event);
+            state.notifier.clone()
+        };
+        if let Some(notifier) = notifier {
+            notifier(pane);
+        }
     }
 
     fn requests(&self) -> Vec<PlatformRequest> {
         self.0.lock().unwrap().requests.clone()
+    }
+
+    fn set_notifier(&self, notifier: wmux_platform::PlatformNotifier) {
+        self.0.lock().unwrap().notifier = Some(notifier);
     }
 }
 
@@ -2489,11 +2495,15 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, read_async_message, write_async_message, write_outbound_messages,
-        ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime, ServerOwner,
-        TestPtyBackend, COMMANDS_PER_TURN, PER_PANE_OUTPUT_TIME,
+        collect_pane_events, read_async_message, run_with_platform_and_config, write_async_message,
+        write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause,
+        Runtime, ServerOwner, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN,
+        PER_PANE_OUTPUT_TIME,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
     use tokio::sync::mpsc;
     use wmux_config::WmuxConfig;
     use wmux_core::{
@@ -2501,11 +2511,311 @@ mod tests {
         ServerEvent, SplitDirection,
     };
     use wmux_platform::{
-        MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
-        TerminalSize,
+        AcceptedConnection, Endpoint, MouseButton, MouseEvent, MouseEventKind, MouseModifiers,
+        PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformFuture,
+        PlatformNotifier, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend,
+        ServerListener, ServerPlatform, TerminalSize,
     };
-    use wmux_protocol::{Message, TerminalCapabilities};
+    use wmux_protocol::{Message, TerminalCapabilities, VERSION};
     use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
+
+    struct MemoryListener {
+        endpoint: Endpoint,
+        owner: PeerIdentity,
+        accepted: mpsc::UnboundedReceiver<AcceptedConnection>,
+    }
+
+    impl ServerListener for MemoryListener {
+        fn endpoint(&self) -> &Endpoint {
+            &self.endpoint
+        }
+
+        fn owner_identity(&self) -> &PeerIdentity {
+            &self.owner
+        }
+
+        fn accept(&mut self) -> PlatformFuture<'_, AcceptedConnection> {
+            Box::pin(async move {
+                self.accepted.recv().await.ok_or_else(|| {
+                    PlatformError::new(
+                        PlatformErrorKind::Disconnected,
+                        "accept memory client",
+                        "memory connector closed",
+                    )
+                })
+            })
+        }
+    }
+
+    struct MemoryServerPlatform {
+        listener: Option<MemoryListener>,
+        pty: TestPtyHandle,
+    }
+
+    impl ServerPlatform for MemoryServerPlatform {
+        fn bind(&mut self) -> PlatformResult<Box<dyn ServerListener>> {
+            self.listener
+                .take()
+                .map(|listener| Box::new(listener) as Box<dyn ServerListener>)
+                .ok_or_else(|| {
+                    PlatformError::new(
+                        PlatformErrorKind::AlreadyRunning,
+                        "bind memory listener",
+                        "listener was already bound",
+                    )
+                })
+        }
+
+        fn create_pty_backend(
+            &mut self,
+            notifier: PlatformNotifier,
+        ) -> PlatformResult<Box<dyn PtyBackend>> {
+            self.pty.set_notifier(notifier);
+            Ok(Box::new(TestPtyBackend {
+                state: self.pty.clone(),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MemoryConnector {
+        accepted: mpsc::UnboundedSender<AcceptedConnection>,
+        owner: PeerIdentity,
+    }
+
+    impl MemoryConnector {
+        fn connect(&self) -> tokio::io::DuplexStream {
+            self.connect_as(self.owner.clone())
+        }
+
+        fn connect_as(&self, peer: PeerIdentity) -> tokio::io::DuplexStream {
+            let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+            self.accepted
+                .send(AcceptedConnection {
+                    stream: Box::new(server),
+                    peer,
+                })
+                .expect("memory server is accepting clients");
+            client
+        }
+    }
+
+    fn memory_platform() -> (MemoryServerPlatform, MemoryConnector, TestPtyHandle) {
+        let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
+        let owner = PeerIdentity::from_token(b"memory-owner");
+        let pty = TestPtyHandle::default();
+        (
+            MemoryServerPlatform {
+                listener: Some(MemoryListener {
+                    endpoint: Endpoint::new("memory://wmux-lifecycle"),
+                    owner: owner.clone(),
+                    accepted: accepted_rx,
+                }),
+                pty: pty.clone(),
+            },
+            MemoryConnector {
+                accepted: accepted_tx,
+                owner,
+            },
+            pty,
+        )
+    }
+
+    async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {
+        let mut stream = connector.connect();
+        write_async_message(
+            &mut stream,
+            Message::Hello {
+                version: VERSION,
+                pid: 42,
+                capabilities: TerminalCapabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_async_message(&mut stream).await.unwrap(),
+            Some(Message::HelloOk {
+                version: VERSION,
+                ..
+            })
+        ));
+        stream
+    }
+
+    async fn command_ok(stream: &mut tokio::io::DuplexStream, command: &str) -> Vec<u8> {
+        write_async_message(stream, Message::Command(command.to_string()))
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), read_async_message(stream))
+                .await
+                .expect("command response timed out")
+                .unwrap();
+            match message {
+                Some(Message::CommandOk(_)) => return output,
+                Some(Message::CommandErr(error)) => panic!("command {command:?} failed: {error}"),
+                Some(Message::Output(bytes)) => output.extend(bytes),
+                Some(other) => panic!("command {command:?} returned {other:?}"),
+                None => panic!("server closed while running {command:?}"),
+            }
+        }
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observable lifecycle transition timed out");
+    }
+
+    async fn wait_for_output(stream: &mut tokio::io::DuplexStream, needle: &[u8]) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match read_async_message(stream).await.unwrap() {
+                    Some(Message::Output(bytes))
+                        if bytes.windows(needle.len()).any(|w| w == needle) =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("server closed before authoritative background output rendered"),
+                }
+            }
+        })
+        .await
+        .expect("authoritative background output render timed out");
+    }
+
+    #[tokio::test]
+    async fn mock_platform_drives_complete_real_protocol_lifecycle() {
+        let (platform, connector, pty) = memory_platform();
+        let server = thread::spawn(move || {
+            run_with_platform_and_config(Box::new(platform), WmuxConfig::default())
+        });
+
+        let mut wrong_peer = connector.connect_as(PeerIdentity::from_token(b"intruder"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), read_async_message(&mut wrong_peer))
+                .await
+                .expect("wrong peer was not rejected before hello")
+                .unwrap(),
+            None
+        );
+
+        let mut client = memory_handshake(&connector).await;
+        command_ok(&mut client, "new-session -d -s durable").await;
+        wait_until(|| {
+            pty.requests()
+                .iter()
+                .filter(|request| matches!(request, PlatformRequest::SpawnPane(_)))
+                .count()
+                == 1
+        })
+        .await;
+        let first_pane = pty
+            .requests()
+            .iter()
+            .find_map(|request| match request {
+                PlatformRequest::SpawnPane(spawn) => Some(spawn.pane),
+                _ => None,
+            })
+            .unwrap();
+
+        command_ok(&mut client, "attach-session -t durable").await;
+        write_async_message(
+            &mut client,
+            Message::Key(WireKeyEvent {
+                code: WireKeyCode::Char('x'),
+                modifiers: WireKeyModifiers::NONE,
+                raw: b"x".to_vec(),
+            }),
+        )
+        .await
+        .unwrap();
+        wait_until(|| {
+            pty.requests().iter().any(|request| {
+                matches!(request, PlatformRequest::WritePane { pane, bytes } if *pane == first_pane && bytes == b"x")
+            })
+        })
+        .await;
+
+        command_ok(&mut client, "split-window -h").await;
+        wait_until(|| {
+            pty.requests()
+                .iter()
+                .filter(|request| matches!(request, PlatformRequest::SpawnPane(_)))
+                .count()
+                == 2
+        })
+        .await;
+        write_async_message(
+            &mut client,
+            Message::Resize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .await
+        .unwrap();
+        wait_until(|| {
+            pty.requests().iter().any(|request| {
+                matches!(request, PlatformRequest::ResizePane { size, .. } if size.rows == 30)
+            })
+        })
+        .await;
+
+        write_async_message(&mut client, Message::Detach)
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), read_async_message(&mut client))
+                .await
+                .expect("detach response timed out")
+                .unwrap()
+            {
+                Some(Message::CommandOk(_)) => break,
+                Some(Message::Output(_)) => {}
+                other => panic!("unexpected detach response: {other:?}"),
+            }
+        }
+
+        pty.emit(
+            first_pane,
+            PlatformEvent::PtyOutput {
+                pane: first_pane,
+                bytes: b"background-ready".to_vec(),
+            },
+        );
+        let mut reattached = memory_handshake(&connector).await;
+        let early_output = command_ok(&mut reattached, "attach-session -t durable").await;
+        if !early_output
+            .windows(b"background-ready".len())
+            .any(|window| window == b"background-ready")
+        {
+            wait_for_output(&mut reattached, b"background-ready").await;
+        }
+
+        command_ok(&mut reattached, "kill-pane").await;
+        command_ok(&mut reattached, "kill-session -t durable").await;
+        wait_until(|| {
+            pty.requests()
+                .iter()
+                .filter(|request| matches!(request, PlatformRequest::TerminatePane { .. }))
+                .count()
+                >= 2
+        })
+        .await;
+
+        let mut shutdown_client = memory_handshake(&connector).await;
+        command_ok(&mut shutdown_client, "kill-server").await;
+        wait_until(|| server.is_finished()).await;
+        server.join().unwrap().unwrap();
+    }
 
     fn attached_owner() -> (ServerOwner, wmux_core::ClientId, wmux_core::PaneId) {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
@@ -3279,6 +3589,65 @@ mod tests {
         assert_eq!(text.matches("[wmux pane exited code=23]").count(), 1);
         assert!(!runtime.platform_panes.contains_key(&created.pane));
         assert!(!runtime.output_ring.contains(&created.pane));
+    }
+
+    #[test]
+    fn malformed_and_out_of_order_platform_events_are_bounded_and_final() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("malformed-events", 80, 24);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
+        let pane = PlatformPaneId::new(created.pane.raw());
+        let unknown = PlatformPaneId::new(999_999);
+
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyOutput {
+                pane: unknown,
+                bytes: b"wrong-pane".to_vec(),
+            },
+        );
+        assert!(
+            !runtime
+                .process_output_round(OutputBudget::default())
+                .changed
+        );
+        assert!(runtime.platform_panes.contains_key(&created.pane));
+
+        runtime.emit_test_platform_event(created.pane, PlatformEvent::PtyClosed { pane });
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyOutput {
+                pane,
+                bytes: b"after-close".to_vec(),
+            },
+        );
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyExited {
+                pane,
+                exit_code: Some(7),
+            },
+        );
+
+        assert!(
+            runtime
+                .process_output_round(OutputBudget::default())
+                .changed
+        );
+        assert!(
+            !runtime
+                .process_output_round(OutputBudget::default())
+                .changed
+        );
+        let screen = runtime.state.pane(created.pane).unwrap().screen.grid();
+        let text = (0..screen.rows())
+            .filter_map(|row| screen.line(row))
+            .map(|line| line.text())
+            .collect::<String>();
+        assert!(!text.contains("wrong-pane"));
+        assert!(!text.contains("after-close"));
+        assert_eq!(text.matches("[wmux pane exited]").count(), 1);
+        assert!(!runtime.platform_panes.contains_key(&created.pane));
     }
 
     #[test]
