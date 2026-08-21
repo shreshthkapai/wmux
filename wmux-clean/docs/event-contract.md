@@ -41,9 +41,11 @@ ResizePane
 TerminatePane
 ```
 
-`wmux_platform::PlatformEvent` carries PTY output and process exit events back
-from a backend. `PlatformPaneId` is a stable semantic token, never a raw OS
-handle.
+`wmux_platform::PlatformEvent` carries PTY output, process exit, final stream
+closure, and classified backend errors back from a backend. `PlatformPaneId`
+is a stable semantic token, never a raw OS handle. `PtyExited` and `PtyClosed`
+are deliberately separate: final output may arrive after process exit, while
+closure is final and no event may follow it.
 
 Windows maps the contract to ConPTY, Job Objects, and named pipes. Linux and
 macOS map it to PTYs, process groups, Unix sockets, and terminal modes. Backend
@@ -65,10 +67,11 @@ those semantic events into terminal-engine mutations even with zero attached
 clients, so detach never pauses the authoritative pane screen. Idle owner waits
 are event or deadline driven; no fixed one-millisecond I/O poll remains.
 
-The Windows adapter exposes a `ConptyPane` controller only to the server's
-platform-coordination layer. It owns all raw handles, its IOCP registration,
-input worker, shutdown signal, Job Object, and pseudoconsole. None enter
-`wmux-core` or the authoritative state model.
+The Windows `PtyBackend` owns each `ConptyPane`, event receiver, raw handle,
+IOCP registration, input worker, shutdown signal, Job Object, and
+pseudoconsole. The server submits only semantic requests and polls semantic
+events; no native controller or receiver enters the shared server library,
+`wmux-core`, or the authoritative state model.
 
 ## Fair PTY Scheduling
 

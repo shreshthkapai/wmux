@@ -16,14 +16,31 @@ cargo run -p wmux-conformance --release
 The suite covers deterministic VT replay, detach and reattach persistence,
 multiple-client scene consistency, resize and reflow, malformed terminal and
 IPC input, key and bracketed-paste translation, DEC mouse-mode routing, and the
-portable command/target/key-table model. Each case produces a
+portable command/target/key-table model. Its platform-lifecycle case dispatches
+spawn, write, resize, and terminate requests through `dyn PtyBackend`, then
+asserts output, exit, and final-close event ordering. Each case produces a
 stable FNV-1a fingerprint. The aggregate fingerprint is checked against
 `EXPECTED_PORTABLE_FINGERPRINT`; a semantic change must deliberately update
 the fixture and expected value.
 
 The GitHub Actions matrix runs the portable core, protocol, platform contract,
-and conformance crates on all three operating systems. This prevents native
-types or host-dependent behavior from entering the shared semantic path.
+config, shared server library, shared client library, and conformance crates on
+all three operating systems. This prevents native types or host-dependent
+behavior from entering the shared semantic path.
+
+### Phase 5 platform contract evidence
+
+The portable suite now contains 14 cases and produces aggregate fingerprint
+`f71b72b35879a1c6`. `EXPECTED_DIFFERENCES` is the only semantic-exception
+registry and is empty in Phase 5: ConPTY versus PTY, named pipes versus Unix
+sockets, and SID versus UID are implementation mechanisms, not observable mux
+differences. Tests may not hide differences behind platform-conditional
+assertions.
+
+The shared server real-protocol test uses an in-memory listener and scripted
+PTY to cover create, attach, input, split, resize, detach, background output,
+reattach, pane/session destruction, and server shutdown. It also rejects a
+wrong peer before `Hello` and bounds wrong-pane and post-close events.
 
 ### Phase 4 command and key evidence
 
@@ -109,5 +126,5 @@ that are independent of the native PTY implementation:
 - application mouse modes take precedence over multiplexer scrollback
 - attached clients retain independent history viewport offsets
 
-These tests run in the Windows workspace job today and should move into a
-platform-neutral server crate when native transport selection is introduced.
+These tests run in the platform-neutral server library and therefore execute
+in the Windows, Linux, and macOS portable CI matrix.

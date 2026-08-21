@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, io::Cursor};
+use std::{collections::VecDeque, fmt::Write as _, io::Cursor};
 
 use wmux_core::{
     build_window_scene, execute, parse_command_text, render_full_scene, route_key, ClientInput,
@@ -7,14 +7,44 @@ use wmux_core::{
     RenderState, ResolveContext, Screen, ServerState, Style, TargetKind, TargetResolver,
     TargetSpec, TerminalEngine,
 };
-use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
+use wmux_platform::{
+    MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
+    PlatformRequest, PlatformResult, PtyBackend, SpawnPane, TerminalSize, TerminationMode,
+};
 use wmux_protocol::{
     encode_frame, read_message, Message, WireKeyCode, WireKeyEvent, WireKeyModifiers,
 };
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x00b7_63c7_26b9_d162;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xf71b_72b3_5879_a1c6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformFamily {
+    Windows,
+    Linux,
+    MacOs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpectedDifference {
+    pub platform: PlatformFamily,
+    pub contract: &'static str,
+    pub rationale: &'static str,
+}
+
+/// Semantic differences must be registered here instead of hidden in
+/// platform-conditional assertions. Phase 5 freezes an empty registry.
+pub const EXPECTED_DIFFERENCES: &[ExpectedDifference] = &[];
+
+pub fn expected_difference(
+    platform: PlatformFamily,
+    contract: &str,
+) -> Option<&'static ExpectedDifference> {
+    EXPECTED_DIFFERENCES
+        .iter()
+        .find(|difference| difference.platform == platform && difference.contract == contract)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseResult {
@@ -43,6 +73,7 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         unicode_terminal_text_case()?,
         terminal_modes_and_title_case()?,
         bounded_control_recovery_case()?,
+        platform_lifecycle_case()?,
     ];
     let mut suite_fingerprint = Fnv64::new();
     for case in &cases {
@@ -52,6 +83,141 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
     Ok(ConformanceReport {
         cases,
         suite_fingerprint: suite_fingerprint.finish(),
+    })
+}
+
+#[derive(Default)]
+struct LifecycleBackend {
+    requests: Vec<PlatformRequest>,
+    events: VecDeque<PlatformEvent>,
+}
+
+impl PtyBackend for LifecycleBackend {
+    fn submit(&mut self, request: PlatformRequest) -> PlatformResult<()> {
+        self.requests.push(request);
+        Ok(())
+    }
+
+    fn try_next_event(&mut self, _pane: PlatformPaneId) -> PlatformResult<Option<PlatformEvent>> {
+        Ok(self.events.pop_front())
+    }
+}
+
+fn platform_lifecycle_case() -> Result<CaseResult, String> {
+    let pane = PlatformPaneId::new(41);
+    let expected_requests = vec![
+        PlatformRequest::SpawnPane(SpawnPane {
+            pane,
+            size: TerminalSize::new(80, 24),
+            command: None,
+            cwd: None,
+            environment: Vec::new(),
+        }),
+        PlatformRequest::WritePane {
+            pane,
+            bytes: b"typed".to_vec(),
+        },
+        PlatformRequest::ResizePane {
+            pane,
+            size: TerminalSize::new(120, 40),
+        },
+        PlatformRequest::TerminatePane {
+            pane,
+            mode: TerminationMode::Graceful,
+        },
+    ];
+    let expected_events = vec![
+        PlatformEvent::PtyOutput {
+            pane,
+            bytes: b"background".to_vec(),
+        },
+        PlatformEvent::PtyExited {
+            pane,
+            exit_code: Some(23),
+        },
+        PlatformEvent::PtyClosed { pane },
+    ];
+    let mut backend = LifecycleBackend {
+        requests: Vec::new(),
+        events: expected_events.iter().cloned().collect(),
+    };
+    {
+        let dispatch: &mut dyn PtyBackend = &mut backend;
+        for request in expected_requests.iter().cloned() {
+            dispatch
+                .submit(request)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if backend.requests != expected_requests {
+        return Err("platform request order changed".to_string());
+    }
+
+    let mut observed_events = Vec::new();
+    {
+        let dispatch: &mut dyn PtyBackend = &mut backend;
+        while let Some(event) = dispatch
+            .try_next_event(pane)
+            .map_err(|error| error.to_string())?
+        {
+            observed_events.push(event);
+        }
+    }
+    if observed_events != expected_events {
+        return Err("platform output/exit/close order changed".to_string());
+    }
+
+    let mut hash = Fnv64::new();
+    for request in &backend.requests {
+        match request {
+            PlatformRequest::SpawnPane(spawn) => {
+                hash.byte(1);
+                hash.u64(spawn.pane.raw());
+                hash.u16(spawn.size.cols);
+                hash.u16(spawn.size.rows);
+            }
+            PlatformRequest::WritePane { pane, bytes } => {
+                hash.byte(2);
+                hash.u64(pane.raw());
+                hash.bytes(bytes);
+            }
+            PlatformRequest::ResizePane { pane, size } => {
+                hash.byte(3);
+                hash.u64(pane.raw());
+                hash.u16(size.cols);
+                hash.u16(size.rows);
+            }
+            PlatformRequest::TerminatePane { pane, mode } => {
+                hash.byte(4);
+                hash.u64(pane.raw());
+                hash.byte(u8::from(*mode == TerminationMode::Force));
+            }
+        }
+    }
+    for event in &observed_events {
+        match event {
+            PlatformEvent::PtyOutput { pane, bytes } => {
+                hash.byte(5);
+                hash.u64(pane.raw());
+                hash.bytes(bytes);
+            }
+            PlatformEvent::PtyExited { pane, exit_code } => {
+                hash.byte(6);
+                hash.u64(pane.raw());
+                hash.u64(exit_code.map_or(u64::MAX, u64::from));
+            }
+            PlatformEvent::PtyClosed { pane } => {
+                hash.byte(7);
+                hash.u64(pane.raw());
+            }
+            PlatformEvent::BackendError { .. } => {
+                return Err("unexpected backend error in lifecycle fixture".to_string());
+            }
+        }
+    }
+    Ok(CaseResult {
+        name: "platform-lifecycle",
+        fingerprint: hash.finish(),
     })
 }
 
@@ -755,15 +921,32 @@ impl Fnv64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_screen, run_portable_suite, verify_portable_suite, EXPECTED_PORTABLE_FINGERPRINT,
+        expected_difference, hash_screen, run_portable_suite, verify_portable_suite,
+        PlatformFamily, EXPECTED_DIFFERENCES, EXPECTED_PORTABLE_FINGERPRINT,
     };
     use wmux_core::{Screen, TerminalEngine};
 
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 13);
+        assert_eq!(report.cases.len(), 14);
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "platform-lifecycle"));
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
+    }
+
+    #[test]
+    fn phase_five_has_one_empty_centralized_difference_registry() {
+        assert!(EXPECTED_DIFFERENCES.is_empty());
+        for platform in [
+            PlatformFamily::Windows,
+            PlatformFamily::Linux,
+            PlatformFamily::MacOs,
+        ] {
+            assert_eq!(expected_difference(platform, "pane-lifecycle"), None);
+        }
     }
 
     #[test]

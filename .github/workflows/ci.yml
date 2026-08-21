@@ -35,8 +35,10 @@ jobs:
           components: rustfmt, clippy
       - name: Run portable semantic conformance
         run: cargo run -p wmux-conformance --release
-      - name: Test portable crates
-        run: cargo test -p wmux-core -p wmux-platform -p wmux-protocol -p wmux-conformance
+      - name: Check shared server and client libraries
+        run: cargo check -p wmux-core -p wmux-platform -p wmux-protocol -p wmux-config -p wmux-server -p wmux -p wmux-conformance --lib
+      - name: Test portable crates and shared runtime libraries
+        run: cargo test -p wmux-core -p wmux-platform -p wmux-protocol -p wmux-config -p wmux-server -p wmux -p wmux-conformance --lib
 
   windows-baseline:
     name: Windows baseline
