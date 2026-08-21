@@ -14,6 +14,8 @@ wmux-config = { path = "../wmux-config" }
 wmux-core = { path = "../wmux-core" }
 wmux-platform = { path = "../wmux-platform" }
 wmux-protocol = { path = "../wmux-protocol" }
+
+[target.'cfg(windows)'.dependencies]
 wmux-windows = { path = "../wmux-windows" }
 
 [lints]

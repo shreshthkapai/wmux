@@ -13,12 +13,8 @@ use std::{
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    runtime::{Builder as RuntimeBuilder, Handle as TokioHandle},
-    sync::{
-        mpsc as async_mpsc,
-        mpsc::error::{TryRecvError as AsyncTryRecvError, TrySendError},
-        oneshot,
-    },
+    runtime::Builder as RuntimeBuilder,
+    sync::{mpsc as async_mpsc, mpsc::error::TrySendError, oneshot},
     task::JoinSet,
 };
 use wmux_config::{config_path, WmuxConfig};
@@ -31,15 +27,13 @@ use wmux_core::{
     RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
 };
 use wmux_platform::{
-    MouseButton, MouseEvent, MouseEventKind, PlatformEvent, PlatformPaneId, TerminalSize,
+    AcceptedConnection, BoxedIpcStream, MouseButton, MouseEvent, MouseEventKind, PeerIdentity,
+    PlatformError, PlatformErrorKind, PlatformEvent, PlatformPaneId, PlatformRequest, PtyBackend,
+    ServerPlatform, SpawnPane, TerminalSize, TerminationMode,
 };
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
     WireKeyCode, WireKeyEvent, FRAME_HEADER_LEN, MAX_FRAME, VERSION,
-};
-use wmux_windows::{
-    conpty::{spawn_shell, ConptyPane, PlatformEventReceiver, PlatformNotifier},
-    pipe::{verify_client, Endpoint, NamedPipeServer, ServerLock, ServerPipeFactory, UserSid},
 };
 
 const TRACE_PREVIEW_BYTES: usize = 96;
@@ -61,37 +55,38 @@ const PER_PANE_OUTPUT_TIME: Duration = Duration::from_millis(1);
 const OUTPUT_ROUND_TIME: Duration = Duration::from_millis(4);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn run() -> io::Result<()> {
+pub fn run_with_platform(platform: Box<dyn ServerPlatform>) -> io::Result<()> {
+    run_with_platform_and_config(platform, load_config())
+}
+
+pub fn run_with_platform_and_config(
+    platform: Box<dyn ServerPlatform>,
+    config: WmuxConfig,
+) -> io::Result<()> {
     RuntimeBuilder::new_multi_thread()
         .worker_threads(2)
         .thread_name("wmux-io")
         .enable_all()
         .build()?
-        .block_on(run_async())
+        .block_on(run_async(platform, config))
 }
 
-async fn run_async() -> io::Result<()> {
-    let endpoint = Endpoint::current_user()?;
-    run_async_at(endpoint).await
-}
-
-async fn run_async_at(endpoint: Endpoint) -> io::Result<()> {
-    let _lock = ServerLock::acquire(&endpoint)?;
-    let config = load_config();
-    eprintln!("wmux config {}", config_path().display());
-
-    let endpoint_name = endpoint.pipe_name().to_string();
-    let owner_sid = endpoint.owner_sid().clone();
-    let mut pipe_factory = ServerPipeFactory::new(endpoint)?;
-    let mut listener = pipe_factory.create()?;
-
+async fn run_async(mut platform: Box<dyn ServerPlatform>, config: WmuxConfig) -> io::Result<()> {
+    let mut listener = platform.bind().map_err(PlatformError::into_io)?;
+    let endpoint_name = listener.endpoint().display().to_string();
+    let owner_identity = listener.owner_identity().clone();
     let (owner_tx, owner_rx) = mpsc::channel();
-    let state_owner_tx = owner_tx.clone();
+    let notify_owner = owner_tx.clone();
+    let notifier = Arc::new(move |_| {
+        let _ = notify_owner.send(OwnerMessage::PlatformReady);
+    });
+    let pty_backend = platform
+        .create_pty_backend(notifier)
+        .map_err(PlatformError::into_io)?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let io = TokioHandle::current();
     let state_owner = thread::Builder::new()
         .name("wmux-state-owner".to_string())
-        .spawn(move || ServerOwner::new(config, io, state_owner_tx, shutdown_tx).run(owner_rx))?;
+        .spawn(move || ServerOwner::new(config, pty_backend, shutdown_tx).run(owner_rx))?;
 
     eprintln!("wmux clean server listening on {endpoint_name}");
     let mut connections = JoinSet::new();
@@ -107,8 +102,11 @@ async fn run_async_at(endpoint: Endpoint) -> io::Result<()> {
             completed = connections.join_next(), if !connections.is_empty() => {
                 report_connection_completion(completed);
             }
-            accepted = listener.connect() => {
-                if let Err(error) = accepted {
+            accepted = listener.accept() => {
+                let accepted = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                    let error = error.into_io();
                     eprintln!("accept error: {error}");
                     tokio::select! {
                         biased;
@@ -120,22 +118,13 @@ async fn run_async_at(endpoint: Endpoint) -> io::Result<()> {
                         }
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     }
-                    listener = match pipe_factory.create() {
-                        Ok(listener) => listener,
-                        Err(error) => break 'accept Err(error),
-                    };
                     continue;
-                }
-
-                let next_listener = match pipe_factory.create() {
-                    Ok(listener) => listener,
-                    Err(error) => break 'accept Err(error),
+                    }
                 };
-                let connected = std::mem::replace(&mut listener, next_listener);
                 let connection_owner = owner_tx.clone();
-                let connection_sid = owner_sid.clone();
+                let connection_identity = owner_identity.clone();
                 connections.spawn(async move {
-                    handle_connection(connected, connection_owner, connection_sid).await
+                    handle_connection(accepted, connection_owner, connection_identity).await
                 });
             }
         }
@@ -223,11 +212,18 @@ enum Outbound {
 }
 
 async fn handle_connection(
-    mut pipe: NamedPipeServer,
+    accepted: AcceptedConnection,
     owner_tx: mpsc::Sender<OwnerMessage>,
-    owner_sid: UserSid,
+    owner_identity: PeerIdentity,
 ) -> io::Result<()> {
-    let capabilities = handshake(&mut pipe, &owner_sid).await?;
+    if accepted.peer != owner_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IPC peer identity does not match endpoint owner",
+        ));
+    }
+    let mut stream = accepted.stream;
+    let capabilities = handshake(&mut stream).await?;
 
     let (outbound_tx, outbound_rx) = async_mpsc::channel(CLIENT_OUTPUT_MESSAGES);
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -242,18 +238,18 @@ async fn handle_connection(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server owner stopped"))?;
 
-    let result = connection_io_loop(pipe, outbound_rx, &owner_tx, client).await;
+    let result = connection_io_loop(stream, outbound_rx, &owner_tx, client).await;
     let _ = owner_tx.send(OwnerMessage::Disconnect(client));
     result
 }
 
 async fn connection_io_loop(
-    pipe: NamedPipeServer,
+    stream: BoxedIpcStream,
     outbound_rx: async_mpsc::Receiver<Outbound>,
     owner_tx: &mpsc::Sender<OwnerMessage>,
     client: ClientId,
 ) -> io::Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(pipe);
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let read_owner = owner_tx.clone();
     let write_owner = owner_tx.clone();
     let read = async move {
@@ -406,18 +402,16 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
 }
 
 async fn handshake(
-    pipe: &mut NamedPipeServer,
-    owner_sid: &UserSid,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
 ) -> io::Result<TerminalCapabilities> {
-    match read_async_message(&mut *pipe).await? {
+    match read_async_message(&mut *stream).await? {
         Some(Message::Hello {
             version,
             capabilities,
             ..
         }) if version == VERSION => {
-            verify_client(pipe, owner_sid)?;
             write_async_message(
-                pipe,
+                stream,
                 Message::HelloOk {
                     version: VERSION,
                     pid: process::id(),
@@ -429,7 +423,7 @@ async fn handshake(
         }
         Some(Message::Hello { version, .. }) => {
             write_async_message(
-                pipe,
+                stream,
                 Message::CommandErr(format!(
                     "unsupported protocol version {version}; expected {VERSION}"
                 )),
@@ -442,7 +436,7 @@ async fn handshake(
         }
         Some(other) => {
             write_async_message(
-                pipe,
+                stream,
                 Message::CommandErr(format!("expected hello, got {other:?}")),
             )
             .await?;
@@ -494,10 +488,79 @@ struct Runtime {
     sync_started_at: BTreeMap<PaneId, Instant>,
     resize_repaint_holds: BTreeMap<PaneId, ResizeRepaintHold>,
     history_growth: Vec<(PaneId, u64)>,
-    io: Option<TokioHandle>,
-    owner_tx: Option<mpsc::Sender<OwnerMessage>>,
+    pty_backend: Box<dyn PtyBackend>,
+    #[cfg(test)]
+    test_platform: TestPtyHandle,
     #[cfg(test)]
     test_inputs: Vec<(PaneId, Vec<u8>)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPtyState {
+    requests: Vec<PlatformRequest>,
+    events: BTreeMap<PlatformPaneId, VecDeque<PlatformEvent>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestPtyHandle(Arc<std::sync::Mutex<TestPtyState>>);
+
+#[cfg(test)]
+impl TestPtyHandle {
+    fn emit(&self, pane: PlatformPaneId, event: PlatformEvent) {
+        self.0
+            .lock()
+            .unwrap()
+            .events
+            .entry(pane)
+            .or_default()
+            .push_back(event);
+    }
+
+    fn requests(&self) -> Vec<PlatformRequest> {
+        self.0.lock().unwrap().requests.clone()
+    }
+}
+
+#[cfg(test)]
+struct TestPtyBackend {
+    state: TestPtyHandle,
+}
+
+#[cfg(test)]
+impl TestPtyBackend {
+    fn pair() -> (Self, TestPtyHandle) {
+        let state = TestPtyHandle::default();
+        (
+            Self {
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+}
+
+#[cfg(test)]
+impl PtyBackend for TestPtyBackend {
+    fn submit(&mut self, request: PlatformRequest) -> wmux_platform::PlatformResult<()> {
+        self.state.0.lock().unwrap().requests.push(request);
+        Ok(())
+    }
+
+    fn try_next_event(
+        &mut self,
+        pane: PlatformPaneId,
+    ) -> wmux_platform::PlatformResult<Option<PlatformEvent>> {
+        Ok(self
+            .state
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .get_mut(&pane)
+            .and_then(VecDeque::pop_front))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -508,7 +571,7 @@ struct OutputResult {
 }
 
 impl Runtime {
-    fn with_config(config: WmuxConfig) -> Self {
+    fn with_backend(config: WmuxConfig, pty_backend: Box<dyn PtyBackend>) -> Self {
         Self {
             state: ServerState::new(),
             queue: CommandQueue::default(),
@@ -518,63 +581,61 @@ impl Runtime {
             sync_started_at: BTreeMap::new(),
             resize_repaint_holds: BTreeMap::new(),
             history_growth: Vec::new(),
-            io: None,
-            owner_tx: None,
+            pty_backend,
+            #[cfg(test)]
+            test_platform: TestPtyHandle::default(),
             #[cfg(test)]
             test_inputs: Vec::new(),
         }
     }
 
-    fn with_native_io(
-        config: WmuxConfig,
-        io: TokioHandle,
-        owner_tx: mpsc::Sender<OwnerMessage>,
-    ) -> Self {
-        let mut runtime = Self::with_config(config);
-        runtime.io = Some(io);
-        runtime.owner_tx = Some(owner_tx);
+    #[cfg(test)]
+    fn with_config(config: WmuxConfig) -> Self {
+        let (backend, handle) = TestPtyBackend::pair();
+        let mut runtime = Self::with_backend(config, Box::new(backend));
+        runtime.test_platform = handle;
         runtime
+    }
+
+    #[cfg(test)]
+    fn add_test_platform_pane(&mut self, pane: PaneId, size: TerminalSize) {
+        self.platform_panes.insert(pane, PlatformPane::new(size));
+        if !self.output_ring.contains(&pane) {
+            self.output_ring.push_back(pane);
+        }
+    }
+
+    #[cfg(test)]
+    fn emit_test_platform_event(&self, pane: PaneId, event: PlatformEvent) {
+        self.test_platform
+            .emit(PlatformPaneId::new(pane.raw()), event);
+    }
+
+    #[cfg(test)]
+    fn test_platform_requests(&self) -> Vec<PlatformRequest> {
+        self.test_platform.requests()
     }
 
     fn ensure_platform_pane(&mut self, pane_id: PaneId, size: TerminalSize) -> io::Result<()> {
         if self.platform_panes.contains_key(&pane_id) {
             return Ok(());
         }
-        #[cfg(test)]
-        if self.io.is_none() {
-            let (_sender, receiver) = async_mpsc::channel(1);
-            self.platform_panes
-                .insert(pane_id, PlatformPane::test(receiver, size));
-            self.output_ring.push_back(pane_id);
-            return Ok(());
-        }
-        let env_overrides = self.config.pane_environment(pane_id.raw());
-        let io = self
-            .io
-            .as_ref()
-            .ok_or_else(|| io::Error::other("native I/O runtime is unavailable"))?;
-        let owner_tx = self
-            .owner_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("state owner notifier is unavailable"))?
-            .clone();
-        let notify: PlatformNotifier = Arc::new(move |_| {
-            let _ = owner_tx.send(OwnerMessage::PlatformReady);
-        });
-        let (conpty, rx) = spawn_shell(
-            PlatformPaneId::new(pane_id.raw()),
-            size,
-            &env_overrides,
-            io,
-            notify,
-        )?;
-        eprintln!(
-            "spawned conpty pane={} pid={}",
-            pane_id.raw(),
-            conpty.process_id()
-        );
-        self.platform_panes
-            .insert(pane_id, PlatformPane::live(conpty, rx, size));
+        let environment = self
+            .config
+            .pane_environment(pane_id.raw())
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        self.pty_backend
+            .submit(PlatformRequest::SpawnPane(SpawnPane {
+                pane: PlatformPaneId::new(pane_id.raw()),
+                size,
+                command: None,
+                cwd: None,
+                environment,
+            }))
+            .map_err(PlatformError::into_io)?;
+        self.platform_panes.insert(pane_id, PlatformPane::new(size));
         self.output_ring.push_back(pane_id);
         Ok(())
     }
@@ -641,9 +702,12 @@ impl Runtime {
         let Some(platform) = self.platform_panes.get_mut(&pane_id) else {
             return Ok(false);
         };
-        if let Some(conpty) = platform.conpty.as_mut() {
-            conpty.resize(size)?;
-        }
+        self.pty_backend
+            .submit(PlatformRequest::ResizePane {
+                pane: PlatformPaneId::new(pane_id.raw()),
+                size,
+            })
+            .map_err(PlatformError::into_io)?;
         platform.size = size;
         let now = Instant::now();
         self.resize_repaint_holds.insert(
@@ -658,10 +722,27 @@ impl Runtime {
     }
 
     fn cleanup_platform_panes(&mut self) {
-        self.platform_panes
-            .retain(|pane, _| self.state.panes.contains_key(pane));
-        self.output_ring
-            .retain(|pane| self.platform_panes.contains_key(pane));
+        let removed = self
+            .platform_panes
+            .keys()
+            .filter(|pane| !self.state.panes.contains_key(pane))
+            .copied()
+            .collect::<Vec<_>>();
+        for pane in removed {
+            let Some(platform) = self.platform_panes.get_mut(&pane) else {
+                continue;
+            };
+            if platform.termination_requested {
+                continue;
+            }
+            if let Err(error) = self.pty_backend.submit(PlatformRequest::TerminatePane {
+                pane: PlatformPaneId::new(pane.raw()),
+                mode: TerminationMode::Force,
+            }) {
+                eprintln!("platform pane termination error: {error}");
+            }
+            platform.termination_requested = true;
+        }
         self.sync_started_at
             .retain(|pane, _| self.state.panes.contains_key(pane));
         self.resize_repaint_holds
@@ -669,10 +750,11 @@ impl Runtime {
     }
 
     fn shutdown_platform_panes(&mut self) {
-        for platform in self.platform_panes.values_mut() {
-            if let Some(conpty) = platform.conpty.as_mut() {
-                conpty.terminate(1);
-            }
+        for pane in self.platform_panes.keys().copied().collect::<Vec<_>>() {
+            let _ = self.pty_backend.submit(PlatformRequest::TerminatePane {
+                pane: PlatformPaneId::new(pane.raw()),
+                mode: TerminationMode::Force,
+            });
         }
         self.platform_panes.clear();
         self.output_ring.clear();
@@ -696,12 +778,13 @@ impl Runtime {
         trace_bytes("pane_input", pane_id, &bytes);
         #[cfg(test)]
         self.test_inputs.push((pane_id, bytes.clone()));
-        if let Some(conpty) = self
-            .platform_panes
-            .get_mut(&pane_id)
-            .and_then(|platform| platform.conpty.as_mut())
-        {
-            conpty.write_input(bytes)?;
+        if self.platform_panes.contains_key(&pane_id) {
+            self.pty_backend
+                .submit(PlatformRequest::WritePane {
+                    pane: PlatformPaneId::new(pane_id.raw()),
+                    bytes,
+                })
+                .map_err(PlatformError::into_io)?;
         }
         Ok(())
     }
@@ -826,38 +909,33 @@ impl Runtime {
             let Some(pane_id) = self.output_ring.pop_front() else {
                 break;
             };
-            let collected = {
-                let Some(platform) = self.platform_panes.get_mut(&pane_id) else {
-                    continue;
-                };
-                collect_pane_events(
-                    &mut platform.rx,
-                    budget.per_pane_bytes,
-                    budget.per_pane_time,
-                )
-            };
+            if !self.platform_panes.contains_key(&pane_id) {
+                continue;
+            }
+            let collected = collect_pane_events(
+                &mut *self.pty_backend,
+                PlatformPaneId::new(pane_id.raw()),
+                budget.per_pane_bytes,
+                budget.per_pane_time,
+            );
             let (still_polling, completed) = {
                 let platform = self
                     .platform_panes
                     .get_mut(&pane_id)
                     .expect("platform pane still exists");
-                if collected.disconnected {
-                    platform.disconnected = true;
+                if collected.closed {
+                    platform.closed = true;
                 }
                 let first_exit = collected.exit_code.is_some() && !platform.exited;
                 if first_exit {
                     platform.exited = true;
-                    if let Some(conpty) = platform.conpty.as_mut() {
-                        if collected.exit_code.flatten().is_some() {
-                            conpty.finish_after_process_exit();
-                        } else {
-                            conpty.terminate(1);
-                        }
-                    }
                 }
-                let completed = platform.disconnected && platform.exited;
+                let completed = platform.closed;
                 (!completed, completed)
             };
+            if let Some(error) = &collected.error {
+                eprintln!("platform pane event error: {error}");
+            }
             if still_polling {
                 self.output_ring.push_back(pane_id);
             }
@@ -867,7 +945,7 @@ impl Runtime {
             result.synchronized_commit |= applied.synchronized_commit;
             let exit_to_apply = match collected.exit_code {
                 Some(Some(exit_code)) => Some(Some(exit_code)),
-                Some(None) if collected.disconnected => Some(None),
+                Some(None) if collected.closed => Some(None),
                 _ => None,
             };
             if let Some(exit_code) = exit_to_apply {
@@ -886,31 +964,18 @@ impl Runtime {
 }
 
 struct PlatformPane {
-    conpty: Option<ConptyPane>,
-    rx: PlatformEventReceiver,
     exited: bool,
-    disconnected: bool,
+    closed: bool,
+    termination_requested: bool,
     size: TerminalSize,
 }
 
 impl PlatformPane {
-    fn live(conpty: ConptyPane, rx: PlatformEventReceiver, size: TerminalSize) -> Self {
+    fn new(size: TerminalSize) -> Self {
         Self {
-            conpty: Some(conpty),
-            rx,
             exited: false,
-            disconnected: false,
-            size,
-        }
-    }
-
-    #[cfg(test)]
-    fn test(rx: PlatformEventReceiver, size: TerminalSize) -> Self {
-        Self {
-            conpty: None,
-            rx,
-            exited: false,
-            disconnected: false,
+            closed: false,
+            termination_requested: false,
             size,
         }
     }
@@ -937,30 +1002,54 @@ impl Default for OutputBudget {
 struct CollectedOutput {
     bytes: Vec<u8>,
     exit_code: Option<Option<u32>>,
-    disconnected: bool,
+    closed: bool,
+    error: Option<PlatformError>,
 }
 
 fn collect_pane_events(
-    rx: &mut PlatformEventReceiver,
+    backend: &mut dyn PtyBackend,
+    pane: PlatformPaneId,
     byte_budget: usize,
     time_budget: Duration,
 ) -> CollectedOutput {
     let started = Instant::now();
     let mut collected = CollectedOutput::default();
     while collected.bytes.len() < byte_budget && started.elapsed() < time_budget {
-        match rx.try_recv() {
-            Ok(PlatformEvent::PtyOutput { bytes, .. }) => collected.bytes.extend_from_slice(&bytes),
-            Ok(PlatformEvent::PtyExited { exit_code, .. }) => {
+        match backend.try_next_event(pane) {
+            Ok(Some(PlatformEvent::PtyOutput {
+                pane: event_pane,
+                bytes,
+            })) if event_pane == pane => collected.bytes.extend_from_slice(&bytes),
+            Ok(Some(PlatformEvent::PtyExited {
+                pane: event_pane,
+                exit_code,
+            })) if event_pane == pane => {
                 if collected.exit_code.is_none() || exit_code.is_some() {
                     collected.exit_code = Some(exit_code);
                 }
             }
-            Err(AsyncTryRecvError::Empty) => break,
-            Err(AsyncTryRecvError::Disconnected) => {
-                collected.disconnected = true;
+            Ok(Some(PlatformEvent::PtyClosed { pane: event_pane })) if event_pane == pane => {
+                collected.closed = true;
                 if collected.exit_code.is_none() {
                     collected.exit_code = Some(None);
                 }
+                break;
+            }
+            Ok(Some(PlatformEvent::BackendError {
+                pane: event_pane,
+                error,
+            })) if event_pane == pane => collected.error = Some(error),
+            Ok(Some(_)) => {
+                collected.error = Some(PlatformError::new(
+                    PlatformErrorKind::InvalidData,
+                    "drain pane events",
+                    "backend returned an event for the wrong pane",
+                ));
+                break;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                collected.error = Some(error);
                 break;
             }
         }
@@ -1138,12 +1227,11 @@ enum ShutdownState {
 impl ServerOwner {
     fn new(
         config: WmuxConfig,
-        io: TokioHandle,
-        owner_tx: mpsc::Sender<OwnerMessage>,
+        pty_backend: Box<dyn PtyBackend>,
         shutdown_tx: oneshot::Sender<()>,
     ) -> Self {
         Self {
-            runtime: Runtime::with_native_io(config, io, owner_tx),
+            runtime: Runtime::with_backend(config, pty_backend),
             clients: BTreeMap::new(),
             started_at: Instant::now(),
             shutdown: ShutdownState::Running,
@@ -2401,9 +2489,9 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, read_async_message, run_async_at, write_async_message,
-        write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, PlatformPane,
-        RenderCause, Runtime, ServerOwner, COMMANDS_PER_TURN, PER_PANE_OUTPUT_TIME,
+        collect_pane_events, read_async_message, write_async_message, write_outbound_messages,
+        ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime, ServerOwner,
+        TestPtyBackend, COMMANDS_PER_TURN, PER_PANE_OUTPUT_TIME,
     };
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -2416,9 +2504,8 @@ mod tests {
         MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
         TerminalSize,
     };
-    use wmux_protocol::{Message, TerminalCapabilities, VERSION};
+    use wmux_protocol::{Message, TerminalCapabilities};
     use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
-    use wmux_windows::pipe::{connect_async, Endpoint, NamedPipeClient};
 
     fn attached_owner() -> (ServerOwner, wmux_core::ClientId, wmux_core::PaneId) {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
@@ -2433,12 +2520,47 @@ mod tests {
         let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
         view.attached = true;
         owner.clients.insert(client, view);
-        let (_pane_tx, pane_rx) = mpsc::channel(1);
-        owner.runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(pane_rx, TerminalSize::new(80, 24)),
-        );
+        owner
+            .runtime
+            .add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         (owner, client, created.pane)
+    }
+
+    #[test]
+    fn server_runtime_submits_only_semantic_platform_requests() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("platform", 80, 24);
+        runtime
+            .ensure_platform_pane(created.pane, TerminalSize::new(80, 24))
+            .unwrap();
+        runtime
+            .write_pane_input(
+                created.pane,
+                wmux_core::ClientInput::Bytes(b"input".to_vec()),
+            )
+            .unwrap();
+        runtime
+            .resize_platform_pane(created.pane, TerminalSize::new(79, 24))
+            .unwrap();
+        runtime.shutdown_platform_panes();
+
+        let requests = runtime.test_platform_requests();
+        assert!(matches!(
+            requests[0],
+            wmux_platform::PlatformRequest::SpawnPane(_)
+        ));
+        assert!(matches!(
+            requests[1],
+            wmux_platform::PlatformRequest::WritePane { .. }
+        ));
+        assert!(matches!(
+            requests[2],
+            wmux_platform::PlatformRequest::ResizePane { .. }
+        ));
+        assert!(matches!(
+            requests[3],
+            wmux_platform::PlatformRequest::TerminatePane { .. }
+        ));
     }
 
     fn wire_char(character: char, modifiers: WireKeyModifiers, raw: &[u8]) -> WireKeyEvent {
@@ -2502,11 +2624,9 @@ mod tests {
         view.attached = true;
         owner.clients.insert(client, view);
         for pane in [created.pane, killed] {
-            let (_pane_tx, pane_rx) = mpsc::channel(1);
             owner
                 .runtime
-                .platform_panes
-                .insert(pane, PlatformPane::test(pane_rx, TerminalSize::new(40, 24)));
+                .add_test_platform_pane(pane, TerminalSize::new(40, 24));
         }
 
         for (character, modifiers, raw) in [
@@ -2715,12 +2835,9 @@ mod tests {
         attached_view.attached = true;
         owner.clients.insert(attached, attached_view);
         let created = owner.runtime.state.create_session("shutdown", 80, 24);
-        let (_pane_tx, pane_rx) = mpsc::channel(1);
-        owner.runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(pane_rx, TerminalSize::new(80, 24)),
-        );
-        owner.runtime.output_ring.push_back(created.pane);
+        owner
+            .runtime
+            .add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
 
         owner
             .handle_event(ServerEvent::Command {
@@ -2870,230 +2987,6 @@ mod tests {
             owner_rx.recv_timeout(Duration::from_secs(1)),
             Ok(super::OwnerMessage::OutboundDrained { client: drained, .. }) if drained == client
         ));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shutdown_drains_clients_releases_lock_and_restarts() {
-        let endpoint = Endpoint::for_instance(&unique_instance("shutdown-restart")).unwrap();
-        let server_endpoint = endpoint.clone();
-        let (server_thread, server_done) = start_test_server(server_endpoint);
-
-        let mut requester = connect_test_client(&endpoint).await;
-        write_async_message(
-            &mut requester,
-            Message::Command("new-session -d".to_string()),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_until(&mut requester, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-
-        let mut attached = connect_test_client(&endpoint).await;
-        write_async_message(
-            &mut attached,
-            Message::Command("attach-session".to_string()),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_until(&mut attached, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-
-        write_async_message(&mut requester, Message::Command("kill-server".to_string()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_until(&mut requester, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-        assert_eq!(
-            read_until(&mut attached, |message| matches!(
-                message,
-                Message::Shutdown
-            ))
-            .await,
-            Message::Shutdown
-        );
-        drop(requester);
-        drop(attached);
-        await_test_server(server_thread, server_done).await;
-        assert!(!endpoint.lock_path().exists());
-
-        let restart_endpoint = endpoint.clone();
-        let (restart_thread, restart_done) = start_test_server(restart_endpoint);
-        let mut killer = connect_test_client(&endpoint).await;
-        write_async_message(&mut killer, Message::Command("kill-server".to_string()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_until(&mut killer, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-        drop(killer);
-        await_test_server(restart_thread, restart_done).await;
-        assert!(!endpoint.lock_path().exists());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn disconnect_after_hello_preserves_detached_session() {
-        let endpoint = Endpoint::for_instance(&unique_instance("hello-disconnect")).unwrap();
-        let (server_thread, server_done) = start_test_server(endpoint.clone());
-
-        let mut controller = connect_test_client(&endpoint).await;
-        write_async_message(
-            &mut controller,
-            Message::Command("new-session -d -s durable".to_string()),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_until(&mut controller, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-
-        let disposable = connect_test_client(&endpoint).await;
-        drop(disposable);
-
-        write_async_message(
-            &mut controller,
-            Message::Command("list-sessions".to_string()),
-        )
-        .await
-        .unwrap();
-        let listed = read_until(&mut controller, |message| {
-            matches!(message, Message::CommandOk(_))
-        })
-        .await;
-        assert!(matches!(listed, Message::CommandOk(text) if text.contains("durable:")));
-
-        write_async_message(&mut controller, Message::Command("kill-server".to_string()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_until(&mut controller, |message| matches!(
-                message,
-                Message::CommandOk(_)
-            ))
-            .await,
-            Message::CommandOk(_)
-        ));
-        drop(controller);
-        await_test_server(server_thread, server_done).await;
-    }
-
-    fn start_test_server(
-        endpoint: Endpoint,
-    ) -> (
-        std::thread::JoinHandle<()>,
-        tokio::sync::oneshot::Receiver<std::io::Result<()>>,
-    ) {
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let server_thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            let _ = done_tx.send(runtime.block_on(run_async_at(endpoint)));
-        });
-        (server_thread, done_rx)
-    }
-
-    async fn await_test_server(
-        server_thread: std::thread::JoinHandle<()>,
-        server_done: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
-    ) {
-        tokio::time::timeout(Duration::from_secs(10), server_done)
-            .await
-            .expect("server did not finish graceful shutdown")
-            .expect("server thread dropped completion")
-            .expect("server returned an error");
-        server_thread.join().expect("server thread panicked");
-    }
-
-    async fn connect_test_client(endpoint: &Endpoint) -> NamedPipeClient {
-        let mut last_error = None;
-        for _ in 0..100 {
-            match connect_async(endpoint) {
-                Ok(mut pipe) => {
-                    write_async_message(
-                        &mut pipe,
-                        Message::Hello {
-                            version: VERSION,
-                            pid: std::process::id(),
-                            capabilities: TerminalCapabilities::default(),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                    assert!(matches!(
-                        read_async_message(&mut pipe).await.unwrap(),
-                        Some(Message::HelloOk {
-                            version: VERSION,
-                            ..
-                        })
-                    ));
-                    return pipe;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            }
-        }
-        panic!("could not connect test client: {:?}", last_error)
-    }
-
-    async fn read_until(
-        pipe: &mut NamedPipeClient,
-        predicate: impl Fn(&Message) -> bool,
-    ) -> Message {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let message = read_async_message(&mut *pipe)
-                    .await
-                    .expect("failed to read server message")
-                    .expect("server closed before expected message");
-                if predicate(&message) {
-                    return message;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for server message")
-    }
-
-    fn unique_instance(label: &str) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is after Unix epoch")
-            .as_nanos();
-        format!("{label}-{}-{nonce}", std::process::id())
     }
 
     #[test]
@@ -3322,20 +3215,24 @@ mod tests {
 
     #[test]
     fn adjacent_output_chunks_are_coalesced() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (mut backend, handle) = TestPtyBackend::pair();
         let pane = PlatformPaneId::new(1);
-        tx.try_send(PlatformEvent::PtyOutput {
+        handle.emit(
             pane,
-            bytes: b"abc".to_vec(),
-        })
-        .unwrap();
-        tx.try_send(PlatformEvent::PtyOutput {
+            PlatformEvent::PtyOutput {
+                pane,
+                bytes: b"abc".to_vec(),
+            },
+        );
+        handle.emit(
             pane,
-            bytes: b"def".to_vec(),
-        })
-        .unwrap();
+            PlatformEvent::PtyOutput {
+                pane,
+                bytes: b"def".to_vec(),
+            },
+        );
 
-        let collected = collect_pane_events(&mut rx, 64, PER_PANE_OUTPUT_TIME);
+        let collected = collect_pane_events(&mut backend, pane, 64, PER_PANE_OUTPUT_TIME);
 
         assert_eq!(collected.bytes, b"abcdef");
     }
@@ -3344,18 +3241,15 @@ mod tests {
     fn exit_and_eof_are_coalesced_and_release_the_platform_pane() {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("exit-race", 80, 24);
-        let (tx, rx) = mpsc::channel(4);
-        runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(rx, TerminalSize::new(80, 24)),
-        );
-        runtime.output_ring.push_back(created.pane);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         let pane = PlatformPaneId::new(created.pane.raw());
-        tx.try_send(PlatformEvent::PtyExited {
-            pane,
-            exit_code: None,
-        })
-        .unwrap();
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyExited {
+                pane,
+                exit_code: None,
+            },
+        );
         assert!(
             !runtime
                 .process_output_round(OutputBudget::default())
@@ -3363,12 +3257,14 @@ mod tests {
         );
         assert!(runtime.platform_panes.contains_key(&created.pane));
 
-        tx.try_send(PlatformEvent::PtyExited {
-            pane,
-            exit_code: Some(23),
-        })
-        .unwrap();
-        drop(tx);
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyExited {
+                pane,
+                exit_code: Some(23),
+            },
+        );
+        runtime.emit_test_platform_event(created.pane, PlatformEvent::PtyClosed { pane });
 
         assert!(
             runtime
@@ -3386,43 +3282,17 @@ mod tests {
     }
 
     #[test]
-    fn pane_queue_overflow_is_explicit_backpressure() {
-        let (tx, _rx) = mpsc::channel(2);
-        let pane = PlatformPaneId::new(1);
-        tx.try_send(PlatformEvent::PtyOutput {
-            pane,
-            bytes: vec![1],
-        })
-        .unwrap();
-        tx.try_send(PlatformEvent::PtyOutput {
-            pane,
-            bytes: vec![2],
-        })
-        .unwrap();
-        assert!(matches!(
-            tx.try_send(PlatformEvent::PtyOutput {
-                pane,
-                bytes: vec![3],
-            }),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
-    }
-
-    #[test]
     fn detached_pane_output_is_applied_to_authoritative_screen() {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("test", 80, 24);
-        let (tx, rx) = mpsc::channel(4);
-        runtime.platform_panes.insert(
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
+        runtime.emit_test_platform_event(
             created.pane,
-            PlatformPane::test(rx, TerminalSize::new(80, 24)),
+            PlatformEvent::PtyOutput {
+                pane: PlatformPaneId::new(created.pane.raw()),
+                bytes: b"detached".to_vec(),
+            },
         );
-        runtime.output_ring.push_back(created.pane);
-        tx.try_send(PlatformEvent::PtyOutput {
-            pane: PlatformPaneId::new(created.pane.raw()),
-            bytes: b"detached".to_vec(),
-        })
-        .unwrap();
 
         assert!(
             runtime
@@ -3468,15 +3338,9 @@ mod tests {
             .unwrap();
         runtime.state.take_pending_pane_resizes();
 
-        let mut senders = Vec::new();
         for pane in [created.pane, second, third] {
-            let (tx, rx) = mpsc::channel(1);
-            senders.push(tx);
             let rect = runtime.state.pane(pane).unwrap().rect;
-            runtime.platform_panes.insert(
-                pane,
-                PlatformPane::test(rx, TerminalSize::new(rect.cols, rect.rows)),
-            );
+            runtime.add_test_platform_pane(pane, TerminalSize::new(rect.cols, rect.rows));
         }
 
         runtime
@@ -3494,11 +3358,7 @@ mod tests {
     fn resized_pane_output_is_staged_until_synchronized_commit() {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("test", 80, 24);
-        let (_tx, rx) = mpsc::channel(1);
-        runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(rx, TerminalSize::new(80, 24)),
-        );
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         runtime.state.resize_window(created.window, 79, 24).unwrap();
         runtime.apply_pending_pane_resizes().unwrap();
 
@@ -3537,11 +3397,7 @@ mod tests {
     fn resized_pane_output_is_staged_until_quiet_deadline() {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("test", 80, 24);
-        let (_tx, rx) = mpsc::channel(1);
-        runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(rx, TerminalSize::new(80, 24)),
-        );
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         runtime.state.resize_window(created.window, 79, 24).unwrap();
         runtime.apply_pending_pane_resizes().unwrap();
 
@@ -3581,31 +3437,24 @@ mod tests {
                 24,
             )
             .unwrap();
-        let (first_tx, first_rx) = mpsc::channel(8);
-        let (second_tx, second_rx) = mpsc::channel(8);
-        runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(first_rx, TerminalSize::new(40, 24)),
-        );
-        runtime.platform_panes.insert(
-            second,
-            PlatformPane::test(second_rx, TerminalSize::new(39, 24)),
-        );
-        runtime.output_ring.extend([created.pane, second]);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(40, 24));
+        runtime.add_test_platform_pane(second, TerminalSize::new(39, 24));
         for _ in 0..6 {
-            first_tx
-                .try_send(PlatformEvent::PtyOutput {
+            runtime.emit_test_platform_event(
+                created.pane,
+                PlatformEvent::PtyOutput {
                     pane: PlatformPaneId::new(created.pane.raw()),
                     bytes: b"aaaa".to_vec(),
-                })
-                .unwrap();
+                },
+            );
         }
-        second_tx
-            .try_send(PlatformEvent::PtyOutput {
+        runtime.emit_test_platform_event(
+            second,
+            PlatformEvent::PtyOutput {
                 pane: PlatformPaneId::new(second.raw()),
                 bytes: b"z".to_vec(),
-            })
-            .unwrap();
+            },
+        );
 
         runtime.process_output_round(OutputBudget {
             per_pane_bytes: 4,
@@ -3621,7 +3470,7 @@ mod tests {
     }
 
     #[test]
-    fn full_pane_queue_does_not_block_control_events() {
+    fn queued_pane_output_does_not_block_control_events() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let client = owner.runtime.state.add_client();
         let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
@@ -3631,18 +3480,18 @@ mod tests {
         );
 
         let created = owner.runtime.state.create_session("test", 80, 24);
-        let (pane_tx, pane_rx) = mpsc::channel(1);
-        pane_tx
-            .try_send(PlatformEvent::PtyOutput {
-                pane: PlatformPaneId::new(created.pane.raw()),
-                bytes: vec![b'x'],
-            })
-            .unwrap();
-        owner.runtime.platform_panes.insert(
-            created.pane,
-            PlatformPane::test(pane_rx, TerminalSize::new(80, 24)),
-        );
-        owner.runtime.output_ring.push_back(created.pane);
+        owner
+            .runtime
+            .add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
+        for _ in 0..1_000 {
+            owner.runtime.emit_test_platform_event(
+                created.pane,
+                PlatformEvent::PtyOutput {
+                    pane: PlatformPaneId::new(created.pane.raw()),
+                    bytes: vec![b'x'],
+                },
+            );
+        }
 
         owner
             .handle_event(ServerEvent::Command {
