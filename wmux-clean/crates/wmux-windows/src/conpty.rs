@@ -18,7 +18,7 @@ use tokio::{
     runtime::Handle as TokioHandle,
     sync::{mpsc as async_mpsc, watch},
 };
-use wmux_platform::{PlatformEvent, PlatformPaneId, TerminalSize};
+use wmux_platform::{PlatformError, PlatformEvent, PlatformPaneId, TerminalSize};
 
 /// At most one MiB of unread 16 KiB chunks may accumulate per pane.
 /// A full queue blocks only that pane's reader, preserving terminal bytes and
@@ -227,9 +227,9 @@ fn spawn_output_reader(
                 emit_platform_event(
                     &tx,
                     &notify,
-                    PlatformEvent::PtyExited {
+                    PlatformEvent::BackendError {
                         pane,
-                        exit_code: None,
+                        error: PlatformError::from_io("register ConPTY output", error),
                     },
                 )
                 .await;
@@ -287,9 +287,9 @@ fn spawn_output_reader(
                         emit_platform_event(
                             &tx,
                             &notify,
-                            PlatformEvent::PtyExited {
+                            PlatformEvent::BackendError {
                                 pane,
-                                exit_code: None,
+                                error: PlatformError::from_io("read ConPTY output", error),
                             },
                         )
                         .await;
@@ -307,7 +307,10 @@ async fn emit_platform_event(
     event: PlatformEvent,
 ) {
     let pane = match &event {
-        PlatformEvent::PtyOutput { pane, .. } | PlatformEvent::PtyExited { pane, .. } => *pane,
+        PlatformEvent::PtyOutput { pane, .. }
+        | PlatformEvent::PtyExited { pane, .. }
+        | PlatformEvent::PtyClosed { pane }
+        | PlatformEvent::BackendError { pane, .. } => *pane,
     };
     if tx.send(event).await.is_ok() {
         notify(pane);

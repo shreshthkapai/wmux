@@ -2,6 +2,10 @@ pub mod conpty;
 pub mod console;
 pub mod daemon;
 pub mod pipe;
+pub mod platform;
+
+#[cfg(test)]
+mod platform_contract_tests;
 
 #[cfg(test)]
 mod daemon_tests {

@@ -9,16 +9,12 @@ use std::{
     ptr, thread,
     time::Duration,
 };
-use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers, TerminalSize};
-use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
+use wmux_platform::{
+    MouseButton, MouseEvent, MouseEventKind, MouseModifiers, TerminalInput, TerminalKeyCode,
+    TerminalKeyEvent, TerminalKeyModifiers, TerminalSize,
+};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConsoleInput {
-    Key(WireKeyEvent),
-    Paste(String),
-    Mouse(MouseEvent),
-    Resize(TerminalSize),
-}
+pub type ConsoleInput = TerminalInput;
 
 #[derive(Debug)]
 pub struct ConsoleGuard {
@@ -27,6 +23,10 @@ pub struct ConsoleGuard {
     input_mode: Dword,
     output_mode: Dword,
 }
+
+// Console handles are process-wide kernel handles. The guard owns only saved
+// mode values and may restore them from any thread; it never closes the handles.
+unsafe impl Send for ConsoleGuard {}
 
 impl ConsoleGuard {
     pub fn enter() -> io::Result<Self> {
@@ -238,58 +238,59 @@ impl Drop for GlobalMemoryGuard {
     }
 }
 
-fn encode_key_event(key: KeyEvent) -> Option<WireKeyEvent> {
+fn encode_key_event(key: KeyEvent) -> Option<TerminalKeyEvent> {
     let raw = encode_key_bytes(key)?;
-    let mut modifiers = wire_key_modifiers(key.modifiers);
+    let mut modifiers = terminal_key_modifiers(key.modifiers);
     let code = match key.code {
         KeyCode::Char(ch) if ch.is_ascii_uppercase() => {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                modifiers |= WireKeyModifiers::SHIFT;
+                modifiers =
+                    TerminalKeyModifiers::new(modifiers.bits() | TerminalKeyModifiers::SHIFT);
             }
-            WireKeyCode::Char(ch.to_ascii_lowercase())
+            TerminalKeyCode::Char(ch.to_ascii_lowercase())
         }
-        KeyCode::Char(ch) => WireKeyCode::Char(ch),
-        KeyCode::Left => WireKeyCode::Left,
-        KeyCode::Right => WireKeyCode::Right,
-        KeyCode::Up => WireKeyCode::Up,
-        KeyCode::Down => WireKeyCode::Down,
-        KeyCode::Home => WireKeyCode::Home,
-        KeyCode::End => WireKeyCode::End,
-        KeyCode::PageUp => WireKeyCode::PageUp,
-        KeyCode::PageDown => WireKeyCode::PageDown,
-        KeyCode::Backspace => WireKeyCode::Backspace,
-        KeyCode::Delete => WireKeyCode::Delete,
-        KeyCode::Insert => WireKeyCode::Insert,
-        KeyCode::Enter => WireKeyCode::Enter,
-        KeyCode::Tab => WireKeyCode::Tab,
-        KeyCode::BackTab => WireKeyCode::BackTab,
-        KeyCode::Esc => WireKeyCode::Escape,
-        KeyCode::F(number) if (1..=24).contains(&number) => WireKeyCode::Function(number),
+        KeyCode::Char(ch) => TerminalKeyCode::Char(ch),
+        KeyCode::Left => TerminalKeyCode::Left,
+        KeyCode::Right => TerminalKeyCode::Right,
+        KeyCode::Up => TerminalKeyCode::Up,
+        KeyCode::Down => TerminalKeyCode::Down,
+        KeyCode::Home => TerminalKeyCode::Home,
+        KeyCode::End => TerminalKeyCode::End,
+        KeyCode::PageUp => TerminalKeyCode::PageUp,
+        KeyCode::PageDown => TerminalKeyCode::PageDown,
+        KeyCode::Backspace => TerminalKeyCode::Backspace,
+        KeyCode::Delete => TerminalKeyCode::Delete,
+        KeyCode::Insert => TerminalKeyCode::Insert,
+        KeyCode::Enter => TerminalKeyCode::Enter,
+        KeyCode::Tab => TerminalKeyCode::Tab,
+        KeyCode::BackTab => TerminalKeyCode::BackTab,
+        KeyCode::Esc => TerminalKeyCode::Escape,
+        KeyCode::F(number) if (1..=24).contains(&number) => TerminalKeyCode::Function(number),
         _ => return None,
     };
 
-    Some(WireKeyEvent {
+    Some(TerminalKeyEvent {
         code,
         modifiers,
         raw,
     })
 }
 
-fn wire_key_modifiers(modifiers: KeyModifiers) -> WireKeyModifiers {
-    let mut wire = WireKeyModifiers::NONE;
+fn terminal_key_modifiers(modifiers: KeyModifiers) -> TerminalKeyModifiers {
+    let mut bits = 0;
     if modifiers.contains(KeyModifiers::SHIFT) {
-        wire |= WireKeyModifiers::SHIFT;
+        bits |= TerminalKeyModifiers::SHIFT;
     }
     if modifiers.contains(KeyModifiers::ALT) {
-        wire |= WireKeyModifiers::ALT;
+        bits |= TerminalKeyModifiers::ALT;
     }
     if modifiers.contains(KeyModifiers::CONTROL) {
-        wire |= WireKeyModifiers::CONTROL;
+        bits |= TerminalKeyModifiers::CONTROL;
     }
     if modifiers.contains(KeyModifiers::SUPER) {
-        wire |= WireKeyModifiers::SUPER;
+        bits |= TerminalKeyModifiers::SUPER;
     }
-    wire
+    TerminalKeyModifiers::new(bits)
 }
 
 fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
@@ -508,7 +509,7 @@ extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
+    use wmux_platform::{TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -518,9 +519,9 @@ mod tests {
     fn normalized_key_keeps_semantic_identity_and_application_bytes() {
         assert_eq!(
             encode_key_event(key(KeyCode::Char('B'), KeyModifiers::CONTROL)),
-            Some(WireKeyEvent {
-                code: WireKeyCode::Char('b'),
-                modifiers: WireKeyModifiers::CONTROL,
+            Some(TerminalKeyEvent {
+                code: TerminalKeyCode::Char('b'),
+                modifiers: TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
                 raw: vec![0x02],
             })
         );
@@ -529,31 +530,43 @@ mod tests {
     #[test]
     fn multibyte_and_navigation_keys_are_one_semantic_event() {
         let unicode = encode_key_event(key(KeyCode::Char('λ'), KeyModifiers::ALT)).unwrap();
-        assert_eq!(unicode.code, WireKeyCode::Char('λ'));
-        assert_eq!(unicode.modifiers, WireKeyModifiers::ALT);
+        assert_eq!(unicode.code, TerminalKeyCode::Char('λ'));
+        assert_eq!(
+            unicode.modifiers,
+            TerminalKeyModifiers::new(TerminalKeyModifiers::ALT)
+        );
         assert_eq!(unicode.raw, [0x1b, 0xce, 0xbb]);
 
         let up = encode_key_event(key(KeyCode::Up, KeyModifiers::NONE)).unwrap();
-        assert_eq!(up.code, WireKeyCode::Up);
-        assert_eq!(up.modifiers, WireKeyModifiers::NONE);
+        assert_eq!(up.code, TerminalKeyCode::Up);
+        assert_eq!(up.modifiers, TerminalKeyModifiers::default());
         assert_eq!(up.raw, b"\x1b[A");
     }
 
     #[test]
     fn normalizes_supported_key_codes_and_modifiers() {
         let shifted = encode_key_event(key(KeyCode::Char('A'), KeyModifiers::SHIFT)).unwrap();
-        assert_eq!(shifted.code, WireKeyCode::Char('a'));
-        assert_eq!(shifted.modifiers, WireKeyModifiers::SHIFT);
+        assert_eq!(shifted.code, TerminalKeyCode::Char('a'));
+        assert_eq!(
+            shifted.modifiers,
+            TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT)
+        );
         assert_eq!(shifted.raw, b"A");
 
         let super_key = encode_key_event(key(KeyCode::Char('k'), KeyModifiers::SUPER)).unwrap();
-        assert_eq!(super_key.code, WireKeyCode::Char('k'));
-        assert_eq!(super_key.modifiers, WireKeyModifiers::SUPER);
+        assert_eq!(super_key.code, TerminalKeyCode::Char('k'));
+        assert_eq!(
+            super_key.modifiers,
+            TerminalKeyModifiers::new(TerminalKeyModifiers::SUPER)
+        );
         assert_eq!(super_key.raw, b"k");
 
         let back_tab = encode_key_event(key(KeyCode::BackTab, KeyModifiers::SHIFT)).unwrap();
-        assert_eq!(back_tab.code, WireKeyCode::BackTab);
-        assert_eq!(back_tab.modifiers, WireKeyModifiers::SHIFT);
+        assert_eq!(back_tab.code, TerminalKeyCode::BackTab);
+        assert_eq!(
+            back_tab.modifiers,
+            TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT)
+        );
         assert_eq!(back_tab.raw, b"\x1b[Z");
     }
 
@@ -562,26 +575,26 @@ mod tests {
         let cases = [
             (
                 key(KeyCode::Char(' '), KeyModifiers::CONTROL),
-                WireKeyCode::Char(' '),
-                WireKeyModifiers::CONTROL,
+                TerminalKeyCode::Char(' '),
+                TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
                 vec![0x00],
             ),
             (
                 key(KeyCode::Backspace, KeyModifiers::CONTROL),
-                WireKeyCode::Backspace,
-                WireKeyModifiers::CONTROL,
+                TerminalKeyCode::Backspace,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
                 vec![0x08],
             ),
             (
                 key(KeyCode::Enter, KeyModifiers::NONE),
-                WireKeyCode::Enter,
-                WireKeyModifiers::NONE,
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::default(),
                 vec![b'\r'],
             ),
             (
                 key(KeyCode::Esc, KeyModifiers::NONE),
-                WireKeyCode::Escape,
-                WireKeyModifiers::NONE,
+                TerminalKeyCode::Escape,
+                TerminalKeyModifiers::default(),
                 vec![0x1b],
             ),
         ];
@@ -589,7 +602,7 @@ mod tests {
         for (input, code, modifiers, raw) in cases {
             assert_eq!(
                 encode_key_event(input),
-                Some(WireKeyEvent {
+                Some(TerminalKeyEvent {
                     code,
                     modifiers,
                     raw,
@@ -601,12 +614,15 @@ mod tests {
     #[test]
     fn normalizes_supported_function_keys() {
         let f1 = encode_key_event(key(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
-        assert_eq!(f1.code, WireKeyCode::Function(1));
+        assert_eq!(f1.code, TerminalKeyCode::Function(1));
         assert_eq!(f1.raw, b"\x1bOP");
 
         let f12 = encode_key_event(key(KeyCode::F(12), KeyModifiers::ALT)).unwrap();
-        assert_eq!(f12.code, WireKeyCode::Function(12));
-        assert_eq!(f12.modifiers, WireKeyModifiers::ALT);
+        assert_eq!(f12.code, TerminalKeyCode::Function(12));
+        assert_eq!(
+            f12.modifiers,
+            TerminalKeyModifiers::new(TerminalKeyModifiers::ALT)
+        );
         assert_eq!(f12.raw, b"\x1b[24~");
     }
 

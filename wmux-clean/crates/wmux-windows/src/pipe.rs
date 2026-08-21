@@ -23,6 +23,10 @@ impl UserSid {
         &self.text
     }
 
+    pub(crate) fn peer_identity(&self) -> wmux_platform::PeerIdentity {
+        wmux_platform::PeerIdentity::from_token(&self.bytes)
+    }
+
     #[cfg(test)]
     fn well_known_local_system_for_test() -> Self {
         Self {
@@ -346,6 +350,11 @@ mod imp {
         #[cfg(test)]
         security_sddl: String,
     }
+
+    // The descriptor is exclusively owned by `ServerPipeFactory`. Moving the
+    // factory transfers that ownership; no thread shares or concurrently uses
+    // the raw allocation.
+    unsafe impl Send for SecurityDescriptor {}
 
     impl SecurityDescriptor {
         fn from_owner(owner: &UserSid) -> io::Result<Self> {

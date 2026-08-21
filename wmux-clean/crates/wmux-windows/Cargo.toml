@@ -13,7 +13,6 @@ crossterm.workspace = true
 tokio.workspace = true
 windows-sys.workspace = true
 wmux-platform = { path = "../wmux-platform" }
-wmux-protocol = { path = "../wmux-protocol" }
 
 [lints]
 workspace = true
