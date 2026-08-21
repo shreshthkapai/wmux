@@ -85,6 +85,9 @@ impl KeyCode {
             } else if character.is_ascii_uppercase() {
                 key = BareKey::Char(character.to_ascii_lowercase());
                 modifiers |= KeyModifiers::SHIFT;
+            } else if character.is_ascii_punctuation() {
+                // Terminal APIs may report both the produced symbol and the Shift used to type it.
+                modifiers = KeyModifiers(modifiers.bits() & !KeyModifiers::SHIFT.bits());
             }
         }
         let (tag, value) = encode_bare_key(key);
@@ -849,7 +852,7 @@ mod tests {
         KeyModifiers, KeyTable, KeyTableName, KeyTableTarget, KeyTables, MAX_KEY_NAME_BYTES,
         MAX_KEY_TABLE_NAME_BYTES,
     };
-    use crate::{parse_command_text, ClientInput, Command, ServerState};
+    use crate::{parse_command_text, ClientInput, Command, ServerState, SplitDirection};
 
     fn binding(key: KeyCode, repeatable: bool, command: &str) -> KeyBinding {
         KeyBinding {
@@ -873,10 +876,64 @@ mod tests {
             KeyCode::character('A', KeyModifiers::NONE),
             KeyCode::character('a', KeyModifiers::SHIFT)
         );
+        assert_ne!(
+            KeyCode::character('a', KeyModifiers::SHIFT),
+            KeyCode::character('a', KeyModifiers::NONE)
+        );
+        assert_ne!(
+            KeyCode::try_new(super::BareKey::Left, KeyModifiers::SHIFT).unwrap(),
+            KeyCode::try_new(super::BareKey::Left, KeyModifiers::NONE).unwrap()
+        );
         assert_eq!(KeyCode::parse("C-S-Left").unwrap().to_string(), "C-S-Left");
         assert_eq!(KeyCode::parse("F24").unwrap().to_string(), "F24");
         assert!(KeyCode::parse("F25").is_err());
         assert!(KeyCode::parse(&"x".repeat(MAX_KEY_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn shifted_printable_symbols_route_to_tmux_default_split_bindings() {
+        for (symbol, direction) in [
+            ('%', SplitDirection::LeftRight),
+            ('"', SplitDirection::TopBottom),
+        ] {
+            let mut state = ServerState::new();
+            let client = state.add_client();
+            assert_eq!(
+                route_key(
+                    &mut state,
+                    client,
+                    InputMode::Normal,
+                    KeyEvent::new(KeyCode::ctrl('b'), vec![0x02]),
+                    100,
+                ),
+                InputRoute::Consumed
+            );
+
+            let route = route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                KeyEvent::new(
+                    KeyCode::character(symbol, KeyModifiers::SHIFT),
+                    symbol.to_string().into_bytes(),
+                ),
+                101,
+            );
+            assert!(
+                matches!(
+                    route,
+                    InputRoute::Commands(commands)
+                        if matches!(
+                            &commands[0],
+                            Command::SplitWindow {
+                                direction: actual,
+                                detached: false,
+                            } if *actual == direction
+                        )
+                ),
+                "shifted {symbol:?} did not route to the expected split binding"
+            );
+        }
     }
 
     #[test]
