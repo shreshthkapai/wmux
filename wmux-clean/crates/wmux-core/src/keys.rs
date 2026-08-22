@@ -757,7 +757,7 @@ pub fn route_key(
 
     expire_key_state(client, now_ms);
     if client.key_table == KeyTableName::ROOT {
-        return route_root(tables, client, event, now_ms);
+        return route_root(tables, client, event);
     }
 
     if client.key_table == KeyTableName::PREFIX && event.code == tables.prefix() {
@@ -769,7 +769,6 @@ pub fn route_key(
     if let Some((repeatable, commands)) = binding_route(tables, client.key_table, event.code) {
         if !repeat_active || repeatable {
             if repeatable {
-                client.prefix_deadline_ms = None;
                 client.repeat_deadline_ms = Some(now_ms.saturating_add(tables.repeat_time_ms()));
                 client.last_repeatable_key = Some(event.code);
             } else {
@@ -780,7 +779,7 @@ pub fn route_key(
     }
 
     reset_key_state(client);
-    route_root(tables, client, event, now_ms)
+    route_root(tables, client, event)
 }
 
 fn route_confirmation(client: &mut Client, event: KeyEvent) -> InputRoute {
@@ -803,10 +802,9 @@ fn route_confirmation(client: &mut Client, event: KeyEvent) -> InputRoute {
     }
 }
 
-fn route_root(tables: &KeyTables, client: &mut Client, event: KeyEvent, now_ms: u64) -> InputRoute {
+fn route_root(tables: &KeyTables, client: &mut Client, event: KeyEvent) -> InputRoute {
     if event.code == tables.prefix() {
         client.key_table = KeyTableName::PREFIX;
-        client.prefix_deadline_ms = Some(now_ms.saturating_add(tables.repeat_time_ms()));
         client.repeat_deadline_ms = None;
         client.last_repeatable_key = None;
         return InputRoute::Consumed;
@@ -829,7 +827,6 @@ fn binding_route(
 fn expire_key_state(client: &mut Client, now_ms: u64) {
     let expired = client
         .repeat_deadline_ms
-        .or(client.prefix_deadline_ms)
         .is_some_and(|deadline| now_ms > deadline);
     if expired {
         reset_key_state(client);
@@ -838,7 +835,6 @@ fn expire_key_state(client: &mut Client, now_ms: u64) {
 
 fn reset_key_state(client: &mut Client) {
     client.key_table = KeyTableName::ROOT;
-    client.prefix_deadline_ms = None;
     client.repeat_deadline_ms = None;
     client.last_repeatable_key = None;
 }
@@ -1169,15 +1165,9 @@ mod tests {
     }
 
     #[test]
-    fn expired_prefix_retries_root_and_root_bindings_precede_passthrough() {
+    fn prefix_waits_for_the_next_binding_beyond_repeat_time() {
         let mut state = ServerState::new();
         let client = state.add_client();
-        let key = KeyCode::character('a', KeyModifiers::NONE);
-        state
-            .key_tables
-            .table_mut(KeyTableName::ROOT)
-            .unwrap()
-            .bind(binding(key, false, "list-sessions"));
         route_key(
             &mut state,
             client,
@@ -1187,8 +1177,9 @@ mod tests {
         );
 
         assert!(matches!(
-            route_key(&mut state, client, InputMode::Normal, character('a'), 501),
-            InputRoute::Commands(_)
+            route_key(&mut state, client, InputMode::Normal, character('0'), 10_000),
+            InputRoute::Commands(commands)
+                if matches!(&commands[0], Command::SelectWindow { .. })
         ));
         assert_eq!(state.clients[&client].key_table, KeyTableName::ROOT);
     }

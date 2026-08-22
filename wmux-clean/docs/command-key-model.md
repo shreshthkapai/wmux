@@ -74,9 +74,11 @@ Windows console modifier reporting.
 
 The server owns sorted compact binding tables with binary-search lookup.
 Phase 4 provides `root`, `prefix`, and `copy-mode` tables, a `C-b` prefix, and
-a 500 ms repeat window. `bind-key`, `unbind-key`, and `list-keys` mutate or
-inspect those server-owned tables. Binding command lists are shared by `Arc`,
-so dispatch does not reparse command text.
+a 500 ms repeat window. Like tmux with its default `prefix-timeout` of zero,
+the prefix table waits indefinitely for the next key; the repeat window applies
+only after a repeatable binding. `bind-key`, `unbind-key`, and `list-keys`
+mutate or inspect those server-owned tables. Binding command lists are shared
+by `Arc`, so dispatch does not reparse command text.
 
 Routing order is confirmation, copy mode, prefix transition, active-table
 binding, then unbound passthrough. Repeatable bindings retain prefix state until
