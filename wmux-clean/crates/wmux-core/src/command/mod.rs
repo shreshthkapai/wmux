@@ -7,8 +7,8 @@ use std::{
 
 use crate::{
     ClientId, FormatContext, FormatEngine, KeyBinding, KeyCode, KeyTableTarget, OptionScope,
-    OptionTarget, PaneId, ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId,
-    SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
+    OptionTarget, OptionValue, PaneId, ResizeDirection, ResolveContext, ResolvedTarget,
+    ServerState, SessionId, SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -657,6 +657,18 @@ pub(super) fn execute_state_command(
                     )
                     .map(|_| ())
             };
+            if result.is_ok() && target == OptionTarget::Server && name == "buffer-limit" {
+                let OptionValue::Number(limit) = state
+                    .option(OptionTarget::Server, "buffer-limit")
+                    .expect("built-in buffer-limit remains available")
+                else {
+                    unreachable!("buffer-limit is a numeric option")
+                };
+                state
+                    .paste_buffers
+                    .set_limit(limit as usize)
+                    .expect("validated buffer-limit is positive");
+            }
             match result {
                 Ok(()) => CommandResult {
                     sequence: queued.sequence,
@@ -2661,6 +2673,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires an option name"));
+    }
+
+    #[test]
+    fn buffer_limit_option_updates_the_server_owned_store() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+        state.paste_buffers.add_automatic(b"one".to_vec()).unwrap();
+        state.paste_buffers.add_automatic(b"two".to_vec()).unwrap();
+
+        assert!(execute_one(&mut state, client, "set-option -g buffer-limit 1").ok);
+        assert_eq!(state.paste_buffers.limit(), 1);
+        assert_eq!(state.paste_buffers.len(), 1);
+        assert!(execute_one(&mut state, client, "set-option -g -u buffer-limit").ok);
+        assert_eq!(state.paste_buffers.limit(), 50);
     }
 
     #[test]

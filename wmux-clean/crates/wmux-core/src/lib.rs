@@ -7,6 +7,7 @@ pub mod ids;
 pub mod keys;
 pub mod layout;
 pub mod options;
+pub mod paste;
 pub mod render;
 pub mod screen;
 pub mod state;
@@ -35,6 +36,7 @@ pub use options::{
     OptionError, OptionScope, OptionStore, OptionTarget, OptionValue, MAX_OPTION_NAME_BYTES,
     MAX_OPTION_STRING_BYTES,
 };
+pub use paste::{PasteBuffer, PasteBufferError, PasteBufferStore};
 pub use render::{
     build_window_scene, build_window_scene_with_client_overlay,
     build_window_scene_with_retained_panes, build_window_scene_with_viewports,

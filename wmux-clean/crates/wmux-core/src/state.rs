@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     ClientId, ConfirmationState, KeyCode, KeyTableName, KeyTables, LayoutNode, OptionError,
-    OptionStore, OptionTarget, OptionValue, PaneId, Rect, ResizeDirection, Screen, SessionGroupId,
-    SessionId, SplitDirection, TerminalEngine, WindowId, WinlinkId,
+    OptionStore, OptionTarget, OptionValue, PaneId, PasteBufferStore, Rect, ResizeDirection,
+    Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId, WinlinkId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +106,7 @@ pub struct ServerState {
     pub panes: BTreeMap<PaneId, Pane>,
     pub key_tables: KeyTables,
     pub options: OptionStore,
+    pub paste_buffers: PasteBufferStore,
     pending_pane_resizes: BTreeMap<PaneId, PaneResize>,
 }
 
@@ -121,6 +122,7 @@ impl ServerState {
             panes: BTreeMap::new(),
             key_tables: KeyTables::tmux_defaults(),
             options: OptionStore::new(),
+            paste_buffers: PasteBufferStore::default(),
             pending_pane_resizes: BTreeMap::new(),
         }
     }
