@@ -454,9 +454,9 @@ fn parse_command_line(raw: &str) -> io::Result<CommandList> {
 }
 
 fn core_key_event(event: WireKeyEvent) -> Result<KeyEvent, String> {
-    let modifiers = KeyModifiers::from_bits(event.modifiers.bits())
+    let mut modifiers = KeyModifiers::from_bits(event.modifiers.bits())
         .ok_or_else(|| "wire key contains unsupported modifiers".to_string())?;
-    let bare = match event.code {
+    let mut bare = match event.code {
         WireKeyCode::Char(character) => BareKey::Char(character),
         WireKeyCode::Left => BareKey::Left,
         WireKeyCode::Right => BareKey::Right,
@@ -475,6 +475,14 @@ fn core_key_event(event: WireKeyEvent) -> Result<KeyEvent, String> {
         WireKeyCode::Escape => BareKey::Escape,
         WireKeyCode::Function(number) => BareKey::Function(number),
     };
+    if matches!(bare, BareKey::Char(_)) && event.raw.len() == 1 && event.raw[0].is_ascii_graphic() {
+        // Legacy terminal input identifies a printable binding by the produced glyph. Console
+        // APIs may redundantly retain the Shift or Control keys used to produce that glyph.
+        bare = BareKey::Char(char::from(event.raw[0]));
+        let redundant = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
+        modifiers = KeyModifiers::from_bits(modifiers.bits() & !redundant.bits())
+            .expect("removing supported modifiers keeps a valid modifier set");
+    }
     let code = KeyCode::try_new(bare, modifiers).map_err(|error| error.to_string())?;
     Ok(KeyEvent::new(code, event.raw))
 }
@@ -2907,6 +2915,34 @@ mod tests {
             .scheduler
             .input_priority_until
             .is_some());
+    }
+
+    #[test]
+    fn printable_raw_quote_routes_despite_redundant_console_modifiers() {
+        let (mut owner, client, _) = attached_owner();
+
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('b', WireKeyModifiers::CONTROL, &[0x02]),
+                0,
+            )
+            .unwrap();
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char(
+                    '"',
+                    WireKeyModifiers::SHIFT | WireKeyModifiers::CONTROL,
+                    b"\"",
+                ),
+                1,
+            )
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.runtime.state.panes.len(), 2);
+        assert!(owner.runtime.test_inputs.is_empty());
     }
 
     #[test]

@@ -62,6 +62,14 @@ original terminal bytes. A multibyte character or escape sequence is one key
 message. Unbound keys move their existing byte vector to the active pane;
 paste remains a separate semantic message and bypasses key tables.
 
+For a character event whose raw payload is exactly one printable ASCII glyph,
+the server uses that produced glyph as the binding identity and discards
+redundant Shift and Control state. Alt, Super, multibyte characters, control
+bytes, and escape sequences retain their semantic identity. The original raw
+payload is never rewritten, so unbound passthrough remains byte-exact. This
+matches tmux's legacy printable-key behavior while tolerating layout-dependent
+Windows console modifier reporting.
+
 ## Tables, routing, and confirmation
 
 The server owns sorted compact binding tables with binary-search lookup.
