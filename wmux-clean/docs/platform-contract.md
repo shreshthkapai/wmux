@@ -45,10 +45,10 @@ listener must derive its owner and peer identities from authenticated native
 state; the shared server compares them before reading protocol `Hello`.
 
 On Windows the listener owns its named-pipe DACL, lock, factory, current pipe,
-and SID verification. Linux must use protected Unix-socket filesystem
-permissions plus `SO_PEERCRED`; macOS must use protected socket permissions
-plus `getpeereid`. A client-provided identity is never trusted. Relevant native
-contracts are documented by [Windows named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights),
+and SID verification. On Linux the adapter uses protected Unix-socket
+filesystem permissions plus `SO_PEERCRED`; on macOS it uses protected socket
+permissions plus `getpeereid`. A client-provided identity is never trusted.
+Relevant native contracts are documented by [Windows named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights),
 [Linux unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html), and
 [Apple getpeereid(3)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html).
 
@@ -65,6 +65,28 @@ logic never examines Windows error codes or Unix `errno`. Diagnostic payloads
 are truncated on a UTF-8 boundary to exactly 4,096 bytes maximum, and conversion
 to `io::Error` occurs only at process-facing boundaries.
 
+## Unix adapter realization
+
+`wmux-unix` implements the frozen contract without exposing descriptors, PIDs,
+UIDs, signals, or termios values to shared crates. The client and server
+composition roots select it under `cfg(unix)`; shared state continues to see
+only stable pane IDs, opaque peer identities, and semantic events.
+
+Each pane is its own session and process group. Graceful termination sends
+`SIGHUP` to the complete group, forced termination sends `SIGKILL`, and backend
+drop kills and reaps all remaining pane trees. PTY output is read in reusable
+16 KiB chunks and delivered through a bounded 64-entry queue. Input uses one
+bounded ordered writer queue with complete short-write retry. Linux epoll and
+macOS kqueue readiness are both consumed through Tokio `AsyncFd`; neither
+reactor is visible across the platform boundary.
+
+The reader and direct-child waiter report independently. The adapter coalesces
+their results into the same portable ordering used by ConPTY: all queued output,
+at most one `PtyExited`, then exactly one `PtyClosed`. The terminal guard saves
+the exact original termios state, applies raw mode, and restores the saved state
+on every drop path. Detached daemon startup creates a new session and disconnects
+standard streams without invoking a shell.
+
 ## Conformance and change rule
 
 The real server is exercised over protocol v6 with a memory listener and
@@ -76,7 +98,7 @@ create -> attach -> type -> split -> resize -> detach
 ```
 
 The deterministic portable suite has a `platform-lifecycle` case and one
-central `EXPECTED_DIFFERENCES` registry. The Phase 5 registry is empty.
+central `EXPECTED_DIFFERENCES` registry. The registry remains empty in Phase 6.
 Platform-specific assertions may test mechanics, but shared semantic exceptions
 must be registered with the affected platform, observable contract, rationale,
 and evidence issue.

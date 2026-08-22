@@ -28,11 +28,11 @@ config, shared server library, shared client library, and conformance crates on
 all three operating systems. This prevents native types or host-dependent
 behavior from entering the shared semantic path.
 
-### Phase 5 platform contract evidence
+### Phase 6 portable contract evidence
 
-The portable suite now contains 14 cases and produces aggregate fingerprint
+The portable suite contains 14 cases and produces aggregate fingerprint
 `f71b72b35879a1c6`. `EXPECTED_DIFFERENCES` is the only semantic-exception
-registry and is empty in Phase 5: ConPTY versus PTY, named pipes versus Unix
+registry and remains empty in Phase 6: ConPTY versus PTY, named pipes versus Unix
 sockets, and SID versus UID are implementation mechanisms, not observable mux
 differences. Tests may not hide differences behind platform-conditional
 assertions.
@@ -64,9 +64,38 @@ reference comparison limits.
 | Contract | Windows | Linux | macOS |
 | --- | --- | --- | --- |
 | Portable semantic suite | Enforced | Enforced in CI | Enforced in CI |
-| PTY input/output | ConPTY IOCP test | Awaiting Unix backend | Awaiting Unix backend |
-| Process-tree cleanup | Job Object descendant test | Awaiting Unix backend | Awaiting Unix backend |
-| Native transport | Named-pipe tests | Awaiting Unix backend | Awaiting Unix backend |
+| PTY input/output | ConPTY IOCP test | Native PTY tests verified | Native PTY CI gate configured |
+| Process-tree cleanup | Job Object descendant test | Process-group descendant tests verified | Process-group CI gate configured |
+| Native transport | Named-pipe tests | AF_UNIX and `SO_PEERCRED` tests verified | AF_UNIX and `getpeereid` CI gate configured |
+| Full native lifecycle | Windows protocol lifecycle | Real Linux socket/PTY lifecycle verified | Native lifecycle CI gate configured |
+
+### Phase 6 Unix lifecycle evidence
+
+`wmux-unix` supplies the real platform adapter on Linux and macOS. Its native
+integration test drives protocol v6 over a real AF_UNIX socket and PTY through:
+
+```text
+create -> attach -> type -> split -> resize -> detach
+       -> background output -> reattach -> kill pane/session -> kill server
+```
+
+The test asserts rendered shell output after reattachment and verifies that the
+owned socket and lock are removed after shutdown. Linux native execution is
+verified locally with:
+
+```powershell
+cargo test -p wmux-unix
+cargo test -p wmux-unix --test native_lifecycle
+cargo check -p wmux -p wmux-server --bins
+cargo run -p wmux-conformance --release
+```
+
+The `native-unix` CI matrix runs the same adapter tests, lifecycle test, binary
+checks, format check, warnings-denied clippy, and portable conformance on
+`ubuntu-latest` and `macos-latest`. Both `x86_64-apple-darwin` and
+`aarch64-apple-darwin` compile checks pass locally. Native macOS behavior is
+still reported as CI-gated rather than verified here because no macOS runner
+was available in the local verification environment.
 
 ### Phase 3 Windows lifecycle evidence
 
@@ -107,10 +136,6 @@ default and `TerminateJobObject` terminates every associated process:
 
 - <https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects>
 - <https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject>
-
-Linux and macOS native conformance must not be marked complete until the Unix
-PTY/process/socket backend exists. The portable suite is ready now and becomes
-the semantic acceptance contract for that backend.
 
 ## Server Invariants
 

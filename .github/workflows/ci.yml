@@ -40,6 +40,34 @@ jobs:
       - name: Test portable crates and shared runtime libraries
         run: cargo test -p wmux-core -p wmux-platform -p wmux-protocol -p wmux-config -p wmux-server -p wmux -p wmux-conformance --lib
 
+  native-unix:
+    name: Native Unix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: wmux-clean
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint Unix targets
+        run: cargo clippy -p wmux-unix -p wmux -p wmux-server --all-targets -- -D warnings
+      - name: Test native Unix adapter and lifecycle
+        run: cargo test -p wmux-unix
+      - name: Check Unix binaries
+        run: cargo check -p wmux -p wmux-server --bins
+      - name: Run semantic conformance
+        run: cargo run -p wmux-conformance --release
+
   windows-baseline:
     name: Windows baseline
     runs-on: windows-latest

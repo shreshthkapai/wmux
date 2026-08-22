@@ -531,7 +531,10 @@ dependencies = [
  "libc",
  "nix",
  "tokio",
+ "wmux-config",
  "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
 ]
 
 [[package]]

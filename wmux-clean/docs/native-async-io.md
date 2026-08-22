@@ -1,8 +1,10 @@
 # Native Asynchronous I/O
 
-The Windows runtime uses Tokio's IOCP-backed named-pipe implementation. Async
-tasks own transport progress only. They emit semantic events to the single
-state owner and never mutate sessions, panes, grids, layouts, or client state.
+The Windows runtime uses Tokio's IOCP-backed named-pipe implementation. The
+Unix runtime uses Tokio readiness around nonblocking AF_UNIX sockets and PTY
+masters, mapping to epoll on Linux and kqueue on macOS. Async tasks own
+transport progress only. They emit semantic events to the single state owner
+and never mutate sessions, panes, grids, layouts, or client state.
 
 ## Client IPC
 
@@ -47,6 +49,37 @@ ConPTY input remains a synchronous pipe as required by Windows. A dedicated
 per-pane writer worker owns that channel so a blocked ConPTY write cannot block
 the state owner or an IOCP worker. Input messages remain ordered.
 
+## Unix PTY Channels
+
+The Unix adapter allocates a PTY at the requested initial size, gives the slave
+to a child in its own session and process group, and retains only the
+nonblocking master. `AsyncFd` drives both readable and writable readiness:
+
+```text
+nonblocking PTY master
+  -> epoll (Linux) / kqueue (macOS)
+  -> reused 16 KiB read buffer
+  -> bounded 64-entry PlatformEvent queue
+  -> fair state-owner parser scheduling
+```
+
+Pane input enters one bounded ordered queue. Its writer retries `EINTR`, clears
+readiness on `EAGAIN`, and completes every short write before advancing to the
+next input message. Resize requests apply `TIOCSWINSZ` to the PTY; the server
+continues to derive the requested size from authoritative layout cells.
+
+PTY EOF and child exit are independent native observations. The backend drains
+queued output before emitting at most one exit and exactly one close. If EOF
+arrives without a child status, it emits one unknown exit first. Pane cleanup
+signals the complete process group, and backend shutdown force-kills and reaps
+every remaining pane tree.
+
+The Unix terminal frontend owns a restoration guard containing the exact saved
+termios state. Entering attach mode applies raw input, while normal return,
+detach, error propagation, and unwinding all restore the saved state through
+the same drop path. Rendering remains one synchronized-output transaction and
+clipboard writes remain one bounded OSC 52 transaction.
+
 ## Backpressure And Shutdown
 
 Each pane has 64 queued 16 KiB output chunks. When full, the async read task
@@ -64,9 +97,9 @@ synchronized-output, or resize deadline. There is no fixed I/O polling tick.
 ## Cross-OS Boundary
 
 IOCP and named-pipe types remain inside `wmux-windows` and `wmux-server` I/O
-coordination. Core events and platform IDs remain OS neutral. Unix backends can
-map the same event contract to nonblocking PTYs plus epoll on Linux and kqueue
-on macOS without changing multiplexer semantics.
+coordination. Unix descriptors, termios, credentials, process groups, and
+signals remain inside `wmux-unix`. Core events and platform IDs remain OS
+neutral; both adapters implement the same ordering and backpressure contract.
 
 ## References
 
@@ -75,3 +108,5 @@ on macOS without changing multiplexer semantics.
 - Microsoft `CreatePseudoConsole` documentation
 - Microsoft synchronous and overlapped named-pipe I/O documentation
 - Microsoft I/O completion port documentation
+- Linux `unix(7)`, `pty(7)`, `epoll(7)`, and `credentials(7)` documentation
+- Apple `getpeereid(3)`, `openpty(3)`, `termios(4)`, and `kqueue(2)` documentation
