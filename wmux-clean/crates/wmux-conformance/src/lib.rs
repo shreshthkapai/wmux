@@ -17,7 +17,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xf71b_72b3_5879_a1c6;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x3c55_888e_04f4_1786;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformFamily {
@@ -66,6 +66,7 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         resize_reflow_case(),
         malformed_input_case()?,
         key_and_paste_case(),
+        paste_buffer_case()?,
         semantic_key_routing_case()?,
         command_target_binding_case()?,
         command_effects_case()?,
@@ -457,6 +458,49 @@ fn key_and_paste_case() -> CaseResult {
         name: "key-paste-behavior",
         fingerprint: hash.finish(),
     }
+}
+
+fn paste_buffer_case() -> Result<CaseResult, String> {
+    let mut state = ServerState::new();
+    let created = state.create_session("buffers", COLS, ROWS);
+    let client = state.add_client();
+    state
+        .attach_client(client, created.session)
+        .ok_or("buffer case attach failed")?;
+    let bytes = vec![0, 0xff, b'\n', b'x'];
+    state
+        .paste_buffers
+        .set_named("exact", bytes.clone())
+        .map_err(|error| error.to_string())?;
+
+    let outcomes = execute_text(&mut state, client, "paste-buffer -d -p -b exact")?;
+    let effect = outcomes[0]
+        .effects
+        .first()
+        .ok_or("paste-buffer did not emit an effect")?;
+    let CommandEffect::PastePane {
+        pane,
+        bytes: effect_bytes,
+        bracketed,
+    } = effect
+    else {
+        return Err("paste-buffer emitted the wrong effect".to_string());
+    };
+    if *pane != created.pane || effect_bytes.as_ref() != bytes || !bracketed {
+        return Err("paste-buffer changed target, bytes, or bracket mode".to_string());
+    }
+    if state.paste_buffers.get(Some("exact")).is_some() {
+        return Err("paste-buffer -d retained the selected buffer".to_string());
+    }
+
+    let mut hash = Fnv64::new();
+    hash.u64(pane.raw());
+    hash.bytes(effect_bytes);
+    hash.byte(u8::from(*bracketed));
+    Ok(CaseResult {
+        name: "paste-buffer-semantics",
+        fingerprint: hash.finish(),
+    })
 }
 
 fn semantic_key_routing_case() -> Result<CaseResult, String> {
@@ -929,11 +973,15 @@ mod tests {
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 14);
+        assert_eq!(report.cases.len(), 15);
         assert!(report
             .cases
             .iter()
             .any(|case| case.name == "platform-lifecycle"));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "paste-buffer-semantics"));
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, IoSlice, Read, Write},
     path::{Path, PathBuf},
@@ -48,6 +48,8 @@ const RESIZE_REPAINT_QUIET: Duration = Duration::from_millis(16);
 const RESIZE_REPAINT_MAX: Duration = Duration::from_millis(120);
 const CONTROL_EVENTS_PER_TURN: usize = 256;
 const COMMANDS_PER_TURN: usize = 64;
+const PASTES_PER_TURN: usize = 64;
+const PASTE_CHUNK_BYTES: usize = 64 * 1024;
 const CLIENT_OUTPUT_MESSAGES: usize = 64;
 const CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CLIENT_MAX_FRAME_BYTES: usize = FRAME_HEADER_LEN + MAX_FRAME;
@@ -1229,9 +1231,40 @@ impl Outbound {
 struct ServerOwner {
     runtime: Runtime,
     clients: BTreeMap<ClientId, ClientView>,
+    pending_pastes: VecDeque<PendingPaste>,
     started_at: Instant,
     shutdown: ShutdownState,
     shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+struct PendingPaste {
+    pane: PaneId,
+    bytes: Arc<[u8]>,
+    offset: usize,
+    prefix_sent: bool,
+    suffix_sent: bool,
+    bracketed: bool,
+}
+
+impl PendingPaste {
+    fn next_chunk(&mut self) -> (Vec<u8>, bool) {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        let payload_len = remaining.min(PASTE_CHUNK_BYTES);
+        let mut chunk = Vec::with_capacity(payload_len + 12);
+        if self.bracketed && !self.prefix_sent {
+            chunk.extend_from_slice(b"\x1b[200~");
+            self.prefix_sent = true;
+        }
+        let end = self.offset + payload_len;
+        chunk.extend_from_slice(&self.bytes[self.offset..end]);
+        self.offset = end;
+        if self.bracketed && self.offset == self.bytes.len() && !self.suffix_sent {
+            chunk.extend_from_slice(b"\x1b[201~");
+            self.suffix_sent = true;
+        }
+        let complete = self.offset == self.bytes.len() && (!self.bracketed || self.suffix_sent);
+        (chunk, complete)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1250,6 +1283,7 @@ impl ServerOwner {
         let mut owner = Self {
             runtime: Runtime::with_backend(config, pty_backend),
             clients: BTreeMap::new(),
+            pending_pastes: VecDeque::new(),
             started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: Some(shutdown_tx),
@@ -1263,6 +1297,7 @@ impl ServerOwner {
         let mut owner = Self {
             runtime: Runtime::with_config(config),
             clients: BTreeMap::new(),
+            pending_pastes: VecDeque::new(),
             started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: None,
@@ -1319,6 +1354,9 @@ impl ServerOwner {
             }
 
             if self.process_command_queue(COMMANDS_PER_TURN) {
+                did_work = true;
+            }
+            if self.process_pending_pastes() {
                 did_work = true;
             }
 
@@ -1657,6 +1695,50 @@ impl ServerOwner {
         processed
     }
 
+    fn process_pending_pastes(&mut self) -> bool {
+        let candidates = self.pending_pastes.len().min(PASTES_PER_TURN);
+        let mut processed = false;
+        let mut serviced_panes = BTreeSet::new();
+        let mut next = VecDeque::with_capacity(self.pending_pastes.len());
+        for _ in 0..candidates {
+            let Some(mut paste) = self.pending_pastes.pop_front() else {
+                break;
+            };
+            if !serviced_panes.insert(paste.pane) {
+                next.push_back(paste);
+                continue;
+            }
+            processed = true;
+            if self
+                .runtime
+                .state
+                .pane(paste.pane)
+                .is_none_or(|pane| pane.dead)
+            {
+                continue;
+            }
+            let (chunk, complete) = paste.next_chunk();
+            if !chunk.is_empty() {
+                if let Err(error) = self
+                    .runtime
+                    .write_pane_input(paste.pane, ClientInput::Bytes(chunk))
+                {
+                    eprintln!(
+                        "pending paste write error for pane {}: {error}",
+                        paste.pane.raw()
+                    );
+                    continue;
+                }
+            }
+            if !complete {
+                next.push_back(paste);
+            }
+        }
+        next.append(&mut self.pending_pastes);
+        self.pending_pastes = next;
+        processed
+    }
+
     fn apply_command_effect(
         &mut self,
         queued: &QueuedCommand,
@@ -1800,12 +1882,20 @@ impl ServerOwner {
                 bytes,
                 bracketed,
             } => {
-                let input = if bracketed {
-                    ClientInput::Paste(bytes.to_vec())
-                } else {
-                    ClientInput::Bytes(bytes.to_vec())
-                };
-                self.runtime.write_pane_input(pane, input)?;
+                let bracketed = bracketed
+                    && self
+                        .runtime
+                        .state
+                        .pane(pane)
+                        .is_some_and(|pane| pane.screen.bracketed_paste());
+                self.pending_pastes.push_back(PendingPaste {
+                    pane,
+                    bytes,
+                    offset: 0,
+                    prefix_sent: false,
+                    suffix_sent: false,
+                    bracketed,
+                });
                 Ok(false)
             }
         }
@@ -1933,6 +2023,26 @@ impl ServerOwner {
             view.request_immediate_render(Instant::now());
         }
         if let Some(Some(bytes)) = clipboard {
+            self.store_copy_and_update_clipboard(client, bytes);
+        }
+    }
+
+    fn store_copy_and_update_clipboard(&mut self, client: ClientId, bytes: Vec<u8>) {
+        if let Err(error) = self
+            .runtime
+            .state
+            .paste_buffers
+            .add_automatic(bytes.clone())
+        {
+            eprintln!("copy-mode buffer error: {error}");
+        }
+        let clipboard_enabled = matches!(
+            self.runtime
+                .state
+                .option(wmux_core::OptionTarget::Client(client), "set-clipboard"),
+            Ok(wmux_core::OptionValue::Flag(true))
+        );
+        if clipboard_enabled {
             self.send_critical(client, Message::Clipboard(bytes));
         }
     }
@@ -2001,7 +2111,7 @@ impl ServerOwner {
                 }
             }
             if let Some(bytes) = copied {
-                self.send_critical(client, Message::Clipboard(bytes));
+                self.store_copy_and_update_clipboard(client, bytes);
             }
             return Ok(());
         }
@@ -3809,11 +3919,171 @@ mod tests {
         owner.handle_copy_mode_key(first, b"\r".to_vec());
 
         assert!(owner.clients[&first].copy_mode.is_none());
+        assert_eq!(
+            owner.runtime.state.paste_buffers.get(None).unwrap().data(),
+            b"alpha"
+        );
         let outbound = first_rx.try_recv().unwrap();
         assert!(matches!(
             outbound,
             Outbound::Message(wmux_protocol::Message::Clipboard(bytes)) if bytes == b"alpha"
         ));
+    }
+
+    #[test]
+    fn copy_mode_stores_buffer_when_clipboard_delivery_is_disabled() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("copy-off", 20, 3);
+        owner.runtime.apply_pty_output(created.pane, b"alpha");
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        owner
+            .runtime
+            .state
+            .options
+            .set(OptionTarget::Client(client), "set-clipboard", "off")
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        owner.enter_copy_mode(client).unwrap();
+        for key in [b"g".as_slice(), b" ", b"$", b"\r"] {
+            owner.handle_copy_mode_key(client, key.to_vec());
+        }
+
+        assert_eq!(
+            owner.runtime.state.paste_buffers.get(None).unwrap().data(),
+            b"alpha"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_paste_is_chunked_bracketed_once_and_yields_to_commands() {
+        let (mut owner, client, pane) = attached_owner();
+        owner
+            .runtime
+            .state
+            .pane_mut(pane)
+            .unwrap()
+            .screen
+            .set_bracketed_paste(true);
+        let bytes = (0..(1024 * 1024 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        owner
+            .runtime
+            .state
+            .paste_buffers
+            .set_named("bulk", bytes.clone())
+            .unwrap();
+        owner
+            .runtime
+            .queue
+            .push_list(
+                client,
+                CommandList::new(vec![Command::PasteBuffer {
+                    name: Some("bulk".to_string()),
+                    delete: false,
+                    bracketed: true,
+                    target: None,
+                }])
+                .unwrap(),
+                CommandSource::KeyBinding,
+            )
+            .unwrap();
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.runtime.test_inputs.is_empty());
+        assert!(owner.process_pending_pastes());
+        assert_eq!(owner.runtime.test_inputs.len(), 1);
+        assert!(owner.runtime.test_inputs[0].1.len() <= super::PASTE_CHUNK_BYTES + 6);
+
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("set-option -g @paste-progress yes").unwrap(),
+            CommandSource::KeyBinding,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@paste-progress")
+                .unwrap(),
+            OptionValue::String("yes".to_string())
+        );
+
+        while owner.process_pending_pastes() {}
+        assert!(owner.pending_pastes.is_empty());
+        let joined = owner
+            .runtime
+            .test_inputs
+            .iter()
+            .flat_map(|(_, chunk)| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(joined.starts_with(b"\x1b[200~"));
+        assert!(joined.ends_with(b"\x1b[201~"));
+        assert_eq!(&joined[6..joined.len() - 6], bytes);
+        assert_eq!(
+            joined
+                .windows(6)
+                .filter(|window| *window == b"\x1b[200~")
+                .count(),
+            1
+        );
+        assert_eq!(
+            joined
+                .windows(6)
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_pastes_remain_fifo_for_each_pane() {
+        let (mut owner, _, pane) = attached_owner();
+        let first = vec![b'a'; super::PASTE_CHUNK_BYTES + 1];
+        owner.pending_pastes.push_back(super::PendingPaste {
+            pane,
+            bytes: first.clone().into(),
+            offset: 0,
+            prefix_sent: false,
+            suffix_sent: false,
+            bracketed: false,
+        });
+        owner.pending_pastes.push_back(super::PendingPaste {
+            pane,
+            bytes: Vec::from(b"SECOND".as_slice()).into(),
+            offset: 0,
+            prefix_sent: false,
+            suffix_sent: false,
+            bracketed: false,
+        });
+
+        assert!(owner.process_pending_pastes());
+        assert_eq!(owner.runtime.test_inputs.len(), 1);
+        assert!(owner.process_pending_pastes());
+        assert_eq!(owner.runtime.test_inputs.len(), 2);
+        assert!(owner.process_pending_pastes());
+        assert_eq!(owner.runtime.test_inputs.len(), 3);
+
+        let joined = owner
+            .runtime
+            .test_inputs
+            .iter()
+            .flat_map(|(_, chunk)| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(&joined[..first.len()], first);
+        assert_eq!(&joined[first.len()..], b"SECOND");
     }
 
     #[test]
