@@ -132,3 +132,37 @@ The researched reference revisions were tmux
 `82c4a24d701ecf9a48aa01bcc5c0bb3882747fe7`. Extra in-scope work was limited
 to making benchmark allocation measurement per-thread and refreshing the fuzz
 lockfile after `wmux-platform` gained its OS-neutral Tokio stream dependency.
+
+## Phase 6 verification evidence
+
+The final local verification on 2026-08-22 produced:
+
+- 285 Windows workspace tests passed, including 36 server and 36
+  Windows-adapter tests;
+- 289 Linux Unix/shared tests passed, including 39 `wmux-unix` unit tests and
+  one real socket/PTY lifecycle integration test;
+- format checks and warnings-denied clippy passed on Windows and for every
+  Unix/shared package on Linux;
+- both Unix binaries compiled and the release Linux CLI completed detached
+  create, list, split, pane listing, session destruction, server shutdown, and
+  endpoint cleanup through the production composition roots;
+- all 14 portable conformance cases produced aggregate fingerprint
+  `f71b72b35879a1c6` on both Windows and Linux, with no expected differences;
+- `x86_64-apple-darwin` and `aarch64-apple-darwin` checks passed for
+  `wmux-unix`, `wmux`, and `wmux-server`;
+- the native seam audit found no Unix API, descriptor, native credential,
+  signal constant, or `wmux_unix` dependency in shared library sources; and
+- the complete Windows release performance gate passed, with
+  `platform-dispatch` completing 10,000,000 operations in 67.546 ms at
+  148,047,914 operations/second with zero allocations and zero violations.
+
+The Linux/macOS `native-unix` CI matrix is configured, but no remote runner was
+available during this local pass. Native macOS execution therefore remains
+CI-gated rather than reported as verified.
+
+Phase 6 retained the tmux and zellij revisions recorded above. Narrow extra
+work was limited to entering the configured Tokio runtime when a state-owner
+thread registers a PTY and marking both freshly allocated PTY descriptors
+close-on-exec. The latter follows tmux's and zellij's inherited-descriptor
+discipline and prevents concurrent child launches from holding another pane's
+PTY open past process-group termination.

@@ -284,3 +284,30 @@ The final Windows release run on 2026-08-21 completed in 68.906 ms at
 zero semantic violations. The enforced floor is 20,000,000 operations/second.
 This is adapter-dispatch evidence, not an end-to-end PTY throughput comparison;
 the existing parser, render, backlog, queue, and latency gates remain required.
+
+## Phase 6 Final Performance Gate
+
+The final Windows release gate on 2026-08-22 passed every existing threshold
+without changing a workload or floor. Selected results from the uncontended
+run were:
+
+| Scenario | Result |
+| --- | ---: |
+| `parser-codex` throughput | 137.33 MiB/s |
+| `frame-codex` p95 | 63.2 us |
+| `hybrid-frame-codex` p95 | 73.7 us |
+| `idle-input-render` p95 | 2.9 us |
+| `history-resize-100k` p95 | 21.8 us |
+| `split-storm` p95 | 37.0 us |
+| `detach-backlog` throughput | 130.03 MiB/s |
+| `multiple-clients` p95 | 156.1 us |
+| `key-unbound` | 159,967,239 operations/second |
+| `key-prefix-binding` | 56,244,108 operations/second |
+| `command-queue` | 14,880,332 operations/second |
+| `command-text` | 748,732 operations/second |
+| `platform-dispatch` | 148,047,914 operations/second |
+
+`platform-dispatch` completed its 10,000,000 semantic requests in 67.546 ms
+with zero measured allocations or violations. Phase 6 adds native Unix I/O
+behind that unchanged dispatch boundary; it does not move descriptors,
+readiness polling, or process mechanics into any measured shared hot path.

@@ -97,6 +97,16 @@ checks, format check, warnings-denied clippy, and portable conformance on
 still reported as CI-gated rather than verified here because no macOS runner
 was available in the local verification environment.
 
+The final Phase 6 local gate on 2026-08-22 passed 285 Windows workspace tests
+and 289 Linux Unix/shared tests. The Linux total includes 39 `wmux-unix` unit
+tests and the real native lifecycle integration test. Windows and Linux both
+produced all 14 case fingerprints and the same aggregate
+`f71b72b35879a1c6`. A release Linux CLI smoke test also completed detached
+session creation, session/pane listing, splitting, session destruction, server
+shutdown, and socket/lock cleanup. The shared-source native seam audit found no
+native Unix types or APIs outside `wmux-unix` and the two binary composition
+roots.
+
 ### Phase 3 Windows lifecycle evidence
 
 The following rows are native automated tests run on Windows. They exercise
