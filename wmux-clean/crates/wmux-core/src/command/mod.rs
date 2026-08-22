@@ -189,6 +189,33 @@ pub enum Command {
         target: Option<TargetSpec>,
         template: String,
     },
+    SetBuffer {
+        name: Option<String>,
+        data: Vec<u8>,
+        clipboard: bool,
+    },
+    LoadBuffer {
+        name: Option<String>,
+        path: PathBuf,
+    },
+    SaveBuffer {
+        name: Option<String>,
+        path: PathBuf,
+        append: bool,
+    },
+    ShowBuffer {
+        name: Option<String>,
+    },
+    ListBuffers,
+    DeleteBuffer {
+        name: Option<String>,
+    },
+    PasteBuffer {
+        name: Option<String>,
+        delete: bool,
+        bracketed: bool,
+        target: Option<TargetSpec>,
+    },
     SourceFile {
         path: PathBuf,
         depth: u8,
@@ -310,6 +337,24 @@ pub enum CommandEffect {
         path: PathBuf,
         depth: u8,
         ancestors: Arc<[PathBuf]>,
+    },
+    ReadBufferFile {
+        path: PathBuf,
+        name: Option<String>,
+    },
+    WriteBufferFile {
+        path: PathBuf,
+        bytes: Arc<[u8]>,
+        append: bool,
+    },
+    Clipboard {
+        client: ClientId,
+        bytes: Arc<[u8]>,
+    },
+    PastePane {
+        pane: PaneId,
+        bytes: Arc<[u8]>,
+        bracketed: bool,
     },
 }
 
@@ -754,6 +799,82 @@ pub(super) fn execute_state_command(
                 Err(error) => error_result(queued.sequence, error),
             }
         }
+        Command::SetBuffer { name, data, .. } => {
+            let result = match name {
+                Some(name) => state.paste_buffers.set_named(name, data),
+                None => state.paste_buffers.add_automatic(data).map(|_| ()),
+            };
+            match result {
+                Ok(()) => command_ok(queued.sequence, String::new(), None),
+                Err(error) => error_result(queued.sequence, error),
+            }
+        }
+        Command::LoadBuffer { .. } => command_ok(queued.sequence, String::new(), None),
+        Command::SaveBuffer { name, .. } => match state.paste_buffers.get(name.as_deref()) {
+            Some(_) => command_ok(queued.sequence, String::new(), None),
+            None => error_result(queued.sequence, missing_buffer(&name)),
+        },
+        Command::ShowBuffer { name } => match state.paste_buffers.get(name.as_deref()) {
+            Some(buffer) => command_ok(
+                queued.sequence,
+                String::from_utf8(buffer.data().to_vec())
+                    .unwrap_or_else(|_| buffer.sample(1024 * 1024)),
+                None,
+            ),
+            None => error_result(queued.sequence, missing_buffer(&name)),
+        },
+        Command::ListBuffers => command_ok(
+            queued.sequence,
+            state
+                .paste_buffers
+                .list()
+                .into_iter()
+                .map(|buffer| {
+                    format!(
+                        "{}: {} bytes: \"{}\"",
+                        buffer.name(),
+                        buffer.data().len(),
+                        buffer.sample(200)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None,
+        ),
+        Command::DeleteBuffer { name } => {
+            let selected = state
+                .paste_buffers
+                .get(name.as_deref())
+                .map(|buffer| buffer.name().to_string());
+            match selected {
+                Some(selected) => {
+                    state.paste_buffers.remove(&selected);
+                    command_ok(queued.sequence, String::new(), None)
+                }
+                None => error_result(queued.sequence, missing_buffer(&name)),
+            }
+        }
+        Command::PasteBuffer { name, target, .. } => {
+            if state.paste_buffers.get(name.as_deref()).is_none() {
+                return error_result(queued.sequence, missing_buffer(&name));
+            }
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Pane,
+                target.as_ref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let Some(pane) = resolved.pane else {
+                return error_result(queued.sequence, "no matching pane");
+            };
+            if state.panes.get(&pane).is_some_and(|pane| pane.dead) {
+                return error_result(queued.sequence, "target pane has exited");
+            }
+            command_ok(queued.sequence, String::new(), Some(pane))
+        }
         Command::SourceFile { .. } => CommandResult {
             sequence: queued.sequence,
             ok: true,
@@ -1136,6 +1257,22 @@ pub(super) fn execute_state_command(
     }
 }
 
+fn command_ok(sequence: u64, message: String, attached_pane: Option<PaneId>) -> CommandResult {
+    CommandResult {
+        sequence,
+        ok: true,
+        message,
+        attached_pane,
+    }
+}
+
+fn missing_buffer(name: &Option<String>) -> String {
+    name.as_ref().map_or_else(
+        || "no buffers".to_string(),
+        |name| format!("no buffer {name}"),
+    )
+}
+
 fn adjacent_session(
     state: &ServerState,
     client: ClientId,
@@ -1335,6 +1472,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("detach"),
     },
     CommandEntry {
+        name: "delete-buffer",
+        alias: Some("deleteb"),
+    },
+    CommandEntry {
         name: "display-message",
         alias: Some("display"),
     },
@@ -1367,6 +1508,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("lsc"),
     },
     CommandEntry {
+        name: "list-buffers",
+        alias: Some("lsb"),
+    },
+    CommandEntry {
         name: "list-keys",
         alias: Some("lsk"),
     },
@@ -1381,6 +1526,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "list-windows",
         alias: Some("lsw"),
+    },
+    CommandEntry {
+        name: "load-buffer",
+        alias: Some("loadb"),
     },
     CommandEntry {
         name: "new-session",
@@ -1399,6 +1548,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("prev"),
     },
     CommandEntry {
+        name: "paste-buffer",
+        alias: Some("pasteb"),
+    },
+    CommandEntry {
         name: "rename-window",
         alias: Some("renamew"),
     },
@@ -1415,6 +1568,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("rotatew"),
     },
     CommandEntry {
+        name: "save-buffer",
+        alias: Some("saveb"),
+    },
+    CommandEntry {
         name: "select-pane",
         alias: Some("selectp"),
     },
@@ -1425,6 +1582,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "set-option",
         alias: Some("set"),
+    },
+    CommandEntry {
+        name: "set-buffer",
+        alias: Some("setb"),
     },
     CommandEntry {
         name: "set-window-option",
@@ -1453,6 +1614,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "show-options",
         alias: Some("show"),
+    },
+    CommandEntry {
+        name: "show-buffer",
+        alias: Some("showb"),
     },
     CommandEntry {
         name: "show-window-options",
@@ -1518,6 +1683,13 @@ pub(super) fn parse_single_command(
         }
         "confirm-before" => parse_confirm_before(argv, depth),
         "display-message" => parse_display_message(argv),
+        "set-buffer" => parse_set_buffer(argv),
+        "load-buffer" => parse_load_buffer(argv),
+        "save-buffer" => parse_save_buffer(argv),
+        "show-buffer" => parse_show_buffer(argv),
+        "list-buffers" => parse_list_buffers(argv),
+        "delete-buffer" => parse_delete_buffer(argv),
+        "paste-buffer" => parse_paste_buffer(argv),
         "source-file" => parse_source_file(argv),
         "set-option" => parse_set_option(argv, OptionScope::Session),
         "set-window-option" => parse_set_option(argv, OptionScope::Window),
@@ -1668,6 +1840,89 @@ pub(super) fn parse_single_command(
         }
         _ => unreachable!("resolved command is missing a parser: {command}"),
     }
+}
+
+fn parse_set_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &["-w"], &["-b"], 1)?;
+    let positionals = positional_arguments(argv, &["-b"]);
+    let data = positionals
+        .first()
+        .ok_or_else(|| CommandParseError::new("set-buffer requires data"))?;
+    Ok(Command::SetBuffer {
+        name: flag_value(argv, "-b"),
+        data: data.as_bytes().to_vec(),
+        clipboard: has_flag(argv, "-w"),
+    })
+}
+
+fn parse_load_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &[], &["-b"], 1)?;
+    let positionals = positional_arguments(argv, &["-b"]);
+    let path = positionals
+        .first()
+        .ok_or_else(|| CommandParseError::new("load-buffer requires a path"))?;
+    Ok(Command::LoadBuffer {
+        name: flag_value(argv, "-b"),
+        path: PathBuf::from(path),
+    })
+}
+
+fn parse_save_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &["-a"], &["-b"], 1)?;
+    let positionals = positional_arguments(argv, &["-b"]);
+    let path = positionals
+        .first()
+        .ok_or_else(|| CommandParseError::new("save-buffer requires a path"))?;
+    Ok(Command::SaveBuffer {
+        name: flag_value(argv, "-b"),
+        path: PathBuf::from(path),
+        append: has_flag(argv, "-a"),
+    })
+}
+
+fn parse_show_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &[], &["-b"], 0)?;
+    Ok(Command::ShowBuffer {
+        name: flag_value(argv, "-b"),
+    })
+}
+
+fn parse_list_buffers(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &[], &[], 0)?;
+    Ok(Command::ListBuffers)
+}
+
+fn parse_delete_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &[], &["-b"], 0)?;
+    Ok(Command::DeleteBuffer {
+        name: flag_value(argv, "-b"),
+    })
+}
+
+fn parse_paste_buffer(argv: &[String]) -> Result<Command, CommandParseError> {
+    validate_arguments(argv, &["-d", "-p"], &["-b", "-t"], 0)?;
+    Ok(Command::PasteBuffer {
+        name: flag_value(argv, "-b"),
+        delete: has_flag(argv, "-d"),
+        bracketed: has_flag(argv, "-p"),
+        target: target_flag_value(argv, "-t")?,
+    })
+}
+
+fn positional_arguments<'a>(argv: &'a [String], value_flags: &[&str]) -> Vec<&'a String> {
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while index < argv.len() {
+        if value_flags.contains(&argv[index].as_str()) {
+            index += 2;
+        } else if argv[index].starts_with('-') {
+            index += 1;
+        } else {
+            positionals.push(&argv[index]);
+            index += 1;
+        }
+    }
+    positionals
 }
 
 fn parse_source_file(argv: &[String]) -> Result<Command, CommandParseError> {
@@ -2445,6 +2700,70 @@ fn format_command(command: &Command) -> String {
             arguments.push(template.clone());
             "display-message"
         }
+        Command::SetBuffer {
+            name,
+            data,
+            clipboard,
+        } => {
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            if *clipboard {
+                arguments.push("-w".to_string());
+            }
+            arguments.push(String::from_utf8_lossy(data).into_owned());
+            "set-buffer"
+        }
+        Command::LoadBuffer { name, path } => {
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            arguments.push(path.to_string_lossy().into_owned());
+            "load-buffer"
+        }
+        Command::SaveBuffer { name, path, append } => {
+            if *append {
+                arguments.push("-a".to_string());
+            }
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            arguments.push(path.to_string_lossy().into_owned());
+            "save-buffer"
+        }
+        Command::ShowBuffer { name } => {
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            "show-buffer"
+        }
+        Command::ListBuffers => "list-buffers",
+        Command::DeleteBuffer { name } => {
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            "delete-buffer"
+        }
+        Command::PasteBuffer {
+            name,
+            delete,
+            bracketed,
+            target,
+        } => {
+            if *delete {
+                arguments.push("-d".to_string());
+            }
+            if *bracketed {
+                arguments.push("-p".to_string());
+            }
+            if let Some(name) = name {
+                arguments.extend(["-b".to_string(), name.clone()]);
+            }
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            "paste-buffer"
+        }
         Command::SourceFile { path, .. } => {
             arguments.push(path.to_string_lossy().into_owned());
             "source-file"
@@ -2689,6 +3008,106 @@ mod tests {
         assert_eq!(state.paste_buffers.len(), 1);
         assert!(execute_one(&mut state, client, "set-option -g -u buffer-limit").ok);
         assert_eq!(state.paste_buffers.limit(), 50);
+    }
+
+    #[test]
+    fn buffer_commands_parse_tmux_compatible_flags_and_aliases() {
+        assert!(matches!(
+            &parse_command_text("setb -b named -w 'hello world'").unwrap()[0],
+            Command::SetBuffer { name: Some(name), data, clipboard: true }
+                if name == "named" && data == b"hello world"
+        ));
+        assert!(matches!(
+            &parse_command_text("loadb -b loaded input.bin").unwrap()[0],
+            Command::LoadBuffer { name: Some(name), path }
+                if name == "loaded" && path == &std::path::PathBuf::from("input.bin")
+        ));
+        assert!(matches!(
+            &parse_command_text("saveb -a -b loaded output.bin").unwrap()[0],
+            Command::SaveBuffer { name: Some(name), path, append: true }
+                if name == "loaded" && path == &std::path::PathBuf::from("output.bin")
+        ));
+        assert!(matches!(
+            &parse_command_text("showb -b loaded").unwrap()[0],
+            Command::ShowBuffer { name: Some(name) } if name == "loaded"
+        ));
+        assert!(matches!(
+            &parse_command_text("deleteb -b loaded").unwrap()[0],
+            Command::DeleteBuffer { name: Some(name) } if name == "loaded"
+        ));
+        assert!(matches!(
+            &parse_command_text("pasteb -d -p -b loaded -t %3").unwrap()[0],
+            Command::PasteBuffer { name: Some(name), delete: true, bracketed: true, target: Some(_) }
+                if name == "loaded"
+        ));
+        assert!(matches!(
+            &parse_command_text("lsb").unwrap()[0],
+            Command::ListBuffers
+        ));
+
+        for invalid in [
+            "set-buffer",
+            "set-buffer -b",
+            "load-buffer input extra",
+            "save-buffer",
+            "show-buffer extra",
+            "list-buffers extra",
+            "delete-buffer -x",
+            "paste-buffer -t",
+        ] {
+            assert!(parse_command_text(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn buffer_commands_mutate_only_the_server_store_and_emit_semantic_effects() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        let set = execute_one(&mut state, client, "set-buffer -b named -w 'hello world'");
+        assert!(set.ok);
+        assert_eq!(
+            state.paste_buffers.get(Some("named")).unwrap().data(),
+            b"hello world"
+        );
+        assert!(matches!(
+            set.effects.as_slice(),
+            [CommandEffect::Clipboard { client: effect_client, bytes }]
+                if *effect_client == client && bytes.as_ref() == b"hello world"
+        ));
+        assert_eq!(
+            execute_text(&mut state, client, "show-buffer -b named").unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            execute_text(&mut state, client, "list-buffers").unwrap(),
+            "named: 11 bytes: \"hello world\""
+        );
+
+        let load = execute_one(&mut state, client, "load-buffer -b loaded input.bin");
+        assert!(matches!(
+            load.effects.as_slice(),
+            [CommandEffect::ReadBufferFile { path, name: Some(name) }]
+                if path == &std::path::PathBuf::from("input.bin") && name == "loaded"
+        ));
+        let save = execute_one(&mut state, client, "save-buffer -a -b named output.bin");
+        assert!(matches!(
+            save.effects.as_slice(),
+            [CommandEffect::WriteBufferFile { path, bytes, append: true }]
+                if path == &std::path::PathBuf::from("output.bin") && bytes.as_ref() == b"hello world"
+        ));
+        let paste = execute_one(&mut state, client, "paste-buffer -p -b named");
+        assert!(matches!(
+            paste.effects.as_slice(),
+            [CommandEffect::PastePane { pane, bytes, bracketed: true }]
+                if *pane == created.pane && bytes.as_ref() == b"hello world"
+        ));
+
+        assert!(execute_one(&mut state, client, "delete-buffer -b named").ok);
+        assert!(state.paste_buffers.get(Some("named")).is_none());
+        assert!(!execute_one(&mut state, client, "show-buffer -b named").ok);
     }
 
     #[test]

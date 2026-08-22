@@ -56,6 +56,7 @@ const PER_PANE_OUTPUT_TIME: Duration = Duration::from_millis(1);
 const OUTPUT_ROUND_TIME: Duration = Duration::from_millis(4);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_FILE_BYTES: usize = 1024 * 1024;
+const MAX_BUFFER_FILE_BYTES: usize = wmux_core::paste::MAX_PASTE_BUFFER_BYTES;
 
 pub fn run_with_platform(platform: Box<dyn ServerPlatform>) -> io::Result<()> {
     run_with_platform_and_config(platform, load_config())
@@ -1763,6 +1764,50 @@ impl ServerOwner {
                     .map_err(io::Error::other)?;
                 Ok(false)
             }
+            CommandEffect::ReadBufferFile { path, name } => {
+                let bytes = read_buffer_file(&path)?;
+                match name {
+                    Some(name) => self
+                        .runtime
+                        .state
+                        .paste_buffers
+                        .set_named(name, bytes)
+                        .map_err(io::Error::other)?,
+                    None => {
+                        self.runtime
+                            .state
+                            .paste_buffers
+                            .add_automatic(bytes)
+                            .map_err(io::Error::other)?;
+                    }
+                }
+                Ok(false)
+            }
+            CommandEffect::WriteBufferFile {
+                path,
+                bytes,
+                append,
+            } => {
+                write_buffer_file(&path, &bytes, append)?;
+                Ok(false)
+            }
+            CommandEffect::Clipboard { client, bytes } => {
+                self.send_critical(client, Message::Clipboard(bytes.to_vec()));
+                Ok(false)
+            }
+            CommandEffect::PastePane {
+                pane,
+                bytes,
+                bracketed,
+            } => {
+                let input = if bracketed {
+                    ClientInput::Paste(bytes.to_vec())
+                } else {
+                    ClientInput::Bytes(bytes.to_vec())
+                };
+                self.runtime.write_pane_input(pane, input)?;
+                Ok(false)
+            }
         }
     }
 
@@ -2335,6 +2380,49 @@ fn load_source_commands(
         .map_err(io::Error::other)
 }
 
+fn read_buffer_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| path_io_error("load-buffer", path, error))?
+        .take((MAX_BUFFER_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| path_io_error("load-buffer", path, error))?;
+    if bytes.len() > MAX_BUFFER_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "load-buffer {} exceeds {MAX_BUFFER_FILE_BYTES} bytes",
+                path.display()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_buffer_file(path: &Path, bytes: &[u8], append: bool) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| path_io_error("save-buffer", path, error))?;
+    file.write_all(bytes)
+        .map_err(|error| path_io_error("save-buffer", path, error))?;
+    file.flush()
+        .map_err(|error| path_io_error("save-buffer", path, error))
+}
+
+fn path_io_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
 fn render_full_for_client(
     runtime: &mut Runtime,
     client: ClientId,
@@ -2800,6 +2888,64 @@ mod tests {
             OptionValue::String("after".to_string())
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn buffer_file_and_clipboard_effects_preserve_exact_bytes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let input = std::env::temp_dir().join(format!(
+            "wmux-load-buffer-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "wmux-save-buffer-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let expected = [0, 0xff, b'\n', b'\r', b'x'];
+        std::fs::write(&input, expected).unwrap();
+
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound_tx, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            client,
+            parse_command_text(&format!(
+                "load-buffer -b exact '{}'; save-buffer -b exact '{}'; set-buffer -b clip -w copied",
+                input.display(),
+                output.display()
+            ))
+            .unwrap(),
+            CommandSource::ClientRequest,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .paste_buffers
+                .get(Some("exact"))
+                .unwrap()
+                .data(),
+            expected
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        assert!(
+            std::iter::from_fn(|| outbound_rx.try_recv().ok()).any(|message| matches!(
+                message,
+                Outbound::Message(wmux_protocol::Message::Clipboard(bytes)) if bytes == b"copied"
+            ))
+        );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
     }
 
     async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {

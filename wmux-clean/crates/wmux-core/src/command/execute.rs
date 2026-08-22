@@ -55,6 +55,53 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
                     commands: commands.clone(),
                 });
             }
+            Command::SetBuffer {
+                data,
+                clipboard: true,
+                ..
+            } => effects.push(CommandEffect::Clipboard {
+                client: queued.client,
+                bytes: Arc::from(data.clone()),
+            }),
+            Command::LoadBuffer { name, path } => effects.push(CommandEffect::ReadBufferFile {
+                path: path.clone(),
+                name: name.clone(),
+            }),
+            Command::SaveBuffer { name, path, append } => {
+                let bytes = state
+                    .paste_buffers
+                    .get(name.as_deref())
+                    .expect("state execution validated the selected buffer")
+                    .shared_data();
+                effects.push(CommandEffect::WriteBufferFile {
+                    path: path.clone(),
+                    bytes,
+                    append: *append,
+                });
+            }
+            Command::PasteBuffer {
+                name,
+                delete,
+                bracketed,
+                ..
+            } => {
+                let buffer = state
+                    .paste_buffers
+                    .get(name.as_deref())
+                    .expect("state execution validated the selected buffer");
+                let selected = buffer.name().to_string();
+                let bytes = buffer.shared_data();
+                if *delete {
+                    state.paste_buffers.remove(&selected);
+                }
+                effects.push(CommandEffect::PastePane {
+                    pane: result
+                        .attached_pane
+                        .expect("state execution resolved the target pane"),
+                    bytes,
+                    bracketed: *bracketed,
+                });
+            }
             Command::SourceFile {
                 path,
                 depth,
@@ -106,7 +153,13 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::ListKeys { .. }
             | Command::SetOption { .. }
             | Command::ShowOptions { .. }
-            | Command::DisplayMessage { .. } => {}
+            | Command::DisplayMessage { .. }
+            | Command::SetBuffer {
+                clipboard: false, ..
+            }
+            | Command::ShowBuffer { .. }
+            | Command::ListBuffers
+            | Command::DeleteBuffer { .. } => {}
         }
     }
 
