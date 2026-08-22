@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ClientId, ConfirmationState, KeyCode, KeyTableName, KeyTables, LayoutNode, OptionError,
-    OptionStore, OptionTarget, OptionValue, PaneId, PasteBufferStore, Rect, ResizeDirection,
-    Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId, WinlinkId,
+    ClientId, ConfirmationState, HookStore, KeyCode, KeyTableName, KeyTables, LayoutNode,
+    OptionError, OptionStore, OptionTarget, OptionValue, PaneId, PasteBufferStore, Rect,
+    ResizeDirection, Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId,
+    WinlinkId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +107,7 @@ pub struct ServerState {
     pub panes: BTreeMap<PaneId, Pane>,
     pub key_tables: KeyTables,
     pub options: OptionStore,
+    pub hooks: HookStore,
     pub paste_buffers: PasteBufferStore,
     pending_pane_resizes: BTreeMap<PaneId, PaneResize>,
 }
@@ -122,6 +124,7 @@ impl ServerState {
             panes: BTreeMap::new(),
             key_tables: KeyTables::tmux_defaults(),
             options: OptionStore::new(),
+            hooks: HookStore::new(),
             paste_buffers: PasteBufferStore::default(),
             pending_pane_resizes: BTreeMap::new(),
         }
@@ -148,6 +151,7 @@ impl ServerState {
     pub fn remove_client(&mut self, client: ClientId) {
         self.clients.remove(&client);
         self.options.remove_target(OptionTarget::Client(client));
+        self.hooks.remove_target(OptionTarget::Client(client));
     }
 
     pub fn option(&self, target: OptionTarget, name: &str) -> Result<OptionValue, OptionError> {
@@ -618,6 +622,7 @@ impl ServerState {
         }
         self.panes.remove(&pane);
         self.options.remove_target(OptionTarget::Pane(pane));
+        self.hooks.remove_target(OptionTarget::Pane(pane));
         self.pending_pane_resizes.remove(&pane);
         self.recompute_window_layout(window);
         self.refresh_attached_panes();
@@ -627,9 +632,11 @@ impl ServerState {
     pub fn kill_window(&mut self, window: WindowId) -> Option<Vec<PaneId>> {
         let killed = self.windows.remove(&window)?.panes;
         self.options.remove_target(OptionTarget::Window(window));
+        self.hooks.remove_target(OptionTarget::Window(window));
         for pane in &killed {
             self.panes.remove(pane);
             self.options.remove_target(OptionTarget::Pane(*pane));
+            self.hooks.remove_target(OptionTarget::Pane(*pane));
             self.pending_pane_resizes.remove(pane);
         }
         let winlinks = self
@@ -715,6 +722,7 @@ impl ServerState {
     fn remove_session_record(&mut self, session: SessionId) -> Option<Session> {
         let removed = self.sessions.remove(&session)?;
         self.options.remove_target(OptionTarget::Session(session));
+        self.hooks.remove_target(OptionTarget::Session(session));
         for client in self.clients.values_mut() {
             if client.attached_session == Some(session) {
                 client.attached_session = None;

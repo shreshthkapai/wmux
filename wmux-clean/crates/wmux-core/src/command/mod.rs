@@ -6,9 +6,10 @@ use std::{
 };
 
 use crate::{
-    ClientId, FormatContext, FormatEngine, KeyBinding, KeyCode, KeyTableTarget, OptionScope,
-    OptionTarget, OptionValue, PaneId, ResizeDirection, ResolveContext, ResolvedTarget,
-    ServerState, SessionId, SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
+    ClientId, FormatContext, FormatEngine, HookEvent, KeyBinding, KeyCode, KeyTableTarget,
+    OptionScope, OptionTarget, OptionValue, PaneId, ResizeDirection, ResolveContext,
+    ResolvedTarget, ServerState, SessionId, SplitDirection, TargetError, TargetKind,
+    TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -185,6 +186,19 @@ pub enum Command {
         name: Option<String>,
         value_only: bool,
     },
+    SetHook {
+        scope: OptionScope,
+        target: Option<TargetSpec>,
+        append: bool,
+        unset: bool,
+        event: HookEvent,
+        commands: Option<CommandList>,
+    },
+    ShowHooks {
+        scope: OptionScope,
+        target: Option<TargetSpec>,
+        event: Option<HookEvent>,
+    },
     DisplayMessage {
         target: Option<TargetSpec>,
         template: String,
@@ -298,6 +312,7 @@ pub enum CommandSource {
     ClientRequest,
     KeyBinding,
     Config,
+    Hook { depth: u8 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -356,6 +371,10 @@ pub enum CommandEffect {
         bytes: Arc<[u8]>,
         bracketed: bool,
     },
+    Notify {
+        event: HookEvent,
+        target: OptionTarget,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,8 +391,14 @@ struct PendingInvocation {
     source: CommandSource,
     commands: CommandList,
     next: usize,
-    inserted: VecDeque<Command>,
+    inserted: VecDeque<ScheduledCommand>,
     messages: String,
+}
+
+#[derive(Debug)]
+struct ScheduledCommand {
+    command: Command,
+    source: CommandSource,
 }
 
 #[derive(Debug, Default)]
@@ -427,12 +452,12 @@ impl CommandQueue {
                 continue;
             }
             let invocation = self.pending.get_mut(&client)?.front_mut()?;
-            let command = if let Some(command) = invocation.inserted.pop_front() {
-                command
+            let (command, source) = if let Some(scheduled) = invocation.inserted.pop_front() {
+                (scheduled.command, scheduled.source)
             } else {
                 let command = invocation.commands[invocation.next].clone();
                 invocation.next += 1;
-                command
+                (command, invocation.source)
             };
             self.next_sequence = self
                 .next_sequence
@@ -443,7 +468,7 @@ impl CommandQueue {
                 sequence: self.next_sequence,
                 client,
                 command,
-                source: invocation.source,
+                source,
                 final_in_list: invocation.inserted.is_empty()
                     && invocation.next == invocation.commands.len(),
             };
@@ -458,6 +483,18 @@ impl CommandQueue {
         active: &QueuedCommand,
         commands: CommandList,
     ) -> Result<(), CommandParseError> {
+        self.insert_after_active_as(active, commands, active.source)
+    }
+
+    pub fn insert_after_active_as(
+        &mut self,
+        active: &QueuedCommand,
+        commands: CommandList,
+        source: CommandSource,
+    ) -> Result<(), CommandParseError> {
+        if matches!(source, CommandSource::Hook { depth } if depth > crate::MAX_HOOK_DEPTH) {
+            return Err(CommandParseError::new("hook depth exceeds 16 levels"));
+        }
         if self.active.get(&active.client) != Some(&active.invocation) {
             return Err(CommandParseError::new("command invocation is not active"));
         }
@@ -478,8 +515,11 @@ impl CommandQueue {
         {
             return Err(CommandParseError::new("command list exceeds 256 commands"));
         }
-        for command in commands.iter().rev() {
-            invocation.inserted.push_front(command.clone());
+        for command in commands.iter() {
+            invocation.inserted.push_back(ScheduledCommand {
+                command: command.clone(),
+                source,
+            });
         }
         Ok(())
     }
@@ -502,6 +542,26 @@ impl CommandQueue {
             }
 
             match result {
+                Err(message) if matches!(command.source, CommandSource::Hook { .. }) => {
+                    if invocation.inserted.is_empty()
+                        && invocation.next == invocation.commands.len()
+                    {
+                        let invocation = invocations.pop_front().expect("front was checked above");
+                        completion = Some(CommandCompletion {
+                            invocation: invocation.id,
+                            client: command.client,
+                            source: invocation.source,
+                            result: Ok(invocation.messages),
+                        });
+                    } else {
+                        completion = Some(CommandCompletion {
+                            invocation: invocation.id,
+                            client: command.client,
+                            source: command.source,
+                            result: Err(message),
+                        });
+                    }
+                }
                 Err(message) => {
                     completion = Some(CommandCompletion {
                         invocation: invocation.id,
@@ -512,7 +572,8 @@ impl CommandQueue {
                     invocations.pop_front();
                 }
                 Ok(message) => {
-                    if !message.is_empty() {
+                    if !message.is_empty() && !matches!(command.source, CommandSource::Hook { .. })
+                    {
                         if !invocation.messages.is_empty() {
                             invocation.messages.push('\n');
                         }
@@ -772,6 +833,59 @@ pub(super) fn execute_state_command(
                 message: values,
                 attached_pane: None,
             }
+        }
+        Command::SetHook {
+            scope,
+            target,
+            append,
+            unset,
+            event,
+            commands,
+        } => {
+            let target = match resolve_option_target(state, queued.client, scope, target.as_ref()) {
+                Ok(target) => target,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let result = if unset {
+                state.hooks.unset(target, event);
+                Ok(())
+            } else {
+                state.hooks.set(
+                    target,
+                    event,
+                    commands.expect("parser requires hook commands"),
+                    append,
+                )
+            };
+            match result {
+                Ok(()) => command_ok(queued.sequence, String::new(), None),
+                Err(error) => error_result(queued.sequence, error),
+            }
+        }
+        Command::ShowHooks {
+            scope,
+            target,
+            event,
+        } => {
+            let target = match resolve_option_target(state, queued.client, scope, target.as_ref()) {
+                Ok(target) => target,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let message = state
+                .hooks
+                .list(target, event)
+                .into_iter()
+                .flat_map(|(event, registrations)| {
+                    registrations
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, commands)| {
+                            format!("{event}[{index}] {}", format_command_list(commands))
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            command_ok(queued.sequence, message, None)
         }
         Command::DisplayMessage { target, template } => {
             let resolved = match resolve_command_target(
@@ -1584,6 +1698,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("set"),
     },
     CommandEntry {
+        name: "set-hook",
+        alias: None,
+    },
+    CommandEntry {
         name: "set-buffer",
         alias: Some("setb"),
     },
@@ -1614,6 +1732,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "show-options",
         alias: Some("show"),
+    },
+    CommandEntry {
+        name: "show-hooks",
+        alias: None,
     },
     CommandEntry {
         name: "show-buffer",
@@ -1691,6 +1813,8 @@ pub(super) fn parse_single_command(
         "delete-buffer" => parse_delete_buffer(argv),
         "paste-buffer" => parse_paste_buffer(argv),
         "source-file" => parse_source_file(argv),
+        "set-hook" => parse_set_hook(argv, depth),
+        "show-hooks" => parse_show_hooks(argv),
         "set-option" => parse_set_option(argv, OptionScope::Session),
         "set-window-option" => parse_set_option(argv, OptionScope::Window),
         "show-options" => parse_show_options(argv, OptionScope::Session),
@@ -1973,6 +2097,137 @@ fn parse_display_message(argv: &[String]) -> Result<Command, CommandParseError> 
     Ok(Command::DisplayMessage {
         target,
         template: positionals.remove(0),
+    })
+}
+
+fn parse_set_hook(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
+    let parsed = parse_hook_arguments(argv, true)?;
+    if parsed.positionals.is_empty() {
+        return Err(CommandParseError::new("set-hook requires a hook name"));
+    }
+    if parsed.positionals.len() > 2 {
+        return Err(CommandParseError::new("too many arguments for set-hook"));
+    }
+    let event = parsed.positionals[0]
+        .parse::<HookEvent>()
+        .map_err(|error| CommandParseError::new(error.to_string()))?;
+    let commands = parsed
+        .positionals
+        .get(1)
+        .map(|commands| parser::parse_nested_command(std::slice::from_ref(commands), depth))
+        .transpose()?;
+    if parsed.unset && commands.is_some() {
+        return Err(CommandParseError::new(
+            "set-hook -u does not accept commands",
+        ));
+    }
+    if !parsed.unset && commands.is_none() {
+        return Err(CommandParseError::new("set-hook requires commands"));
+    }
+    Ok(Command::SetHook {
+        scope: parsed.scope,
+        target: parsed.target,
+        append: parsed.append,
+        unset: parsed.unset,
+        event,
+        commands,
+    })
+}
+
+fn parse_show_hooks(argv: &[String]) -> Result<Command, CommandParseError> {
+    let parsed = parse_hook_arguments(argv, false)?;
+    if parsed.positionals.len() > 1 {
+        return Err(CommandParseError::new("too many arguments for show-hooks"));
+    }
+    let event = parsed
+        .positionals
+        .first()
+        .map(|event| event.parse::<HookEvent>())
+        .transpose()
+        .map_err(|error| CommandParseError::new(error.to_string()))?;
+    Ok(Command::ShowHooks {
+        scope: parsed.scope,
+        target: parsed.target,
+        event,
+    })
+}
+
+struct ParsedHookArguments {
+    scope: OptionScope,
+    target: Option<TargetSpec>,
+    append: bool,
+    unset: bool,
+    positionals: Vec<String>,
+}
+
+fn parse_hook_arguments(
+    argv: &[String],
+    setting: bool,
+) -> Result<ParsedHookArguments, CommandParseError> {
+    let mut scope = None;
+    let mut target = None;
+    let mut append = false;
+    let mut unset = false;
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while let Some(argument) = argv.get(index) {
+        if argument == "-t" {
+            let raw = argv
+                .get(index + 1)
+                .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+            target = Some(
+                TargetSpec::parse(raw.clone())
+                    .map_err(|error| CommandParseError::new(error.to_string()))?,
+            );
+            index += 2;
+            continue;
+        }
+        if argument == "--" {
+            positionals.extend_from_slice(&argv[index + 1..]);
+            break;
+        }
+        if let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for flag in flags.chars() {
+                let selected_scope = match flag {
+                    'g' => Some(OptionScope::Server),
+                    's' => Some(OptionScope::Session),
+                    'w' => Some(OptionScope::Window),
+                    'p' => Some(OptionScope::Pane),
+                    'c' => Some(OptionScope::Client),
+                    'a' if setting => {
+                        append = true;
+                        None
+                    }
+                    'u' if setting => {
+                        unset = true;
+                        None
+                    }
+                    _ => {
+                        return Err(CommandParseError::new(format!("unknown option: -{flag}")));
+                    }
+                };
+                if let Some(selected_scope) = selected_scope {
+                    if scope.replace(selected_scope).is_some() {
+                        return Err(CommandParseError::new(
+                            "hook scope flags are mutually exclusive",
+                        ));
+                    }
+                }
+            }
+        } else {
+            positionals.push(argument.clone());
+        }
+        index += 1;
+    }
+    if append && unset {
+        return Err(CommandParseError::new("set-hook -a and -u conflict"));
+    }
+    Ok(ParsedHookArguments {
+        scope: scope.unwrap_or(OptionScope::Session),
+        target,
+        append,
+        unset,
+        positionals,
     })
 }
 
@@ -2693,6 +2948,44 @@ fn format_command(command: &Command) -> String {
             }
             "show-options"
         }
+        Command::SetHook {
+            scope,
+            target,
+            append,
+            unset,
+            event,
+            commands,
+        } => {
+            push_option_scope(&mut arguments, *scope);
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            if *append {
+                arguments.push("-a".to_string());
+            }
+            if *unset {
+                arguments.push("-u".to_string());
+            }
+            arguments.push(event.to_string());
+            if let Some(commands) = commands {
+                arguments.push(format_command_list(commands));
+            }
+            "set-hook"
+        }
+        Command::ShowHooks {
+            scope,
+            target,
+            event,
+        } => {
+            push_option_scope(&mut arguments, *scope);
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            if let Some(event) = event {
+                arguments.push(event.to_string());
+            }
+            "show-hooks"
+        }
         Command::DisplayMessage { target, template } => {
             if let Some(target) = target {
                 arguments.extend(["-t".to_string(), target.to_string()]);
@@ -2870,8 +3163,8 @@ mod tests {
         CommandQueue, CommandSource,
     };
     use crate::{
-        build_window_scene, render_full_scene, KeyCode, RenderState, ServerState, SplitDirection,
-        TargetResolver, TargetSpec,
+        build_window_scene, render_full_scene, KeyCode, OptionTarget, RenderState, ServerState,
+        SplitDirection, TargetResolver, TargetSpec,
     };
 
     fn target(raw: &str) -> TargetSpec {
@@ -3074,7 +3367,13 @@ mod tests {
         );
         assert!(matches!(
             set.effects.as_slice(),
-            [CommandEffect::Clipboard { client: effect_client, bytes }]
+            [
+                CommandEffect::Clipboard { client: effect_client, bytes },
+                CommandEffect::Notify {
+                    event: crate::HookEvent::BufferChanged,
+                    target: OptionTarget::Server,
+                }
+            ]
                 if *effect_client == client && bytes.as_ref() == b"hello world"
         ));
         assert_eq!(
@@ -3171,6 +3470,130 @@ mod tests {
                 assert!(completion.is_none());
             }
         }
+    }
+
+    #[test]
+    fn continuation_sources_are_isolated_and_hook_errors_do_not_abort_the_parent() {
+        let mut queue = CommandQueue::default();
+        let first_client = crate::ClientId::new(1);
+        let second_client = crate::ClientId::new(2);
+        queue
+            .push_list(
+                first_client,
+                list("display-message first; display-message last"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+        queue
+            .push_list(
+                second_client,
+                list("display-message other"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+
+        let first = queue.pop().unwrap();
+        queue
+            .insert_after_active_as(
+                &first,
+                list("display-message hook-one; display-message hook-two"),
+                CommandSource::Hook { depth: 1 },
+            )
+            .unwrap();
+        assert!(queue.finish(first, Ok(String::new())).is_none());
+
+        let other = queue.pop().unwrap();
+        assert_eq!(other.client, second_client);
+        assert!(queue.finish(other, Ok(String::new())).is_some());
+
+        let hook_one = queue.pop().unwrap();
+        assert_eq!(hook_one.source, CommandSource::Hook { depth: 1 });
+        let hook_error = queue
+            .finish(hook_one, Err("hook failed".to_string()))
+            .unwrap();
+        assert_eq!(hook_error.source, CommandSource::Hook { depth: 1 });
+
+        let hook_two = queue.pop().unwrap();
+        assert!(matches!(
+            &hook_two.command,
+            Command::DisplayMessage { template, .. } if template == "hook-two"
+        ));
+        assert!(queue.finish(hook_two, Ok(String::new())).is_none());
+        let last = queue.pop().unwrap();
+        assert!(matches!(
+            last.command,
+            Command::DisplayMessage { template, .. } if template == "last"
+        ));
+    }
+
+    #[test]
+    fn hook_commands_parse_store_list_and_unset_nested_command_lists() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("hooks", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        assert!(
+            execute_one(
+                &mut state,
+                client,
+                "set-hook -g pane-created 'set-option -g @hook first'",
+            )
+            .ok
+        );
+        assert!(
+            execute_one(
+                &mut state,
+                client,
+                "set-hook -ag pane-created 'set-option -g @hook second'",
+            )
+            .ok
+        );
+        let shown = execute_text(&mut state, client, "show-hooks -g pane-created").unwrap();
+        assert!(shown.contains("pane-created[0] set-option -g @hook first"));
+        assert!(shown.contains("pane-created[1] set-option -g @hook second"));
+
+        assert!(execute_one(&mut state, client, "set-hook -gu pane-created").ok);
+        assert!(
+            execute_text(&mut state, client, "show-hooks -g pane-created")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_command_text("set-hook -g pane-created")
+            .unwrap_err()
+            .to_string()
+            .contains("requires commands"));
+    }
+
+    #[test]
+    fn successful_structural_mutations_emit_typed_hook_notifications() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("hooks", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        let split = execute_one(&mut state, client, "split-window -h");
+        let pane = split
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CommandEffect::Notify {
+                    event: crate::HookEvent::PaneCreated,
+                    target: OptionTarget::Pane(pane),
+                } => Some(*pane),
+                _ => None,
+            })
+            .expect("split emitted pane-created");
+        assert_ne!(pane, created.pane);
+
+        let buffer = execute_one(&mut state, client, "set-buffer copied");
+        assert!(buffer.effects.iter().any(|effect| matches!(
+            effect,
+            CommandEffect::Notify {
+                event: crate::HookEvent::BufferChanged,
+                target: OptionTarget::Server,
+            }
+        )));
     }
 
     #[test]

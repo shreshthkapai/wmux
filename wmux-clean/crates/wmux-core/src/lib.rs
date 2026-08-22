@@ -3,6 +3,7 @@ pub mod copy_mode;
 pub mod event;
 pub mod formats;
 pub mod grid;
+pub mod hooks;
 pub mod ids;
 pub mod keys;
 pub mod layout;
@@ -25,6 +26,7 @@ pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
 pub use formats::{FormatContext, FormatEngine, FormatError, MAX_FORMAT_BYTES, MAX_FORMAT_DEPTH};
 pub use grid::{Cell, Color, Grid, Line, Style};
+pub use hooks::{HookError, HookEvent, HookStore, MAX_HOOK_DEPTH, MAX_HOOK_REGISTRATIONS};
 pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, WinlinkId};
 pub use keys::{
     route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,

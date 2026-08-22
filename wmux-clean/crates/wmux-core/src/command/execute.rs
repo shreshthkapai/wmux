@@ -6,6 +6,7 @@ use crate::ServerState;
 
 pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> CommandOutcome {
     let queued = queued.borrow();
+    let closing_notification = closing_notification(state, queued);
     let result = super::execute_state_command(state, queued.clone());
     debug_assert_eq!(result.sequence, queued.sequence);
     let mut effects = SmallVec::new();
@@ -18,9 +19,15 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             Command::CopyMode => effects.push(CommandEffect::EnterCopyMode {
                 client: queued.client,
             }),
-            Command::DetachClient => effects.push(CommandEffect::DetachClient {
-                client: queued.client,
-            }),
+            Command::DetachClient => {
+                effects.push(CommandEffect::Notify {
+                    event: crate::HookEvent::ClientDetached,
+                    target: crate::OptionTarget::Client(queued.client),
+                });
+                effects.push(CommandEffect::DetachClient {
+                    client: queued.client,
+                });
+            }
             Command::SendKeys { keys, repeat, .. } => {
                 let bytes_per_repeat = keys.iter().map(|key| key.encoded_len()).sum::<usize>();
                 let total = bytes_per_repeat.checked_mul(usize::from(*repeat));
@@ -114,6 +121,19 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             Command::NewSession { attach, .. } => {
                 if let Some(pane) = result.attached_pane {
                     effects.push(CommandEffect::EnsurePane { pane });
+                    if let Some(window) = state.panes.get(&pane).map(|pane| pane.window) {
+                        if let Some(session) = state
+                            .winlinks
+                            .values()
+                            .find(|winlink| winlink.window == window)
+                            .map(|winlink| winlink.session)
+                        {
+                            effects.push(CommandEffect::Notify {
+                                event: crate::HookEvent::SessionCreated,
+                                target: crate::OptionTarget::Session(session),
+                            });
+                        }
+                    }
                 }
                 if *attach {
                     effects.push(CommandEffect::RefreshClient {
@@ -121,9 +141,27 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
                     });
                 }
             }
-            Command::NewWindow { .. } | Command::SplitWindow { .. } => {
+            Command::NewWindow { .. } => {
                 if let Some(pane) = result.attached_pane {
                     effects.push(CommandEffect::EnsurePane { pane });
+                    if let Some(window) = state.panes.get(&pane).map(|pane| pane.window) {
+                        effects.push(CommandEffect::Notify {
+                            event: crate::HookEvent::WindowCreated,
+                            target: crate::OptionTarget::Window(window),
+                        });
+                    }
+                }
+                effects.push(CommandEffect::RefreshClient {
+                    client: queued.client,
+                });
+            }
+            Command::SplitWindow { .. } => {
+                if let Some(pane) = result.attached_pane {
+                    effects.push(CommandEffect::EnsurePane { pane });
+                    effects.push(CommandEffect::Notify {
+                        event: crate::HookEvent::PaneCreated,
+                        target: crate::OptionTarget::Pane(pane),
+                    });
                 }
                 effects.push(CommandEffect::RefreshClient {
                     client: queued.client,
@@ -135,14 +173,19 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::RenameWindow { .. }
             | Command::RotateWindow { .. }
             | Command::SwapPane { .. }
-            | Command::KillPane
-            | Command::KillWindow
-            | Command::KillSession { .. }
             | Command::AttachSession { .. }
             | Command::SwitchClient { .. }
             | Command::RefreshClient => effects.push(CommandEffect::RefreshClient {
                 client: queued.client,
             }),
+            Command::KillPane | Command::KillWindow | Command::KillSession { .. } => {
+                effects.push(CommandEffect::RefreshClient {
+                    client: queued.client,
+                });
+                if let Some((event, target)) = closing_notification {
+                    effects.push(CommandEffect::Notify { event, target });
+                }
+            }
             Command::StartServer
             | Command::ListClients
             | Command::ListSessions
@@ -153,13 +196,33 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::ListKeys { .. }
             | Command::SetOption { .. }
             | Command::ShowOptions { .. }
+            | Command::SetHook { .. }
+            | Command::ShowHooks { .. }
             | Command::DisplayMessage { .. }
             | Command::SetBuffer {
                 clipboard: false, ..
             }
             | Command::ShowBuffer { .. }
-            | Command::ListBuffers
-            | Command::DeleteBuffer { .. } => {}
+            | Command::ListBuffers => {}
+            Command::DeleteBuffer { .. } => effects.push(CommandEffect::Notify {
+                event: crate::HookEvent::BufferDeleted,
+                target: crate::OptionTarget::Server,
+            }),
+        }
+        match &queued.command {
+            Command::SetBuffer { .. } => effects.push(CommandEffect::Notify {
+                event: crate::HookEvent::BufferChanged,
+                target: crate::OptionTarget::Server,
+            }),
+            Command::PasteBuffer { delete: true, .. } => effects.push(CommandEffect::Notify {
+                event: crate::HookEvent::BufferDeleted,
+                target: crate::OptionTarget::Server,
+            }),
+            Command::AttachSession { .. } => effects.push(CommandEffect::Notify {
+                event: crate::HookEvent::ClientAttached,
+                target: crate::OptionTarget::Client(queued.client),
+            }),
+            _ => {}
         }
     }
 
@@ -168,4 +231,30 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
         message: result.message,
         effects,
     }
+}
+
+fn closing_notification(
+    state: &ServerState,
+    queued: &QueuedCommand,
+) -> Option<(crate::HookEvent, crate::OptionTarget)> {
+    let (event, kind) = match &queued.command {
+        Command::KillPane => (crate::HookEvent::PaneClosed, crate::TargetKind::Pane),
+        Command::KillWindow => (crate::HookEvent::WindowClosed, crate::TargetKind::Window),
+        Command::KillSession { .. } => {
+            (crate::HookEvent::SessionClosed, crate::TargetKind::Session)
+        }
+        _ => return None,
+    };
+    let target = match &queued.command {
+        Command::KillSession { target } => target.as_ref(),
+        _ => None,
+    };
+    let resolved = super::resolve_command_target(state, queued.client, kind, target).ok()?;
+    let target = match kind {
+        crate::TargetKind::Session => crate::OptionTarget::Session(resolved.session?),
+        crate::TargetKind::Window => crate::OptionTarget::Window(resolved.window?),
+        crate::TargetKind::Pane => crate::OptionTarget::Pane(resolved.pane?),
+        crate::TargetKind::Client => crate::OptionTarget::Client(resolved.client),
+    };
+    Some((event, target))
 }

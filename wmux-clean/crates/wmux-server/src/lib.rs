@@ -1863,6 +1863,11 @@ impl ServerOwner {
                             .map_err(io::Error::other)?;
                     }
                 }
+                self.insert_hook_notification(
+                    queued,
+                    wmux_core::HookEvent::BufferChanged,
+                    wmux_core::OptionTarget::Server,
+                )?;
                 Ok(false)
             }
             CommandEffect::WriteBufferFile {
@@ -1898,13 +1903,52 @@ impl ServerOwner {
                 });
                 Ok(false)
             }
+            CommandEffect::Notify { event, target } => {
+                self.insert_hook_notification(queued, event, target)?;
+                Ok(false)
+            }
         }
+    }
+
+    fn insert_hook_notification(
+        &mut self,
+        queued: &QueuedCommand,
+        event: wmux_core::HookEvent,
+        target: wmux_core::OptionTarget,
+    ) -> io::Result<()> {
+        let depth = match queued.source {
+            CommandSource::Hook { depth } if depth >= wmux_core::MAX_HOOK_DEPTH => return Ok(()),
+            CommandSource::Hook { depth } => depth + 1,
+            _ => 1,
+        };
+        let path = self.runtime.state.option_path(target);
+        let registrations = self.runtime.state.hooks.resolve(&path, event).to_vec();
+        for commands in registrations {
+            if event == wmux_core::HookEvent::ClientDetached {
+                self.runtime
+                    .queue
+                    .push_list(ClientId::new(0), commands, CommandSource::Hook { depth })
+                    .map_err(io::Error::other)?;
+            } else {
+                self.runtime
+                    .queue
+                    .insert_after_active_as(queued, commands, CommandSource::Hook { depth })
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
     }
 
     fn send_command_completion(&mut self, completion: wmux_core::CommandCompletion) {
         if matches!(completion.source, CommandSource::Config) {
             if let Err(message) = completion.result {
                 eprintln!("wmux config command error: {message}");
+            }
+            return;
+        }
+        if matches!(completion.source, CommandSource::Hook { .. }) {
+            if let Err(message) = completion.result {
+                eprintln!("wmux hook command error: {message}");
             }
             return;
         }
@@ -3056,6 +3100,63 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn hooks_run_in_the_active_invocation_before_remaining_parent_commands() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("hooks", 80, 24);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        owner
+            .clients
+            .insert(client, ClientView::new(tx, TerminalCapabilities::default()));
+        owner.enqueue_command_list(
+            client,
+            parse_command_text(
+                "set-hook -g pane-created 'set-option -g @hook fired'; split-window; show-options -g -v @hook",
+            )
+            .unwrap(),
+            CommandSource::ClientRequest,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::CommandOk(message))) if message == "fired"
+        ));
+    }
+
+    #[test]
+    fn recursive_hooks_stop_at_the_shared_depth_limit() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("hooks", 80, 24);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        owner.enqueue_command_list(
+            client,
+            parse_command_text(
+                "set-hook -g buffer-changed 'set-buffer recursive'; set-buffer root",
+            )
+            .unwrap(),
+            CommandSource::KeyBinding,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.runtime.queue.is_empty());
+        assert_eq!(
+            owner.runtime.state.paste_buffers.len(),
+            usize::from(wmux_core::MAX_HOOK_DEPTH) + 1
+        );
     }
 
     async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {
