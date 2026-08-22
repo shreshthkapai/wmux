@@ -1,0 +1,19 @@
+[package]
+name = "wmux-unix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wmux_unix"
+path = "src/lib.rs"
+
+[dependencies]
+crossterm.workspace = true
+libc.workspace = true
+nix.workspace = true
+tokio.workspace = true
+wmux-platform = { path = "../wmux-platform" }
+
+[lints]
+workspace = true
