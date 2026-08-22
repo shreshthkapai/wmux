@@ -6,9 +6,11 @@ use std::{
         unix::process::CommandExt,
     },
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
 };
-use wmux_platform::SpawnPane;
+use wmux_platform::{DaemonSpec, SpawnPane};
 
 pub(crate) struct SpawnedPane {
     pub(crate) master: OwnedFd,
@@ -131,6 +133,44 @@ pub(crate) fn signal_group(process_group: libc::pid_t, signal: libc::c_int) -> i
 pub(crate) fn force_kill_and_reap(child: &mut Child, process_group: libc::pid_t) {
     let _ = signal_group(process_group, libc::SIGKILL);
     let _ = child.wait();
+}
+
+pub(crate) fn spawn_daemon(spec: &DaemonSpec) -> io::Result<()> {
+    let (child_tx, child_rx) = mpsc::sync_channel::<Child>(1);
+    thread::Builder::new()
+        .name("wmux-server-reaper".to_string())
+        .spawn(move || {
+            if let Ok(mut child) = child_rx.recv() {
+                let _ = child.wait();
+            }
+        })?;
+
+    let mut command = Command::new(&spec.executable);
+    command
+        .args(&spec.arguments)
+        .current_dir(&spec.current_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = command.spawn()?;
+    child_tx.send(child).map_err(|error| {
+        let mut child = error.0;
+        let process_group = child.id() as libc::pid_t;
+        force_kill_and_reap(&mut child, process_group);
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "daemon reaper exited before receiving the server child",
+        )
+    })
 }
 
 fn nix_error(error: nix::errno::Errno) -> io::Error {

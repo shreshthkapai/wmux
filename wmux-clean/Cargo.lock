@@ -452,6 +452,7 @@ dependencies = [
  "wmux-config",
  "wmux-platform",
  "wmux-protocol",
+ "wmux-unix",
  "wmux-windows",
 ]
 
@@ -518,6 +519,7 @@ dependencies = [
  "wmux-core",
  "wmux-platform",
  "wmux-protocol",
+ "wmux-unix",
  "wmux-windows",
 ]
 

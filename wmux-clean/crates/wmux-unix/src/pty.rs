@@ -71,7 +71,11 @@ impl UnixPtyBackend {
             force_kill_and_reap(&mut child, process_group);
             return Err(PlatformError::from_io("configure Unix PTY master", error));
         }
-        let io = match AsyncFd::new(master) {
+        let registration = {
+            let _runtime = self.runtime.enter();
+            AsyncFd::new(master)
+        };
+        let io = match registration {
             Ok(io) => Arc::new(io),
             Err(error) => {
                 force_kill_and_reap(&mut child, process_group);
@@ -806,6 +810,31 @@ mod tests {
         }
 
         assert!(backpressured, "stalled input queue must be bounded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_spawns_from_the_non_runtime_state_owner_thread() {
+        let runtime = Handle::current();
+        let notifier: PlatformNotifier = Arc::new(|_| {});
+        let backend = UnixPtyBackend::new(runtime, notifier);
+
+        std::thread::spawn(move || {
+            let mut backend = backend;
+            backend
+                .submit(PlatformRequest::SpawnPane(SpawnPane {
+                    pane: PlatformPaneId::new(15),
+                    size: TerminalSize::new(80, 24),
+                    command: Some(CommandSpec {
+                        program: OsString::from("/bin/sh"),
+                        args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
+                    }),
+                    cwd: None,
+                    environment: Vec::new(),
+                }))
+                .expect("state-owner thread spawns PTY");
+        })
+        .join()
+        .expect("state-owner thread does not panic");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

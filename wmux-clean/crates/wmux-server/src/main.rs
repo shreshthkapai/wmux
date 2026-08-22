@@ -5,11 +5,17 @@ fn main() -> std::io::Result<()> {
             .map_err(wmux_platform::PlatformError::into_io)?;
         wmux_server::run_with_platform(Box::new(platform))
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        let platform = wmux_unix::UnixServerPlatform::current_user()
+            .map_err(wmux_platform::PlatformError::into_io)?;
+        wmux_server::run_with_platform(Box::new(platform))
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "the Unix backend is implemented in Phase 6",
+            "wmux has no platform backend for this operating system",
         ))
     }
 }

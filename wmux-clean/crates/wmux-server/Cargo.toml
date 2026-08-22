@@ -18,5 +18,8 @@ wmux-protocol = { path = "../wmux-protocol" }
 [target.'cfg(windows)'.dependencies]
 wmux-windows = { path = "../wmux-windows" }
 
+[target.'cfg(unix)'.dependencies]
+wmux-unix = { path = "../wmux-unix" }
+
 [lints]
 workspace = true

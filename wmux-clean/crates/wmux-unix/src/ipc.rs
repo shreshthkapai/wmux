@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
@@ -17,11 +18,21 @@ pub(crate) struct UnixEndpoint {
 }
 
 impl UnixEndpoint {
+    pub(crate) fn current_user() -> io::Result<Self> {
+        let owner_uid = unsafe { libc::geteuid() };
+        let directory = runtime_directory(
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            std::env::temp_dir(),
+            owner_uid,
+        );
+        Self::from_runtime_directory(directory)
+    }
+
     pub(crate) fn from_runtime_directory(directory: PathBuf) -> io::Result<Self> {
-        if directory.as_os_str().is_empty() {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "runtime directory is empty",
+                "runtime directory must be an absolute path",
             ));
         }
         let socket = directory.join("wmux.sock");
@@ -36,6 +47,10 @@ impl UnixEndpoint {
 
     pub(crate) fn socket_path(&self) -> &Path {
         &self.socket
+    }
+
+    pub(crate) fn owner_identity(&self) -> wmux_platform::PeerIdentity {
+        identity_from_uid(self.owner_uid)
     }
 
     pub(crate) fn bind(&self) -> io::Result<BoundEndpoint> {
@@ -155,6 +170,27 @@ impl UnixEndpoint {
         }
         fs::remove_file(&self.lock)
     }
+}
+
+fn runtime_directory(
+    xdg_runtime: Option<OsString>,
+    temporary: PathBuf,
+    owner_uid: libc::uid_t,
+) -> PathBuf {
+    xdg_runtime
+        .map(PathBuf::from)
+        .filter(|path| runtime_root_is_private(path, owner_uid))
+        .map(|path| path.join("wmux"))
+        .unwrap_or_else(|| temporary.join(format!("wmux-{owner_uid}")))
+}
+
+fn runtime_root_is_private(path: &Path, owner_uid: libc::uid_t) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_dir() && metadata.uid() == owner_uid && metadata.mode() & 0o022 == 0
+    })
 }
 
 fn process_is_alive(pid: libc::pid_t) -> bool {
@@ -277,7 +313,7 @@ impl OwnedPath {
 
 #[cfg(test)]
 mod tests {
-    use super::UnixEndpoint;
+    use super::{runtime_directory, UnixEndpoint};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -314,6 +350,45 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn current_user_prefers_only_a_private_xdg_runtime_root() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.path()).expect("test root is created");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("test root is private");
+        let temporary = root.path().join("fallback");
+        let owner_uid = unsafe { libc::geteuid() };
+
+        assert_eq!(
+            runtime_directory(
+                Some(root.path().as_os_str().to_owned()),
+                temporary.clone(),
+                owner_uid,
+            ),
+            root.path().join("wmux")
+        );
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))
+            .expect("test root becomes public");
+        assert_eq!(
+            runtime_directory(
+                Some(root.path().as_os_str().to_owned()),
+                temporary.clone(),
+                owner_uid,
+            ),
+            temporary.join(format!("wmux-{owner_uid}"))
+        );
+        assert_eq!(
+            runtime_directory(Some("relative".into()), temporary.clone(), owner_uid),
+            temporary.join(format!("wmux-{owner_uid}"))
+        );
+        let error = match UnixEndpoint::from_runtime_directory(PathBuf::from("relative")) {
+            Ok(_) => panic!("relative endpoint was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
