@@ -12,6 +12,8 @@ use wmux_platform::{
     PlatformResult, SpawnJob,
 };
 
+use crate::process::{child_descriptor_limit, mark_non_stdio_descriptors_close_on_exec};
+
 const JOB_EVENT_QUEUE_CHUNKS: usize = 64;
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
@@ -59,15 +61,16 @@ impl UnixJobBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output_write))
             .stderr(Stdio::from(error_write));
+        let descriptor_limit = child_descriptor_limit();
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setpgid(0, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                Ok(())
+                mark_non_stdio_descriptors_close_on_exec(descriptor_limit)
             });
         }
-        let mut child = command
+        let child = command
             .spawn()
             .map_err(|error| PlatformError::from_io("spawn shell job", error))?;
         let process_group = child.id() as libc::pid_t;
@@ -250,5 +253,83 @@ fn set_close_on_exec(file: &File) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnixJobBackend;
+    use std::{
+        fs,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+    use wmux_platform::{JobBackend, JobEvent, JobRequest, PlatformJobId, SpawnJob};
+
+    #[test]
+    fn native_job_combines_output_applies_context_and_closes_after_exit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!("wmux-job-{}-{nonce}", std::process::id()));
+        fs::create_dir(&cwd).unwrap();
+        let mut backend = UnixJobBackend::new(Arc::new(|_| {}));
+        let job = PlatformJobId::new(7);
+        backend
+            .submit(JobRequest::Spawn(SpawnJob {
+                job,
+                command: "printf '%s\\n' \"$WMUX_JOB_VALUE\"; pwd; printf 'stderr\\n' >&2"
+                    .to_string(),
+                cwd: Some(cwd.clone()),
+                environment: vec![("WMUX_JOB_VALUE".into(), "native".into())],
+            }))
+            .unwrap();
+
+        let (output, exit_code) = collect_job(&mut backend, job);
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(exit_code, Some(0));
+        assert!(output.contains("native\n"));
+        assert!(output.contains("stderr\n"));
+        assert!(output.contains(cwd.to_string_lossy().as_ref()));
+        fs::remove_dir(cwd).unwrap();
+    }
+
+    #[test]
+    fn terminating_a_job_kills_its_process_group_and_closes() {
+        let mut backend = UnixJobBackend::new(Arc::new(|_| {}));
+        let job = PlatformJobId::new(8);
+        backend
+            .submit(JobRequest::Spawn(SpawnJob {
+                job,
+                command: "sleep 30 & wait".to_string(),
+                cwd: None,
+                environment: Vec::new(),
+            }))
+            .unwrap();
+        backend.submit(JobRequest::Terminate { job }).unwrap();
+        let (_, exit_code) = collect_job(&mut backend, job);
+        assert_ne!(exit_code, Some(0));
+    }
+
+    fn collect_job(backend: &mut UnixJobBackend, job: PlatformJobId) -> (Vec<u8>, Option<u32>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut exit_code = None;
+        loop {
+            match backend.try_next_event(job).unwrap() {
+                Some(JobEvent::Output { bytes, .. }) => output.extend(bytes),
+                Some(JobEvent::Exited {
+                    exit_code: code, ..
+                }) => exit_code = code,
+                Some(JobEvent::Closed { .. }) => return (output, exit_code),
+                Some(JobEvent::BackendError { error, .. }) => panic!("job error: {error}"),
+                None => {
+                    assert!(Instant::now() < deadline, "job did not close");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 }

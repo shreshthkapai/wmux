@@ -28,6 +28,27 @@ config, shared server library, shared client library, and conformance crates on
 all three operating systems. This prevents native types or host-dependent
 behavior from entering the shared semantic path.
 
+### Phase 7 shared-semantics evidence
+
+Phase 7 extends the portable suite to 16 cases. The added
+`control-protocol-v7` case covers stable record IDs, arbitrary binary pane
+output, notifications, ordered command completion, and bounded recovery. On
+2026-08-22, Windows and Linux produced the same aggregate fingerprint
+`d5670ad858ef5735`; `EXPECTED_DIFFERENCES` remains empty.
+
+The final local gate passed 343 Windows workspace tests and 349 Linux
+Unix/shared tests. The Linux total includes 42 `wmux-unix` unit tests and the
+real native lifecycle integration test. Strict clippy passed on both systems,
+and `wmux-unix`, `wmux`, and `wmux-server` compiled for both
+`x86_64-apple-darwin` and `aarch64-apple-darwin`.
+
+Production CLI smoke tests on Windows and Linux used `wmux -C` to start the
+real daemon, create and list a detached session, execute a native `run-shell`
+job, observe ordered `%begin`, `%notification`, and `%end` records, stop the
+server, and verify endpoint cleanup. The Linux loaded suite additionally
+exercises the reference-model child descriptor discipline: pane, job, and
+daemon children cannot inherit unrelated server descriptors.
+
 ### Phase 6 portable contract evidence
 
 The portable suite contains 14 cases and produces aggregate fingerprint
@@ -72,7 +93,8 @@ reference comparison limits.
 ### Phase 6 Unix lifecycle evidence
 
 `wmux-unix` supplies the real platform adapter on Linux and macOS. Its native
-integration test drives protocol v6 over a real AF_UNIX socket and PTY through:
+integration test drives the current versioned protocol over a real AF_UNIX
+socket and PTY through:
 
 ```text
 create -> attach -> type -> split -> resize -> detach

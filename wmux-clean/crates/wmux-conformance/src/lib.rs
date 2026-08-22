@@ -3,9 +3,9 @@ use std::{collections::VecDeque, fmt::Write as _, io::Cursor};
 use wmux_core::{
     build_window_scene, execute, parse_command_text, render_full_scene, route_key, ClientInput,
     Color, Command, CommandEffect, CommandOutcome, CommandQueue, CommandSource, ConfirmationState,
-    InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, KeyTableName, QueuedCommand,
-    RenderState, ResolveContext, Screen, ServerState, Style, TargetKind, TargetResolver,
-    TargetSpec, TerminalEngine,
+    ControlNotification, ControlRecord, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers,
+    KeyTableName, PaneId, QueuedCommand, RenderState, ResolveContext, Screen, ServerState, Style,
+    TargetKind, TargetResolver, TargetSpec, TerminalEngine,
 };
 use wmux_platform::{
     MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PlatformEvent, PlatformPaneId,
@@ -17,7 +17,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0x3c55_888e_04f4_1786;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xd567_0ad8_58ef_5735;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformFamily {
@@ -74,6 +74,7 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
         unicode_terminal_text_case()?,
         terminal_modes_and_title_case()?,
         bounded_control_recovery_case()?,
+        control_protocol_case()?,
         platform_lifecycle_case()?,
     ];
     let mut suite_fingerprint = Fnv64::new();
@@ -84,6 +85,46 @@ pub fn run_portable_suite() -> Result<ConformanceReport, String> {
     Ok(ConformanceReport {
         cases,
         suite_fingerprint: suite_fingerprint.finish(),
+    })
+}
+
+fn control_protocol_case() -> Result<CaseResult, String> {
+    let messages = vec![
+        Message::EnterControl,
+        Message::ControlCommand {
+            sequence: 1,
+            command: "list-sessions".to_string(),
+        },
+        Message::ControlRecord(ControlRecord::Ready),
+        Message::ControlRecord(ControlRecord::Begin { sequence: 1 }),
+        Message::ControlRecord(ControlRecord::Output {
+            pane: PaneId::new(7),
+            bytes: vec![0, 0xff, b'\\', b'\n'],
+        }),
+        Message::ControlRecord(ControlRecord::Notification(
+            ControlNotification::PaneCreated {
+                pane: PaneId::new(7),
+            },
+        )),
+        Message::ControlRecord(ControlRecord::End {
+            sequence: 1,
+            output: "done".to_string(),
+        }),
+        Message::ControlRecord(ControlRecord::Pause {
+            pane: Some(PaneId::new(7)),
+        }),
+    ];
+    let mut hash = Fnv64::new();
+    for message in messages {
+        let frame = encode_frame(&message);
+        if read_message(frame.as_slice()).map_err(|error| error.to_string())? != Some(message) {
+            return Err("control protocol round trip changed".to_string());
+        }
+        hash.bytes(&frame);
+    }
+    Ok(CaseResult {
+        name: "control-protocol-v7",
+        fingerprint: hash.finish(),
     })
 }
 
@@ -973,7 +1014,7 @@ mod tests {
     #[test]
     fn portable_semantic_suite_passes() {
         let report = verify_portable_suite().unwrap();
-        assert_eq!(report.cases.len(), 15);
+        assert_eq!(report.cases.len(), 16);
         assert!(report
             .cases
             .iter()
@@ -982,6 +1023,10 @@ mod tests {
             .cases
             .iter()
             .any(|case| case.name == "paste-buffer-semantics"));
+        assert!(report
+            .cases
+            .iter()
+            .any(|case| case.name == "control-protocol-v7"));
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 

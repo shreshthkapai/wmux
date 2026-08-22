@@ -311,3 +311,31 @@ run were:
 with zero measured allocations or violations. Phase 6 adds native Unix I/O
 behind that unchanged dispatch boundary; it does not move descriptors,
 readiness polling, or process mechanics into any measured shared hot path.
+
+## Phase 7 Final Performance Gate
+
+The Phase 7 Windows full release gate on 2026-08-22 passed every existing
+threshold without changing a workload or floor. Selected results were:
+
+| Scenario | Result |
+| --- | ---: |
+| `parser-codex` throughput | 124.59 MiB/s |
+| `frame-codex` p95 | 102.9 us |
+| `hybrid-frame-codex` p95 | 86.1 us |
+| `idle-input-render` p95 | 3.2 us |
+| `history-resize-100k` p95 | 23.1 us |
+| `split-storm` p95 | 43.7 us |
+| `detach-backlog` throughput | 102.06 MiB/s |
+| `multiple-clients` p95 | 220.4 us |
+| `key-unbound` | 145,954,080 operations/second |
+| `key-prefix-binding` | 47,112,166 operations/second |
+| `command-queue` | 9,269,172 operations/second |
+| `command-text` | 645,491 operations/second |
+| `platform-dispatch` | 143,816,398 operations/second |
+
+`platform-dispatch` completed 10,000,000 semantic requests in 69.533 ms with
+zero measured allocations or violations. Protocol-v7 control output retains
+the pane-output allocation through encoding and slices emitted records to 64
+KiB, while the server reserves reply capacity inside its existing bounded
+per-client queue. Phase 7 shell jobs execute outside the state-owner loop and
+return bounded chunks through the unchanged semantic platform dispatch seam.

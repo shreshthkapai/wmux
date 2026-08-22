@@ -7,7 +7,7 @@ use std::{
     },
     path::Path,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, OnceLock},
     thread,
 };
 use wmux_platform::{DaemonSpec, SpawnPane, TerminalSize};
@@ -67,8 +67,9 @@ pub(crate) fn spawn_pane(request: &SpawnPane) -> io::Result<SpawnedPane> {
         command.current_dir(cwd);
     }
     command.envs(request.environment.iter().map(|(key, value)| (key, value)));
+    let descriptor_limit = child_descriptor_limit();
     unsafe {
-        command.pre_exec(move || child_terminal_setup(master_fd, slave_fd));
+        command.pre_exec(move || child_terminal_setup(master_fd, slave_fd, descriptor_limit));
     }
     let child = command.spawn()?;
     drop(pty.slave);
@@ -86,7 +87,11 @@ fn default_shell() -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
 }
 
-fn child_terminal_setup(master_fd: libc::c_int, slave_fd: libc::c_int) -> io::Result<()> {
+fn child_terminal_setup(
+    master_fd: libc::c_int,
+    slave_fd: libc::c_int,
+    descriptor_limit: libc::c_int,
+) -> io::Result<()> {
     if master_fd > libc::STDERR_FILENO {
         unsafe { libc::close(master_fd) };
     }
@@ -97,7 +102,54 @@ fn child_terminal_setup(master_fd: libc::c_int, slave_fd: libc::c_int) -> io::Re
     if unsafe { libc::login_tty(slave_fd) } == -1 {
         return Err(io::Error::last_os_error());
     }
+    mark_non_stdio_descriptors_close_on_exec(descriptor_limit)?;
     reset_signal_state()
+}
+
+pub(crate) fn child_descriptor_limit() -> libc::c_int {
+    static LIMIT: OnceLock<libc::c_int> = OnceLock::new();
+    *LIMIT.get_or_init(|| unsafe { libc::getdtablesize().max(libc::STDERR_FILENO + 1) })
+}
+
+pub(crate) fn mark_non_stdio_descriptors_close_on_exec(
+    descriptor_limit: libc::c_int,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                (libc::STDERR_FILENO + 1) as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            return Err(error);
+        }
+    }
+
+    for descriptor in (libc::STDERR_FILENO + 1)..descriptor_limit {
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags == -1 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn reset_signal_state() -> io::Result<()> {
@@ -177,13 +229,13 @@ pub(crate) fn spawn_daemon(spec: &DaemonSpec) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let descriptor_limit = child_descriptor_limit();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+                return Err(io::Error::last_os_error());
             }
+            mark_non_stdio_descriptors_close_on_exec(descriptor_limit)
         });
     }
     let child = command.spawn()?;
@@ -207,7 +259,7 @@ mod tests {
     use super::{open_pty, reset_signal_state, spawn_pane};
     use std::{
         ffi::OsString,
-        fs,
+        fs::{self, File},
         io::Read,
         os::fd::{AsRawFd, OwnedFd},
         path::{Path, PathBuf},
@@ -273,6 +325,41 @@ mod tests {
                 "PTY descriptor cannot leak into another concurrently spawned pane"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_child_does_not_inherit_unrelated_parent_descriptors() {
+        let directory = TestDirectory::new();
+        let marker_path = directory.path().join("must-not-reach-pane-child");
+        let marker = File::create(&marker_path).expect("marker descriptor opens");
+        let descriptor = marker.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(flags, -1, "marker descriptor flags are readable");
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            -1,
+            "test marker is intentionally inheritable"
+        );
+        let request = SpawnPane {
+            pane: PlatformPaneId::new(2),
+            size: TerminalSize::new(80, 24),
+            command: Some(CommandSpec {
+                program: OsString::from("/bin/readlink"),
+                args: vec![OsString::from(format!("/proc/self/fd/{descriptor}"))],
+            }),
+            cwd: None,
+            environment: Vec::new(),
+        };
+
+        let mut pane = spawn_pane(&request).expect("PTY child spawns");
+        let _ = pane.child.wait().expect("PTY child is reaped");
+        let output = read_pty_to_end(pane.master);
+
+        assert!(
+            !String::from_utf8_lossy(&output).contains(marker_path.to_string_lossy().as_ref()),
+            "pane child inherited an unrelated parent descriptor"
+        );
     }
 
     #[test]

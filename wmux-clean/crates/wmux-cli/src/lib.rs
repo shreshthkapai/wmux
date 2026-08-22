@@ -26,6 +26,7 @@ pub struct ServerInvocation {
 pub enum Invocation {
     Help,
     Version,
+    Control,
     Config(ConfigAction),
     Server(ServerInvocation),
 }
@@ -41,9 +42,10 @@ impl fmt::Display for CliError {
 
 impl Error for CliError {}
 
-pub const HELP: &str = "Usage: wmux [--help|-h] [--version|-V] [command [arguments]]\n\
+pub const HELP: &str = "Usage: wmux [--help|-h] [--version|-V] [-C] [command [arguments]]\n\
 \n\
 Commands:\n\
+  -C                      enter line-oriented control mode\n\
   bind-key|bind [-nr] [-T table] key command [arguments]\n\
   confirm-before|confirm [-p prompt] command [arguments]\n\
   config path|show|effective\n\
@@ -71,6 +73,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, CliError> {
         [argument] if matches!(argument.as_str(), "--version" | "-V") => {
             return Ok(Invocation::Version)
         }
+        [argument] if argument == "-C" => return Ok(Invocation::Control),
         [config, command] if config == "config" => {
             return match command.as_str() {
                 "path" => Ok(Invocation::Config(ConfigAction::Path)),
@@ -213,5 +216,11 @@ mod tests {
 
         let switch = server(&["switchc", "-n"]);
         assert_eq!(switch.argv, args(&["switch-client", "-n"]));
+    }
+
+    #[test]
+    fn control_mode_is_a_distinct_local_adapter_invocation() {
+        assert_eq!(parse(&args(&["-C"])).unwrap(), Invocation::Control);
+        assert!(super::HELP.contains("-C"));
     }
 }

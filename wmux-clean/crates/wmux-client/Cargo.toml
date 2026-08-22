@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 tokio.workspace = true
 wmux-config = { path = "../wmux-config" }
+wmux-core = { path = "../wmux-core" }
 wmux-cli = { path = "../wmux-cli" }
 wmux-platform = { path = "../wmux-platform" }
 wmux-protocol = { path = "../wmux-protocol" }

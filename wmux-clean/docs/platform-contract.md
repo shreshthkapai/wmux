@@ -81,6 +81,13 @@ bounded ordered writer queue with complete short-write retry. Linux epoll and
 macOS kqueue readiness are both consumed through Tokio `AsyncFd`; neither
 reactor is visible across the platform boundary.
 
+Before every pane, shell-job, or daemon `exec`, the Unix adapter marks every
+descriptor above standard error close-on-exec. Linux uses one
+`close_range(..., CLOSE_RANGE_CLOEXEC)` syscall; other Unix targets use a
+bounded descriptor-table walk. This matches tmux's `closefrom` and zellij's
+`close_open_fds` child discipline and prevents a concurrent launch from
+holding another pane's PTY, pipe, or socket open.
+
 The reader and direct-child waiter report independently. The adapter coalesces
 their results into the same portable ordering used by ConPTY: all queued output,
 at most one `PtyExited`, then exactly one `PtyClosed`. The terminal guard saves
@@ -90,7 +97,7 @@ standard streams without invoking a shell.
 
 ## Conformance and change rule
 
-The real server is exercised over protocol v6 with a memory listener and
+The real server is exercised over protocol v7 with a memory listener and
 scripted backend through this lifecycle:
 
 ```text
@@ -183,3 +190,29 @@ thread registers a PTY and marking both freshly allocated PTY descriptors
 close-on-exec. The latter follows tmux's and zellij's inherited-descriptor
 discipline and prevents concurrent child launches from holding another pane's
 PTY open past process-group termination.
+
+## Phase 7 verification evidence
+
+The final local verification on 2026-08-22 produced:
+
+- 343 Windows workspace tests and 349 Linux Unix/shared tests passed;
+- format checks and warnings-denied clippy passed on Windows and Linux;
+- protocol-v7 conformance produced all 16 case fingerprints and aggregate
+  `d5670ad858ef5735` on both systems, with no expected differences;
+- real Windows and Linux control clients created a session, listed state, ran
+  a native shell job, observed structured ordered records, shut down the
+  daemon, and released the endpoint;
+- Intel and Apple Silicon macOS compile checks passed for the complete Unix
+  adapter, server, and client composition;
+- the shared-source audit found no native API, descriptor, handle, credential,
+  process, or platform-crate dependency outside composition roots; and
+- the unchanged full release performance gate passed, with platform dispatch
+  completing 10,000,000 operations in 69.533 ms at 143,816,398
+  operations/second and zero measured allocations or violations.
+
+Windows jobs use an explicitly inherited combined-output pipe, suspended
+`CreateProcessW`, a kill-on-close Job Object assigned before resume, and one
+terminal close event. Unix jobs use `/bin/sh -c`, a dedicated process group,
+combined bounded output, group termination, and the same descriptor sanitation
+as pane and daemon children. Shared job IDs, limits, command suspension,
+capture, hooks, and control records remain OS-neutral.

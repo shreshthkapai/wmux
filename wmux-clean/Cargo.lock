@@ -450,6 +450,7 @@ dependencies = [
  "tokio",
  "wmux-cli",
  "wmux-config",
+ "wmux-core",
  "wmux-platform",
  "wmux-protocol",
  "wmux-unix",

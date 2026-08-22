@@ -1,7 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     future::Future,
-    io::{self, IoSlice, Write},
+    io::{self, BufRead, IoSlice, Write},
     process,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,6 +18,7 @@ use tokio::{
 };
 use wmux_cli::{ConfigAction, Invocation, ServerInvocation, StartupPolicy};
 use wmux_config::{config_path, WmuxConfig};
+use wmux_core::{ControlNotification, ControlRecord};
 use wmux_platform::{
     BoxedIpcStream, ClientTransport, DaemonSpec, PlatformError, PlatformErrorKind, PlatformResult,
     TerminalBackend, TerminalInput, TerminalKeyCode, TerminalKeyEvent,
@@ -43,6 +44,10 @@ pub fn run_with_platform(
             println!("{}", wmux_cli::version_line());
             Ok(())
         }
+        Invocation::Control => RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_control_invocation(transport)),
         Invocation::Config(ConfigAction::Path) => show_config_path(),
         Invocation::Config(ConfigAction::Show) => show_config(),
         Invocation::Config(ConfigAction::Effective) => show_effective_config(),
@@ -118,6 +123,189 @@ async fn send_command(mut pipe: BoxedIpcStream, command: String) -> io::Result<(
             "server closed",
         )),
     }
+}
+
+async fn run_control_invocation(transport: Arc<dyn ClientTransport>) -> io::Result<()> {
+    let invocation = ServerInvocation {
+        argv: Vec::new(),
+        attached: false,
+        startup: StartupPolicy::StartIfMissing,
+    };
+    let pipe =
+        connect_for_invocation(&invocation, TerminalCapabilities::default(), transport).await?;
+    let (input_tx, input_rx) = async_mpsc::channel(64);
+    thread::Builder::new()
+        .name("wmux-control-stdin".to_string())
+        .spawn(move || {
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                if input_tx.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+        })?;
+    let stdout = io::stdout();
+    control_io_loop(pipe, input_rx, &mut stdout.lock()).await
+}
+
+async fn control_io_loop(
+    mut pipe: BoxedIpcStream,
+    mut input: async_mpsc::Receiver<io::Result<String>>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    write_async_message(&mut pipe, Message::EnterControl).await?;
+    match read_async_message(&mut pipe).await? {
+        Some(Message::ControlRecord(ControlRecord::Ready)) => {
+            write_control_record(output, &ControlRecord::Ready)?;
+        }
+        Some(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected control response: {other:?}"),
+            ));
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed",
+            ))
+        }
+    }
+
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    let mut sequence = 1_u64;
+    let mut in_flight = 0_usize;
+    let mut input_closed = false;
+    loop {
+        tokio::select! {
+            inbound = read_async_message(&mut reader) => match inbound? {
+                Some(Message::ControlRecord(record)) => {
+                    if matches!(record, ControlRecord::End { .. } | ControlRecord::Error { .. }) {
+                        in_flight = in_flight.saturating_sub(1);
+                    }
+                    write_control_record(output, &record)?;
+                    if input_closed && in_flight == 0 { return Ok(()); }
+                }
+                Some(Message::Shutdown) | None => return Ok(()),
+                Some(other) => return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected control message: {other:?}"),
+                )),
+            },
+            line = input.recv(), if !input_closed => {
+                let Some(line) = line else {
+                    input_closed = true;
+                    if in_flight == 0 { return Ok(()); }
+                    continue;
+                };
+                let command = line?;
+                write_async_message(
+                    &mut writer,
+                    Message::ControlCommand { sequence, command },
+                ).await?;
+                in_flight += 1;
+                sequence = sequence.checked_add(1).ok_or_else(|| {
+                    io::Error::other("control sequence space exhausted")
+                })?;
+            }
+        }
+    }
+}
+
+fn write_control_record(output: &mut impl Write, record: &ControlRecord) -> io::Result<()> {
+    output.write_all(format_control_record(record).as_bytes())?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn format_control_record(record: &ControlRecord) -> String {
+    match record {
+        ControlRecord::Ready => "%ready".to_string(),
+        ControlRecord::Begin { sequence } => format!("%begin {sequence}"),
+        ControlRecord::Output { pane, bytes } => {
+            format!("%output %{} {}", pane.raw(), escape_control_bytes(bytes))
+        }
+        ControlRecord::Notification(notification) => format_control_notification(notification),
+        ControlRecord::End { sequence, output } if output.is_empty() => format!("%end {sequence}"),
+        ControlRecord::End { sequence, output } => {
+            format!(
+                "%end {sequence} {}",
+                escape_control_bytes(output.as_bytes())
+            )
+        }
+        ControlRecord::Error { sequence, message } => {
+            format!(
+                "%error {sequence} {}",
+                escape_control_bytes(message.as_bytes())
+            )
+        }
+        ControlRecord::Pause { pane: Some(pane) } => format!("%pause %{}", pane.raw()),
+        ControlRecord::Pause { pane: None } => "%pause".to_string(),
+    }
+}
+
+fn format_control_notification(notification: &ControlNotification) -> String {
+    match notification {
+        ControlNotification::ClientAttached { client } => {
+            format!("%notification client-attached @{}", client.raw())
+        }
+        ControlNotification::ClientDetached { client } => {
+            format!("%notification client-detached @{}", client.raw())
+        }
+        ControlNotification::SessionCreated { session } => {
+            format!("%notification session-created ${}", session.raw())
+        }
+        ControlNotification::SessionClosed { session } => {
+            format!("%notification session-closed ${}", session.raw())
+        }
+        ControlNotification::WindowCreated { window } => {
+            format!("%notification window-created @{}", window.raw())
+        }
+        ControlNotification::WindowClosed { window } => {
+            format!("%notification window-closed @{}", window.raw())
+        }
+        ControlNotification::PaneCreated { pane } => {
+            format!("%notification pane-created %{}", pane.raw())
+        }
+        ControlNotification::PaneClosed { pane } => {
+            format!("%notification pane-closed %{}", pane.raw())
+        }
+        ControlNotification::BufferChanged { name } => {
+            format_control_named_notification("buffer-changed", name.as_deref())
+        }
+        ControlNotification::BufferDeleted { name } => {
+            format_control_named_notification("buffer-deleted", name.as_deref())
+        }
+        ControlNotification::JobFinished { job, exit_code } => match exit_code {
+            Some(exit_code) => format!("%notification job-finished #{} {exit_code}", job.raw()),
+            None => format!("%notification job-finished #{} unknown", job.raw()),
+        },
+    }
+}
+
+fn format_control_named_notification(event: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!(
+            "%notification {event} {}",
+            escape_control_bytes(name.as_bytes())
+        ),
+        None => format!("%notification {event}"),
+    }
+}
+
+fn escape_control_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    for byte in bytes {
+        if (0x20..=0x7e).contains(byte) && *byte != b'\\' {
+            escaped.push(char::from(*byte));
+        } else {
+            escaped.push('\\');
+            escaped.push(char::from(b'0' + ((byte >> 6) & 0x07)));
+            escaped.push(char::from(b'0' + ((byte >> 3) & 0x07)));
+            escaped.push(char::from(b'0' + (byte & 0x07)));
+        }
+    }
+    escaped
 }
 
 async fn attached_command(
@@ -465,6 +653,9 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Mouse(_) => "mouse",
         Message::Output(_) => "output",
         Message::Clipboard(_) => "clipboard",
+        Message::EnterControl => "enter-control",
+        Message::ControlCommand { .. } => "control-command",
+        Message::ControlRecord(_) => "control-record",
         Message::Resize { .. } => "resize",
         Message::Detach => "detach",
         Message::Shutdown => "shutdown",
@@ -719,12 +910,14 @@ fn terminal_capabilities() -> TerminalCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_attached_inbound, connect_with_startup_policy, handshake_read_error,
-        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
-        send_key, wire_key_event, write_async_message, AttachedInbound,
+        classify_attached_inbound, connect_with_startup_policy, control_io_loop,
+        escape_control_bytes, format_control_record, handshake_read_error, no_server_message,
+        protocol_error, read_async_message, read_inbound_messages, retry_delays, send_key,
+        wire_key_event, write_async_message, AttachedInbound,
     };
     use std::{cell::Cell, future::ready, io};
     use wmux_cli::StartupPolicy;
+    use wmux_core::{ControlRecord, PaneId};
     use wmux_platform::{PlatformError, PlatformErrorKind};
     use wmux_protocol::{Message, WireKeyCode, WireKeyEvent, WireKeyModifiers};
 
@@ -926,5 +1119,73 @@ mod tests {
 
         writer_task.await.unwrap();
         reader_task.abort();
+    }
+
+    #[test]
+    fn control_formatter_octal_escapes_binary_and_flush_delimiters() {
+        assert_eq!(escape_control_bytes(b"a\0\\\n\xff"), r"a\000\134\012\377");
+        assert_eq!(
+            format_control_record(&ControlRecord::Output {
+                pane: PaneId::new(7),
+                bytes: b"ok\n".to_vec(),
+            }),
+            r"%output %7 ok\012"
+        );
+        assert_eq!(
+            format_control_record(&ControlRecord::Error {
+                sequence: 2,
+                message: "bad\ncommand".to_string(),
+            }),
+            r"%error 2 bad\012command"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_adapter_streams_lines_and_structured_records_without_terminal_mode() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(2);
+        input_tx
+            .send(Ok("list-sessions".to_string()))
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        let client = control_io_loop(Box::new(client), input_rx, &mut output);
+        let server = async {
+            assert_eq!(
+                read_async_message(&mut server).await.unwrap(),
+                Some(Message::EnterControl)
+            );
+            write_async_message(&mut server, Message::ControlRecord(ControlRecord::Ready))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_async_message(&mut server).await.unwrap(),
+                Some(Message::ControlCommand {
+                    sequence: 1,
+                    command: "list-sessions".to_string(),
+                })
+            );
+            for record in [
+                ControlRecord::Begin { sequence: 1 },
+                ControlRecord::End {
+                    sequence: 1,
+                    output: "work: 1 windows".to_string(),
+                },
+            ] {
+                write_async_message(&mut server, Message::ControlRecord(record))
+                    .await
+                    .unwrap();
+            }
+            write_async_message(&mut server, Message::Shutdown)
+                .await
+                .unwrap();
+        };
+        let (client_result, ()) = tokio::join!(client, server);
+        client_result.unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "%ready\n%begin 1\n%end 1 work: 1 windows\n"
+        );
+        drop(input_tx);
     }
 }
