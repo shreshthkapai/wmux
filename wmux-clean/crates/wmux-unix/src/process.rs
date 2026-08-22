@@ -1,4 +1,4 @@
-use nix::pty::{openpty, Winsize};
+use nix::pty::{openpty, OpenptyResult, Winsize};
 use std::{
     io,
     os::{
@@ -10,7 +10,7 @@ use std::{
     sync::mpsc,
     thread,
 };
-use wmux_platform::{DaemonSpec, SpawnPane};
+use wmux_platform::{DaemonSpec, SpawnPane, TerminalSize};
 
 pub(crate) struct SpawnedPane {
     pub(crate) master: OwnedFd,
@@ -18,17 +18,42 @@ pub(crate) struct SpawnedPane {
     pub(crate) process_group: libc::pid_t,
 }
 
-pub(crate) fn spawn_pane(request: &SpawnPane) -> io::Result<SpawnedPane> {
+fn open_pty(size: TerminalSize) -> io::Result<OpenptyResult> {
     let pty = openpty(
         Some(&Winsize {
-            ws_row: request.size.rows.max(1),
-            ws_col: request.size.cols.max(1),
+            ws_row: size.rows.max(1),
+            ws_col: size.cols.max(1),
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),
         None,
     )
     .map_err(nix_error)?;
+    set_close_on_exec(&pty.master)?;
+    set_close_on_exec(&pty.slave)?;
+    Ok(pty)
+}
+
+fn set_close_on_exec(descriptor: &OwnedFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::fcntl(
+            descriptor.as_raw_fd(),
+            libc::F_SETFD,
+            flags | libc::FD_CLOEXEC,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_pane(request: &SpawnPane) -> io::Result<SpawnedPane> {
+    let pty = open_pty(request.size)?;
     let master_fd = pty.master.as_raw_fd();
     let slave_fd = pty.slave.as_raw_fd();
     let mut command = if let Some(spec) = &request.command {
@@ -179,12 +204,12 @@ fn nix_error(error: nix::errno::Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{reset_signal_state, spawn_pane};
+    use super::{open_pty, reset_signal_state, spawn_pane};
     use std::{
         ffi::OsString,
         fs,
         io::Read,
-        os::fd::OwnedFd,
+        os::fd::{AsRawFd, OwnedFd},
         path::{Path, PathBuf},
         process,
         time::{SystemTime, UNIX_EPOCH},
@@ -234,6 +259,20 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn newly_allocated_pty_descriptors_are_close_on_exec() {
+        let pty = open_pty(TerminalSize::new(80, 24)).expect("PTY allocation succeeds");
+        for descriptor in [&pty.master, &pty.slave] {
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags, -1, "descriptor flags are readable");
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "PTY descriptor cannot leak into another concurrently spawned pane"
+            );
+        }
     }
 
     #[test]
