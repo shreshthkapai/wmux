@@ -111,12 +111,26 @@ fn reset_signal_state() -> io::Result<()> {
 }
 
 pub(crate) fn signal_group(process_group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
-    let result = unsafe { libc::kill(-process_group, signal) };
-    if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    if process_group <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process group must be positive",
+        ));
     }
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+pub(crate) fn force_kill_and_reap(child: &mut Child, process_group: libc::pid_t) {
+    let _ = signal_group(process_group, libc::SIGKILL);
+    let _ = child.wait();
 }
 
 fn nix_error(error: nix::errno::Errno) -> io::Error {

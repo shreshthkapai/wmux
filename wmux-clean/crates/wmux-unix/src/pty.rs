@@ -1,4 +1,4 @@
-use crate::process::{signal_group, spawn_pane, SpawnedPane};
+use crate::process::{force_kill_and_reap, signal_group, spawn_pane, SpawnedPane};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::{
     collections::BTreeMap,
@@ -67,12 +67,17 @@ impl UnixPtyBackend {
             mut child,
             process_group,
         } = spawned;
-        set_nonblocking(&master)
-            .map_err(|error| PlatformError::from_io("configure Unix PTY master", error))?;
-        let io = Arc::new(
-            AsyncFd::new(master)
-                .map_err(|error| PlatformError::from_io("register Unix PTY master", error))?,
-        );
+        if let Err(error) = set_nonblocking(&master) {
+            force_kill_and_reap(&mut child, process_group);
+            return Err(PlatformError::from_io("configure Unix PTY master", error));
+        }
+        let io = match AsyncFd::new(master) {
+            Ok(io) => Arc::new(io),
+            Err(error) => {
+                force_kill_and_reap(&mut child, process_group);
+                return Err(PlatformError::from_io("register Unix PTY master", error));
+            }
+        };
         let (event_tx, event_rx) = mpsc::channel(PTY_EVENT_QUEUE_CHUNKS);
         let (input_tx, input_rx) = mpsc::channel(PTY_INPUT_QUEUE_CHUNKS);
         self.runtime.spawn(read_output(
@@ -122,6 +127,20 @@ impl UnixPtyBackend {
                 format!("platform pane {} does not exist", pane.raw()),
             )
         })
+    }
+}
+
+impl Drop for UnixPtyBackend {
+    fn drop(&mut self) {
+        let process_groups = self
+            .panes
+            .values()
+            .map(|pane| pane.process_group)
+            .collect::<Vec<_>>();
+        self.panes.clear();
+        for process_group in process_groups {
+            let _ = signal_group(process_group, libc::SIGKILL);
+        }
     }
 }
 
@@ -375,7 +394,7 @@ mod tests {
     use super::{set_nonblocking, InternalEvent, UnixPane, UnixPtyBackend};
     use crate::process::signal_group;
     use nix::pty::openpty;
-    use std::{ffi::OsString, os::fd::AsRawFd, sync::Arc, time::Duration};
+    use std::{ffi::OsString, io, os::fd::AsRawFd, sync::Arc, time::Duration};
     use tokio::{
         io::unix::AsyncFd,
         runtime::Handle,
@@ -396,6 +415,139 @@ mod tests {
 
     fn process_guard(backend: &UnixPtyBackend, pane: PlatformPaneId) -> ProcessGroupGuard {
         ProcessGroupGuard(backend.panes.get(&pane).expect("pane exists").process_group)
+    }
+
+    #[derive(Default)]
+    struct NativeProcessGuard {
+        groups: Vec<libc::pid_t>,
+        processes: Vec<libc::pid_t>,
+    }
+
+    impl NativeProcessGuard {
+        fn track(&mut self, group: libc::pid_t, processes: [libc::pid_t; 2]) {
+            self.groups.push(group);
+            self.processes.extend(processes);
+        }
+
+        fn disarm(&mut self) {
+            self.groups.clear();
+            self.processes.clear();
+        }
+    }
+
+    impl Drop for NativeProcessGuard {
+        fn drop(&mut self) {
+            for &group in &self.groups {
+                let _ = signal_group(group, libc::SIGKILL);
+            }
+            for &process in &self.processes {
+                unsafe { libc::kill(process, libc::SIGKILL) };
+            }
+        }
+    }
+
+    async fn spawn_process_tree(
+        backend: &mut UnixPtyBackend,
+        notified: &Notify,
+        pane: PlatformPaneId,
+    ) -> [libc::pid_t; 2] {
+        let marker = format!("WMUX_PIDS_{}", pane.raw());
+        let script = format!(
+            "trap ':' HUP TERM; sleep 30 & child=$!; \
+             printf '{marker} %s %s\\n' \"$$\" \"$child\"; \
+             while kill -0 \"$child\" 2>/dev/null; do wait \"$child\" || :; done"
+        );
+        backend
+            .submit(PlatformRequest::SpawnPane(SpawnPane {
+                pane,
+                size: TerminalSize::new(80, 24),
+                command: Some(CommandSpec {
+                    program: OsString::from("/bin/sh"),
+                    args: vec![OsString::from("-c"), OsString::from(script)],
+                }),
+                cwd: None,
+                environment: Vec::new(),
+            }))
+            .expect("process tree spawns");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = Vec::new();
+            loop {
+                while let Some(event) = backend.try_next_event(pane).expect("event poll succeeds") {
+                    match event {
+                        PlatformEvent::PtyOutput { bytes, .. } => output.extend_from_slice(&bytes),
+                        PlatformEvent::BackendError { error, .. } => {
+                            panic!("process tree failed before reporting PIDs: {error}")
+                        }
+                        PlatformEvent::PtyExited { exit_code, .. } => {
+                            panic!("process tree exited before reporting PIDs: {exit_code:?}")
+                        }
+                        PlatformEvent::PtyClosed { .. } => {
+                            panic!("process tree closed before reporting PIDs")
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&output);
+                let fields = text.split_whitespace().collect::<Vec<_>>();
+                if let Some(marker_index) = fields.iter().position(|field| *field == marker) {
+                    let shell = fields
+                        .get(marker_index + 1)
+                        .expect("shell PID follows marker")
+                        .parse()
+                        .expect("shell PID is numeric");
+                    let descendant = fields
+                        .get(marker_index + 2)
+                        .expect("descendant PID follows marker")
+                        .parse()
+                        .expect("descendant PID is numeric");
+                    return [shell, descendant];
+                }
+                notified.notified().await;
+            }
+        })
+        .await
+        .expect("process tree reports PIDs")
+    }
+
+    async fn wait_for_closed(
+        backend: &mut UnixPtyBackend,
+        notified: &Notify,
+        pane: PlatformPaneId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Some(event) = backend.try_next_event(pane).expect("event poll succeeds") {
+                    match event {
+                        PlatformEvent::PtyClosed { .. } => return,
+                        PlatformEvent::BackendError { error, .. } => {
+                            panic!("PTY cleanup failed: {error}")
+                        }
+                        PlatformEvent::PtyOutput { .. } | PlatformEvent::PtyExited { .. } => {}
+                    }
+                }
+                notified.notified().await;
+            }
+        })
+        .await
+        .expect("PTY closes after termination");
+    }
+
+    fn process_is_running(process: libc::pid_t) -> bool {
+        let result = unsafe { libc::kill(process, 0) };
+        if result == -1 {
+            return io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        }
+        true
+    }
+
+    async fn wait_for_processes_gone(processes: &[libc::pid_t]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processes.iter().copied().any(process_is_running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all process-tree members terminate");
     }
 
     fn kernel_size(backend: &UnixPtyBackend, pane: PlatformPaneId) -> TerminalSize {
@@ -654,6 +806,145 @@ mod tests {
         }
 
         assert!(backpressured, "stalled input queue must be bounded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_termination_hangs_up_the_complete_process_group() {
+        let notified = Arc::new(Notify::new());
+        let notifier: PlatformNotifier = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move |_| notified.notify_one())
+        };
+        let mut backend = UnixPtyBackend::new(Handle::current(), notifier);
+        let pane = PlatformPaneId::new(9);
+        let processes = spawn_process_tree(&mut backend, &notified, pane).await;
+        let process_group = backend.panes.get(&pane).expect("pane exists").process_group;
+        assert_eq!(process_group, processes[0]);
+        assert_eq!(unsafe { libc::getpgid(processes[1]) }, process_group);
+        let mut cleanup = NativeProcessGuard::default();
+        cleanup.track(process_group, processes);
+
+        backend
+            .submit(PlatformRequest::TerminatePane {
+                pane,
+                mode: TerminationMode::Graceful,
+            })
+            .expect("graceful termination succeeds");
+        wait_for_closed(&mut backend, &notified, pane).await;
+        wait_for_processes_gone(&processes).await;
+        signal_group(process_group, libc::SIGKILL).expect("repeated termination is idempotent");
+        cleanup.disarm();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_termination_kills_the_complete_process_group() {
+        let notified = Arc::new(Notify::new());
+        let notifier: PlatformNotifier = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move |_| notified.notify_one())
+        };
+        let mut backend = UnixPtyBackend::new(Handle::current(), notifier);
+        let pane = PlatformPaneId::new(10);
+        let processes = spawn_process_tree(&mut backend, &notified, pane).await;
+        let process_group = backend.panes.get(&pane).expect("pane exists").process_group;
+        assert_eq!(unsafe { libc::getpgid(processes[1]) }, process_group);
+        let mut cleanup = NativeProcessGuard::default();
+        cleanup.track(process_group, processes);
+
+        backend
+            .submit(PlatformRequest::TerminatePane {
+                pane,
+                mode: TerminationMode::Force,
+            })
+            .expect("forced termination succeeds");
+        wait_for_closed(&mut backend, &notified, pane).await;
+        wait_for_processes_gone(&processes).await;
+        cleanup.disarm();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_backend_kills_and_reaps_every_remaining_pane() {
+        let notified = Arc::new(Notify::new());
+        let notifier: PlatformNotifier = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move |_| notified.notify_one())
+        };
+        let mut backend = UnixPtyBackend::new(Handle::current(), notifier);
+        let first = PlatformPaneId::new(11);
+        let second = PlatformPaneId::new(12);
+        let first_processes = spawn_process_tree(&mut backend, &notified, first).await;
+        let second_processes = spawn_process_tree(&mut backend, &notified, second).await;
+        let first_group = backend
+            .panes
+            .get(&first)
+            .expect("first pane exists")
+            .process_group;
+        let second_group = backend
+            .panes
+            .get(&second)
+            .expect("second pane exists")
+            .process_group;
+        let mut cleanup = NativeProcessGuard::default();
+        cleanup.track(first_group, first_processes);
+        cleanup.track(second_group, second_processes);
+
+        drop(backend);
+        wait_for_processes_gone(&[
+            first_processes[0],
+            first_processes[1],
+            second_processes[0],
+            second_processes[1],
+        ])
+        .await;
+        cleanup.disarm();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminating_one_pane_does_not_signal_another_pane_group() {
+        let notified = Arc::new(Notify::new());
+        let notifier: PlatformNotifier = {
+            let notified = Arc::clone(&notified);
+            Arc::new(move |_| notified.notify_one())
+        };
+        let mut backend = UnixPtyBackend::new(Handle::current(), notifier);
+        let first = PlatformPaneId::new(13);
+        let second = PlatformPaneId::new(14);
+        let first_processes = spawn_process_tree(&mut backend, &notified, first).await;
+        let second_processes = spawn_process_tree(&mut backend, &notified, second).await;
+        let first_group = backend
+            .panes
+            .get(&first)
+            .expect("first pane exists")
+            .process_group;
+        let second_group = backend
+            .panes
+            .get(&second)
+            .expect("second pane exists")
+            .process_group;
+        assert_ne!(first_group, second_group);
+        let mut cleanup = NativeProcessGuard::default();
+        cleanup.track(first_group, first_processes);
+        cleanup.track(second_group, second_processes);
+
+        backend
+            .submit(PlatformRequest::TerminatePane {
+                pane: first,
+                mode: TerminationMode::Force,
+            })
+            .expect("first pane terminates");
+        wait_for_closed(&mut backend, &notified, first).await;
+        wait_for_processes_gone(&first_processes).await;
+        assert!(second_processes.iter().copied().all(process_is_running));
+
+        backend
+            .submit(PlatformRequest::TerminatePane {
+                pane: second,
+                mode: TerminationMode::Graceful,
+            })
+            .expect("second pane terminates");
+        wait_for_closed(&mut backend, &notified, second).await;
+        wait_for_processes_gone(&second_processes).await;
+        cleanup.disarm();
     }
 
     #[tokio::test]
