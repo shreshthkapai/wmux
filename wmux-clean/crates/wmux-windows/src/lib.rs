@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 pub mod conpty;
 pub mod console;
 pub mod daemon;
