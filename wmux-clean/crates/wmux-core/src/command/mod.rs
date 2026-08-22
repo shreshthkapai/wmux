@@ -5,9 +5,9 @@ use std::{
 };
 
 use crate::{
-    ClientId, KeyBinding, KeyCode, KeyTableTarget, OptionScope, OptionTarget, PaneId,
-    ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId, SplitDirection,
-    TargetError, TargetKind, TargetResolver, TargetSpec,
+    ClientId, FormatContext, FormatEngine, KeyBinding, KeyCode, KeyTableTarget, OptionScope,
+    OptionTarget, PaneId, ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId,
+    SplitDirection, TargetError, TargetKind, TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -156,6 +156,10 @@ pub enum Command {
         local_only: bool,
         name: Option<String>,
         value_only: bool,
+    },
+    DisplayMessage {
+        target: Option<TargetSpec>,
+        template: String,
     },
 }
 
@@ -630,6 +634,32 @@ pub(super) fn execute_state_command(
                 ok: true,
                 message: values,
                 attached_pane: None,
+            }
+        }
+        Command::DisplayMessage { target, template } => {
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Pane,
+                target.as_ref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let context = FormatContext {
+                client: Some(resolved.client),
+                session: resolved.session,
+                window: resolved.window,
+                pane: resolved.pane,
+            };
+            match FormatEngine::expand(state, context, &template) {
+                Ok(message) => CommandResult {
+                    sequence: queued.sequence,
+                    ok: true,
+                    message,
+                    attached_pane: None,
+                },
+                Err(error) => error_result(queued.sequence, error),
             }
         }
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
@@ -1207,6 +1237,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("detach"),
     },
     CommandEntry {
+        name: "display-message",
+        alias: Some("display"),
+    },
+    CommandEntry {
         name: "kill-pane",
         alias: Some("killp"),
     },
@@ -1381,6 +1415,7 @@ pub(super) fn parse_single_command(
             Ok(Command::RefreshClient)
         }
         "confirm-before" => parse_confirm_before(argv, depth),
+        "display-message" => parse_display_message(argv),
         "set-option" => parse_set_option(argv, OptionScope::Session),
         "set-window-option" => parse_set_option(argv, OptionScope::Window),
         "show-options" => parse_show_options(argv, OptionScope::Session),
@@ -1530,6 +1565,45 @@ pub(super) fn parse_single_command(
         }
         _ => unreachable!("resolved command is missing a parser: {command}"),
     }
+}
+
+fn parse_display_message(argv: &[String]) -> Result<Command, CommandParseError> {
+    let mut target = None;
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-p" => {}
+            "-t" => {
+                let raw = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+                target = Some(
+                    TargetSpec::parse(raw.clone())
+                        .map_err(|error| CommandParseError::new(error.to_string()))?,
+                );
+                index += 1;
+            }
+            "--" => {
+                positionals.extend_from_slice(&argv[index + 1..]);
+                break;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => positionals.push(argument.clone()),
+        }
+        index += 1;
+    }
+    if positionals.len() != 1 {
+        return Err(CommandParseError::new(
+            "display-message requires exactly one format",
+        ));
+    }
+    Ok(Command::DisplayMessage {
+        target,
+        template: positionals.remove(0),
+    })
 }
 
 fn parse_set_option(
@@ -2249,6 +2323,13 @@ fn format_command(command: &Command) -> String {
             }
             "show-options"
         }
+        Command::DisplayMessage { target, template } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            arguments.push(template.clone());
+            "display-message"
+        }
     };
 
     if arguments.is_empty() {
@@ -2473,6 +2554,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires an option name"));
+    }
+
+    #[test]
+    fn display_message_uses_the_shared_target_aware_format_engine() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 90, 30);
+        state.attach_client(client, created.session).unwrap();
+
+        assert_eq!(
+            execute_text(
+                &mut state,
+                client,
+                "display-message '#{session_name}:#{window_index}:#{pane_width}x#{pane_height}'",
+            )
+            .unwrap(),
+            "work:0:90x30"
+        );
+        assert!(
+            execute_one(&mut state, client, "display-message -t %999 '#{pane_id}'")
+                .message
+                .contains("no matching pane")
+        );
     }
 
     #[test]

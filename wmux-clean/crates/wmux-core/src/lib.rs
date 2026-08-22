@@ -1,6 +1,7 @@
 pub mod command;
 pub mod copy_mode;
 pub mod event;
+pub mod formats;
 pub mod grid;
 pub mod ids;
 pub mod keys;
@@ -21,6 +22,7 @@ pub use command::{
 };
 pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
+pub use formats::{FormatContext, FormatEngine, FormatError, MAX_FORMAT_BYTES, MAX_FORMAT_DEPTH};
 pub use grid::{Cell, Color, Grid, Line, Style};
 pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, WinlinkId};
 pub use keys::{
