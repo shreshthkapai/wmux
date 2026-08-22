@@ -13,20 +13,34 @@ workspace graph. The targets exercise only OS-neutral code:
   parses and walks every command in successful command lists without executing
   server mutations.
 
-Run sanitizer-backed fuzzing on a supported nightly Unix-like x86-64 or aarch64
-host:
+Install `cargo-fuzz` and run sanitizer-backed fuzzing on a supported nightly
+Linux or macOS x86-64/aarch64 host. Run these commands from the repository
+root so artifacts stay in the ignored per-target directories:
 
 ```bash
-cargo +nightly fuzz run terminal_bytes -- -max_total_time=60
-cargo +nightly fuzz run protocol_frame -- -max_total_time=60
-cargo +nightly fuzz run command_text -- -max_total_time=60
+rustup toolchain install nightly --profile minimal
+cargo +nightly install cargo-fuzz --locked
+mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes
+cargo +nightly fuzz run command_text -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/command_text/
+cargo +nightly fuzz run protocol_frame -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/protocol_frame/
+cargo +nightly fuzz run terminal_bytes -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/terminal_bytes/
 ```
 
-For an extended command-parser run, preserve the checked-in semantic corpus
-and increase the time budget:
+Those three 30-second runs are the CI smoke gate. The release-candidate gate
+runs every target for 15 minutes:
 
 ```bash
-cargo +nightly fuzz run command_text -- -max_total_time=3600
+cargo +nightly fuzz run command_text -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/command_text/
+cargo +nightly fuzz run protocol_frame -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/protocol_frame/
+cargo +nightly fuzz run terminal_bytes -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/terminal_bytes/
+```
+
+Minimize and replay a sanitizer artifact before converting it into an owning
+unit or integration regression:
+
+```bash
+cargo +nightly fuzz tmin terminal_bytes fuzz/artifacts/terminal_bytes/crash-HASH
+cargo +nightly fuzz run terminal_bytes fuzz/artifacts/terminal_bytes/crash-HASH
 ```
 
 From Windows, validate the manifest and compile the harnesses without claiming
@@ -35,8 +49,11 @@ a sanitizer-backed fuzz run:
 ```powershell
 cargo metadata --manifest-path fuzz/Cargo.toml --no-deps
 cargo check --manifest-path fuzz/Cargo.toml --bins
+cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
 ```
 
 Keep checked-in seeds small and semantic. Do not replace the malformed inputs
-with generated crash artifacts; add minimized regressions as ordinary tests as
-well as corpus entries.
+with generated coverage files or raw crash artifacts. A minimized failure must
+become an ordinary test in the crate that owns the parser as well as a named
+corpus seed. Upload `fuzz/artifacts` on CI failure; an empty directory on success
+is expected.

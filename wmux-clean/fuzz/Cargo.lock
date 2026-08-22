@@ -267,5 +267,6 @@ dependencies = [
 name = "wmux-protocol"
 version = "0.1.0"
 dependencies = [
+ "wmux-core",
  "wmux-platform",
 ]
