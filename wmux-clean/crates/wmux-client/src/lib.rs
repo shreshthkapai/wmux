@@ -408,6 +408,14 @@ fn input_reader(
     }
 }
 
+struct InputStopGuard(Arc<AtomicBool>);
+
+impl Drop for InputStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 async fn attach_io_loop(
     writer: &mut (impl AsyncWrite + Unpin),
     mut inbound_rx: async_mpsc::Receiver<io::Result<Option<Message>>>,
@@ -417,6 +425,7 @@ async fn attach_io_loop(
     capabilities: TerminalCapabilities,
     terminal: Arc<dyn TerminalBackend>,
 ) -> io::Result<()> {
+    let _input_stop = InputStopGuard(Arc::clone(&done));
     let mut resize_check = tokio::time::interval(Duration::from_millis(500));
     resize_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -910,16 +919,107 @@ fn terminal_capabilities() -> TerminalCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_attached_inbound, connect_with_startup_policy, control_io_loop,
-        escape_control_bytes, format_control_record, handshake_read_error, no_server_message,
-        protocol_error, read_async_message, read_inbound_messages, retry_delays, send_key,
-        wire_key_event, write_async_message, AttachedInbound,
+        attach_io_loop, attached_command, classify_attached_inbound, connect_with_startup_policy,
+        control_io_loop, escape_control_bytes, format_control_record, handshake_read_error,
+        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
+        send_key, wire_key_event, write_async_message, AttachedInbound,
     };
-    use std::{cell::Cell, future::ready, io};
+    use std::{
+        cell::Cell,
+        future::ready,
+        io,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
     use wmux_cli::StartupPolicy;
     use wmux_core::{ControlRecord, PaneId};
-    use wmux_platform::{PlatformError, PlatformErrorKind};
-    use wmux_protocol::{Message, WireKeyCode, WireKeyEvent, WireKeyModifiers};
+    use wmux_platform::{
+        PlatformError, PlatformErrorKind, PlatformResult, TerminalBackend, TerminalInput,
+        TerminalModeGuard, TerminalSize,
+    };
+    use wmux_protocol::{
+        Message, TerminalCapabilities, WireKeyCode, WireKeyEvent, WireKeyModifiers,
+    };
+
+    struct NoopTerminal;
+
+    impl TerminalBackend for NoopTerminal {
+        fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
+            unreachable!("attach I/O loop does not enter terminal mode")
+        }
+
+        fn read_input(&self) -> PlatformResult<Option<TerminalInput>> {
+            Ok(None)
+        }
+
+        fn write_output(&self, _bytes: &[u8]) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_render_transaction(
+            &self,
+            _bytes: &[u8],
+            _synchronized_output: bool,
+        ) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_clipboard_text(&self, _text: &str) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> PlatformResult<TerminalSize> {
+            Ok(TerminalSize::new(80, 24))
+        }
+    }
+
+    struct CountedGuard(Arc<AtomicUsize>);
+
+    impl Drop for CountedGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FailingOutputTerminal {
+        guard_drops: Arc<AtomicUsize>,
+    }
+
+    impl TerminalBackend for FailingOutputTerminal {
+        fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
+            Ok(Box::new(CountedGuard(Arc::clone(&self.guard_drops))))
+        }
+
+        fn read_input(&self) -> PlatformResult<Option<TerminalInput>> {
+            Ok(None)
+        }
+
+        fn write_output(&self, _bytes: &[u8]) -> PlatformResult<()> {
+            Err(PlatformError::new(
+                PlatformErrorKind::Disconnected,
+                "write test terminal",
+                "scripted terminal closure",
+            ))
+        }
+
+        fn write_render_transaction(
+            &self,
+            _bytes: &[u8],
+            _synchronized_output: bool,
+        ) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_clipboard_text(&self, _text: &str) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> PlatformResult<TerminalSize> {
+            Ok(TerminalSize::new(80, 24))
+        }
+    }
 
     #[test]
     fn platform_terminal_key_converts_exactly_to_protocol_v6() {
@@ -1070,6 +1170,54 @@ mod tests {
             read_async_message(&mut server).await.unwrap(),
             Some(Message::Key(expected))
         );
+    }
+
+    #[tokio::test]
+    async fn attach_io_error_signals_the_terminal_input_thread_to_stop() {
+        let (mut writer, _reader) = tokio::io::duplex(64);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
+        inbound_tx
+            .send(Err(io::Error::other("scripted IPC read failure")))
+            .await
+            .unwrap();
+        let (_input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+        let done = Arc::new(AtomicBool::new(false));
+
+        let error = attach_io_loop(
+            &mut writer,
+            inbound_rx,
+            input_rx,
+            Arc::clone(&done),
+            TerminalSize::new(80, 24),
+            TerminalCapabilities::default(),
+            Arc::new(NoopTerminal),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn attached_terminal_error_drops_the_mode_guard_exactly_once() {
+        let (client, _server) = tokio::io::duplex(64);
+        let guard_drops = Arc::new(AtomicUsize::new(0));
+        let terminal = Arc::new(FailingOutputTerminal {
+            guard_drops: Arc::clone(&guard_drops),
+        });
+
+        let error = attached_command(
+            Box::new(client),
+            "attach-session".to_string(),
+            TerminalCapabilities::default(),
+            terminal,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(guard_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
