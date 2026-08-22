@@ -94,7 +94,9 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::ListPanes { .. }
             | Command::BindKey { .. }
             | Command::UnbindKey { .. }
-            | Command::ListKeys { .. } => {}
+            | Command::ListKeys { .. }
+            | Command::SetOption { .. }
+            | Command::ShowOptions { .. } => {}
         }
     }
 

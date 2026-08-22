@@ -5,9 +5,9 @@ use std::{
 };
 
 use crate::{
-    ClientId, KeyBinding, KeyCode, KeyTableTarget, PaneId, ResizeDirection, ResolveContext,
-    ResolvedTarget, ServerState, SessionId, SplitDirection, TargetError, TargetKind,
-    TargetResolver, TargetSpec,
+    ClientId, KeyBinding, KeyCode, KeyTableTarget, OptionScope, OptionTarget, PaneId,
+    ResizeDirection, ResolveContext, ResolvedTarget, ServerState, SessionId, SplitDirection,
+    TargetError, TargetKind, TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -142,6 +142,20 @@ pub enum Command {
     ConfirmBefore {
         prompt: String,
         commands: CommandList,
+    },
+    SetOption {
+        scope: OptionScope,
+        target: Option<TargetSpec>,
+        unset: bool,
+        name: String,
+        value: Option<String>,
+    },
+    ShowOptions {
+        scope: OptionScope,
+        target: Option<TargetSpec>,
+        local_only: bool,
+        name: Option<String>,
+        value_only: bool,
     },
 }
 
@@ -536,6 +550,88 @@ pub(super) fn execute_state_command(
             },
             Err(error) => error_result(queued.sequence, error),
         },
+        Command::SetOption {
+            scope,
+            target,
+            unset,
+            name,
+            value,
+        } => {
+            let target = match resolve_option_target(state, queued.client, scope, target.as_ref()) {
+                Ok(target) => target,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let result = if unset {
+                state.options.unset(target, &name).map(|_| ())
+            } else {
+                state
+                    .options
+                    .set(
+                        target,
+                        &name,
+                        value.as_deref().expect("parser requires a value"),
+                    )
+                    .map(|_| ())
+            };
+            match result {
+                Ok(()) => CommandResult {
+                    sequence: queued.sequence,
+                    ok: true,
+                    message: String::new(),
+                    attached_pane: None,
+                },
+                Err(error) => error_result(queued.sequence, error),
+            }
+        }
+        Command::ShowOptions {
+            scope,
+            target,
+            local_only,
+            name,
+            value_only,
+        } => {
+            let target = match resolve_option_target(state, queued.client, scope, target.as_ref()) {
+                Ok(target) => target,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            let path = state.option_path(target);
+            let values = if let Some(name) = name {
+                let value = if local_only {
+                    state
+                        .options
+                        .list_local(target)
+                        .into_iter()
+                        .find(|(candidate, _)| candidate == &name)
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| format!("option not set: {name}"))
+                } else {
+                    state
+                        .options
+                        .get(&path, &name)
+                        .map_err(|error| error.to_string())
+                };
+                match values_to_message(value.map(|value| vec![(name, value)]), value_only) {
+                    Ok(message) => message,
+                    Err(error) => return error_result(queued.sequence, error),
+                }
+            } else {
+                let values = if local_only {
+                    state.options.list_local(target)
+                } else {
+                    state.options.list_effective(&path)
+                };
+                match values_to_message(Ok(values), false) {
+                    Ok(message) => message,
+                    Err(error) => return error_result(queued.sequence, error),
+                }
+            };
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: values,
+                attached_pane: None,
+            }
+        }
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
             sequence: queued.sequence,
             ok: true,
@@ -1034,6 +1130,56 @@ fn resolve_session_target(
         })
 }
 
+fn resolve_option_target(
+    state: &ServerState,
+    client: ClientId,
+    scope: OptionScope,
+    target: Option<&TargetSpec>,
+) -> Result<OptionTarget, String> {
+    if scope == OptionScope::Server {
+        if target.is_some() {
+            return Err("server options do not accept a target".to_string());
+        }
+        return Ok(OptionTarget::Server);
+    }
+    let kind = match scope {
+        OptionScope::Server => unreachable!(),
+        OptionScope::Session => TargetKind::Session,
+        OptionScope::Window => TargetKind::Window,
+        OptionScope::Pane => TargetKind::Pane,
+        OptionScope::Client => TargetKind::Client,
+    };
+    let resolved =
+        resolve_command_target(state, client, kind, target).map_err(|error| error.to_string())?;
+    match scope {
+        OptionScope::Server => unreachable!(),
+        OptionScope::Session => resolved.session.map(OptionTarget::Session),
+        OptionScope::Window => resolved.window.map(OptionTarget::Window),
+        OptionScope::Pane => resolved.pane.map(OptionTarget::Pane),
+        OptionScope::Client => Some(OptionTarget::Client(resolved.client)),
+    }
+    .ok_or_else(|| format!("no matching {scope}"))
+}
+
+fn values_to_message(
+    values: Result<Vec<(String, crate::OptionValue)>, String>,
+    value_only: bool,
+) -> Result<String, String> {
+    values.map(|values| {
+        values
+            .into_iter()
+            .map(|(name, value)| {
+                if value_only {
+                    value.to_string()
+                } else {
+                    format!("{name} {value}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
 struct CommandEntry {
     name: &'static str,
     alias: Option<&'static str>,
@@ -1145,6 +1291,14 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("selectw"),
     },
     CommandEntry {
+        name: "set-option",
+        alias: Some("set"),
+    },
+    CommandEntry {
+        name: "set-window-option",
+        alias: Some("setw"),
+    },
+    CommandEntry {
         name: "send-keys",
         alias: Some("send"),
     },
@@ -1159,6 +1313,14 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "start-server",
         alias: Some("start"),
+    },
+    CommandEntry {
+        name: "show-options",
+        alias: Some("show"),
+    },
+    CommandEntry {
+        name: "show-window-options",
+        alias: Some("showw"),
     },
     CommandEntry {
         name: "swap-pane",
@@ -1219,6 +1381,10 @@ pub(super) fn parse_single_command(
             Ok(Command::RefreshClient)
         }
         "confirm-before" => parse_confirm_before(argv, depth),
+        "set-option" => parse_set_option(argv, OptionScope::Session),
+        "set-window-option" => parse_set_option(argv, OptionScope::Window),
+        "show-options" => parse_show_options(argv, OptionScope::Session),
+        "show-window-options" => parse_show_options(argv, OptionScope::Window),
         "start-server" => {
             validate_arguments(argv, &[], &[], 0)?;
             Ok(Command::StartServer)
@@ -1364,6 +1530,142 @@ pub(super) fn parse_single_command(
         }
         _ => unreachable!("resolved command is missing a parser: {command}"),
     }
+}
+
+fn parse_set_option(
+    argv: &[String],
+    default_scope: OptionScope,
+) -> Result<Command, CommandParseError> {
+    let parsed = parse_option_arguments(argv, default_scope, false)?;
+    let name = parsed
+        .positionals
+        .first()
+        .cloned()
+        .ok_or_else(|| CommandParseError::new("set-option requires an option name"))?;
+    let value = parsed.positionals.get(1).cloned();
+    if parsed.positionals.len() > 2 {
+        return Err(CommandParseError::new("too many arguments for set-option"));
+    }
+    if !parsed.unset && value.is_none() {
+        return Err(CommandParseError::new(
+            "set-option requires a value unless -u is used",
+        ));
+    }
+    if parsed.unset && value.is_some() {
+        return Err(CommandParseError::new(
+            "set-option -u does not accept a value",
+        ));
+    }
+    Ok(Command::SetOption {
+        scope: parsed.scope,
+        target: parsed.target,
+        unset: parsed.unset,
+        name,
+        value,
+    })
+}
+
+fn parse_show_options(
+    argv: &[String],
+    default_scope: OptionScope,
+) -> Result<Command, CommandParseError> {
+    let parsed = parse_option_arguments(argv, default_scope, true)?;
+    if parsed.positionals.len() > 1 {
+        return Err(CommandParseError::new(
+            "too many arguments for show-options",
+        ));
+    }
+    let name = parsed.positionals.first().cloned();
+    if parsed.value_only && name.is_none() {
+        return Err(CommandParseError::new(
+            "show-options -v requires an option name",
+        ));
+    }
+    Ok(Command::ShowOptions {
+        scope: parsed.scope,
+        target: parsed.target,
+        local_only: parsed.local_only,
+        name,
+        value_only: parsed.value_only,
+    })
+}
+
+struct ParsedOptionArguments {
+    scope: OptionScope,
+    target: Option<TargetSpec>,
+    unset: bool,
+    local_only: bool,
+    value_only: bool,
+    positionals: Vec<String>,
+}
+
+fn parse_option_arguments(
+    argv: &[String],
+    default_scope: OptionScope,
+    showing: bool,
+) -> Result<ParsedOptionArguments, CommandParseError> {
+    let mut scope = None;
+    let mut target = None;
+    let mut unset = false;
+    let mut local_only = false;
+    let mut value_only = false;
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while let Some(argument) = argv.get(index) {
+        let selected_scope = match argument.as_str() {
+            "-g" => Some(OptionScope::Server),
+            "-s" => Some(OptionScope::Session),
+            "-w" => Some(OptionScope::Window),
+            "-p" => Some(OptionScope::Pane),
+            "-c" => Some(OptionScope::Client),
+            _ => None,
+        };
+        if let Some(selected) = selected_scope {
+            if scope.replace(selected).is_some() {
+                return Err(CommandParseError::new(
+                    "option scope flags are mutually exclusive",
+                ));
+            }
+        } else {
+            match argument.as_str() {
+                "-t" => {
+                    let raw = argv
+                        .get(index + 1)
+                        .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+                    target = Some(
+                        TargetSpec::parse(raw.clone())
+                            .map_err(|error| CommandParseError::new(error.to_string()))?,
+                    );
+                    index += 1;
+                }
+                "-u" if !showing => unset = true,
+                "-A" if showing => local_only = false,
+                "-L" if showing => local_only = true,
+                "-v" if showing => value_only = true,
+                "--" => {
+                    positionals.extend_from_slice(&argv[index + 1..]);
+                    break;
+                }
+                option if option.starts_with('-') => {
+                    return Err(CommandParseError::new(format!("unknown option: {option}")));
+                }
+                _ => positionals.push(argument.clone()),
+            }
+        }
+        index += 1;
+    }
+    let scope = scope.unwrap_or(default_scope);
+    if scope == OptionScope::Server && target.is_some() {
+        return Err(CommandParseError::new("server options do not accept -t"));
+    }
+    Ok(ParsedOptionArguments {
+        scope,
+        target,
+        unset,
+        local_only,
+        value_only,
+        positionals,
+    })
 }
 
 fn parse_bind_key(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
@@ -1905,6 +2207,48 @@ fn format_command(command: &Command) -> String {
                     .join(" ")
             );
         }
+        Command::SetOption {
+            scope,
+            target,
+            unset,
+            name,
+            value,
+        } => {
+            push_option_scope(&mut arguments, *scope);
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            if *unset {
+                arguments.push("-u".to_string());
+            }
+            arguments.push(name.clone());
+            if let Some(value) = value {
+                arguments.push(value.clone());
+            }
+            "set-option"
+        }
+        Command::ShowOptions {
+            scope,
+            target,
+            local_only,
+            name,
+            value_only,
+        } => {
+            push_option_scope(&mut arguments, *scope);
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            if *local_only {
+                arguments.push("-L".to_string());
+            }
+            if *value_only {
+                arguments.push("-v".to_string());
+            }
+            if let Some(name) = name {
+                arguments.push(name.clone());
+            }
+            "show-options"
+        }
     };
 
     if arguments.is_empty() {
@@ -1919,6 +2263,17 @@ fn format_command(command: &Command) -> String {
                 .join(" ")
         )
     }
+}
+
+fn push_option_scope(arguments: &mut Vec<String>, scope: OptionScope) {
+    let flag = match scope {
+        OptionScope::Server => "-g",
+        OptionScope::Session => "-s",
+        OptionScope::Window => "-w",
+        OptionScope::Pane => "-p",
+        OptionScope::Client => "-c",
+    };
+    arguments.push(flag.to_string());
 }
 
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
@@ -2065,6 +2420,59 @@ mod tests {
                 final_in_list: true,
             },
         )
+    }
+
+    #[test]
+    fn option_commands_resolve_scope_target_and_inheritance_once() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        assert!(execute_one(&mut state, client, "set-option -g @level server").ok);
+        assert!(execute_one(&mut state, client, "set-option @level session").ok);
+        assert!(execute_one(&mut state, client, "set-window-option @level window").ok);
+        assert!(execute_one(&mut state, client, "set-option -p @level pane").ok);
+
+        assert_eq!(
+            execute_text(&mut state, client, "show-options -p -v @level").unwrap(),
+            "pane"
+        );
+        assert_eq!(
+            execute_text(&mut state, client, "show-options -w -v @level").unwrap(),
+            "window"
+        );
+        assert!(execute_one(&mut state, client, "set-option -p -u @level").ok);
+        assert_eq!(
+            execute_text(&mut state, client, "show-options -p -v @level").unwrap(),
+            "window"
+        );
+        assert_eq!(
+            execute_text(&mut state, client, "show-options -g @level").unwrap(),
+            "@level server"
+        );
+    }
+
+    #[test]
+    fn option_commands_reject_wrong_scopes_and_conflicting_flags() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let created = state.create_session("work", 80, 24);
+        state.attach_client(client, created.session).unwrap();
+
+        assert!(
+            execute_one(&mut state, client, "set-option -p buffer-limit 10")
+                .message
+                .contains("pane scope")
+        );
+        assert!(parse_command_text("set-option -g -p @x value")
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive"));
+        assert!(parse_command_text("show-options -v")
+            .unwrap_err()
+            .to_string()
+            .contains("requires an option name"));
     }
 
     #[test]
