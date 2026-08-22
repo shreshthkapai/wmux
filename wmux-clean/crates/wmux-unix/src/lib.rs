@@ -5,6 +5,10 @@
 // lands, then remove this allowance.
 #[allow(dead_code)]
 mod ipc;
+#[allow(dead_code)]
+mod process;
+#[allow(dead_code)]
+mod pty;
 mod terminal;
 
 pub use terminal::UnixTerminalBackend;
