@@ -526,6 +526,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wmux-stress"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "wmux-config",
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
+]
+
+[[package]]
 name = "wmux-unix"
 version = "0.1.0"
 dependencies = [

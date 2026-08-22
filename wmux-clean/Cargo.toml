@@ -11,6 +11,7 @@ members = [
     "crates/wmux-client",
     "crates/wmux-bench",
     "crates/wmux-conformance",
+    "crates/wmux-stress",
 ]
 resolver = "2"
 

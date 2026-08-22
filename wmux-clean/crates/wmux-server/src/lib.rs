@@ -1091,7 +1091,10 @@ impl Runtime {
             if completed {
                 self.platform_panes.remove(&pane_id);
                 self.sync_started_at.remove(&pane_id);
-                self.resize_repaint_holds.remove(&pane_id);
+                let deferred_final_frame = self.resize_repaint_holds.remove(&pane_id).is_some();
+                if deferred_final_frame && result.changed {
+                    result.publishable = true;
+                }
             }
         }
         result
@@ -5364,6 +5367,52 @@ mod tests {
             .damage_journal()
             .back()
             .is_some_and(|batch| batch.operations.contains(&wmux_core::DamageOperation::Full)));
+    }
+
+    #[test]
+    fn pane_close_releases_a_resize_deferred_final_frame() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("test", 80, 24);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
+        runtime.state.resize_window(created.window, 79, 24).unwrap();
+        runtime.apply_pending_pane_resizes().unwrap();
+        let platform_pane = PlatformPaneId::new(created.pane.raw());
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyOutput {
+                pane: platform_pane,
+                bytes: b"final-before-close".to_vec(),
+            },
+        );
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyExited {
+                pane: platform_pane,
+                exit_code: Some(0),
+            },
+        );
+        runtime.emit_test_platform_event(
+            created.pane,
+            PlatformEvent::PtyClosed {
+                pane: platform_pane,
+            },
+        );
+
+        let result = runtime.process_output_round(OutputBudget::default());
+
+        assert!(result.changed);
+        assert!(result.publishable);
+        assert!(!runtime.resize_repaint_holds.contains_key(&created.pane));
+        assert!(runtime
+            .state
+            .pane(created.pane)
+            .unwrap()
+            .screen
+            .grid()
+            .line(0)
+            .unwrap()
+            .text()
+            .contains("final-before-close"));
     }
 
     #[test]
