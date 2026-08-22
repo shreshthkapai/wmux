@@ -41,6 +41,13 @@ impl WindowsServerPlatform {
                 .map_err(|error| classify_windows_io_error("discover server endpoint", error))?,
         })
     }
+
+    pub fn for_instance(instance: &str) -> PlatformResult<Self> {
+        Ok(Self {
+            endpoint: WindowsEndpoint::for_instance(instance)
+                .map_err(|error| classify_windows_io_error("configure server endpoint", error))?,
+        })
+    }
 }
 
 impl ServerPlatform for WindowsServerPlatform {
@@ -129,6 +136,16 @@ impl WindowsClientTransport {
     pub fn current_user() -> PlatformResult<Self> {
         let endpoint = WindowsEndpoint::current_user()
             .map_err(|error| classify_windows_io_error("discover server endpoint", error))?;
+        let semantic_endpoint = Endpoint::new(endpoint.pipe_name());
+        Ok(Self {
+            endpoint,
+            semantic_endpoint,
+        })
+    }
+
+    pub fn for_instance(instance: &str) -> PlatformResult<Self> {
+        let endpoint = WindowsEndpoint::for_instance(instance)
+            .map_err(|error| classify_windows_io_error("configure server endpoint", error))?;
         let semantic_endpoint = Endpoint::new(endpoint.pipe_name());
         Ok(Self {
             endpoint,

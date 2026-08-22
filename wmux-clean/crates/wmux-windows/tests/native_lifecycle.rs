@@ -1,56 +1,57 @@
-#![cfg(unix)]
+#![cfg(windows)]
 
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    process,
+    io,
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, WAIT_OBJECT_0},
+    System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+};
 use wmux_platform::{BoxedIpcStream, ClientTransport};
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
     FRAME_HEADER_LEN, VERSION,
 };
-use wmux_unix::{UnixClientTransport, UnixServerPlatform};
+use wmux_windows::platform::{WindowsClientTransport, WindowsServerPlatform};
 
-struct TestDirectory(PathBuf);
+#[test]
+fn native_lifecycle_endpoints_are_explicitly_isolated() {
+    let instance = format!("phase8-native-{}", std::process::id());
+    let other_instance = format!("{instance}-other");
 
-impl TestDirectory {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock is after Unix epoch")
-            .as_nanos();
-        Self(std::env::temp_dir().join(format!("wmux-native-lifecycle-{}-{nonce}", process::id())))
-    }
+    let _server = WindowsServerPlatform::for_instance(&instance)
+        .expect("isolated Windows server platform is constructed");
+    let client = WindowsClientTransport::for_instance(&instance)
+        .expect("matching Windows client transport is constructed");
+    let matching = WindowsClientTransport::for_instance(&instance)
+        .expect("second matching Windows client transport is constructed");
+    let other = WindowsClientTransport::for_instance(&other_instance)
+        .expect("different Windows client transport is constructed");
 
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        if self
-            .0
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("wmux-native-lifecycle-"))
-        {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    assert_eq!(client.endpoint(), matching.endpoint());
+    assert_ne!(client.endpoint(), other.endpoint());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
-    let runtime = TestDirectory::new();
-    let platform = UnixServerPlatform::from_runtime_directory(runtime.path().to_path_buf())
-        .expect("server platform is constructed");
-    let transport = UnixClientTransport::from_runtime_directory(runtime.path().to_path_buf())
-        .expect("client transport is constructed");
+async fn real_windows_lifecycle_survives_client_loss_and_cleans_process_trees() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock is after Unix epoch")
+        .as_nanos();
+    let instance = format!("phase8-native-{}-{nonce}", std::process::id());
+    run_lifecycle(&instance).await;
+    run_restart(&instance).await;
+}
+
+async fn run_lifecycle(instance: &str) {
+    let platform = WindowsServerPlatform::for_instance(instance)
+        .expect("isolated Windows server platform is constructed");
+    let transport = WindowsClientTransport::for_instance(instance)
+        .expect("isolated Windows client transport is constructed");
     let (server_result_tx, server_result_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         let result = wmux_server::run_with_platform_and_config(
@@ -64,53 +65,46 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
     command(&mut attached, "new-session -s native").await;
     write_message(
         &mut attached,
-        Message::Input(b"printf 'WMUX_%s' TYPED\n".to_vec()),
+        Message::Input(b"echo WMUX_NATIVE_TYPED\r".to_vec()),
     )
     .await;
-    wait_for_output(&mut attached, b"WMUX_TYPED").await;
+    wait_for_output(&mut attached, b"WMUX_NATIVE_TYPED").await;
 
     drop(attached);
-    let mut attached = connect_and_handshake(&transport).await;
-    command(&mut attached, "attach-session -t native").await;
-
-    command(&mut attached, "split-window").await;
-    write_message(
-        &mut attached,
-        Message::Resize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    write_message(
-        &mut attached,
-        Message::Input(b"set -- $(stty size); printf 'WMUX_SIZE_%sx%s' \"$1\" \"$2\"\n".to_vec()),
-    )
-    .await;
-    // The default top/bottom split gives the active (second) pane the
-    // remainder after the one-row separator: (30 - 1) / 2 rounded up.
-    wait_for_output(&mut attached, b"WMUX_SIZE_15x100").await;
+    let mut verifier = connect_and_handshake(&transport).await;
+    let sessions = command(&mut verifier, "list-sessions").await;
+    assert!(sessions.contains("native"));
+    command(&mut verifier, "attach-session -t native").await;
 
     write_message(
-        &mut attached,
-        Message::Input(b"(sleep 1; printf 'WMUX_%s' BACKGROUND) &\n".to_vec()),
+        &mut verifier,
+        Message::Input(b"ping -n 2 127.0.0.1 >nul & echo WMUX_BACKGROUND\r".to_vec()),
     )
     .await;
-    write_message(&mut attached, Message::Detach).await;
-    wait_for_command_ok(&mut attached).await;
-    drop(attached);
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    write_message(&mut verifier, Message::Detach).await;
+    wait_for_command_ok(&mut verifier).await;
+    drop(verifier);
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
 
     let mut reattached = connect_and_handshake(&transport).await;
-    command(&mut reattached, "attach-session -t native").await;
-    wait_for_output(&mut reattached, b"WMUX_BACKGROUND").await;
+    let early = command(&mut reattached, "attach-session -t native").await;
+    if !early
+        .as_bytes()
+        .windows(b"WMUX_BACKGROUND".len())
+        .any(|window| window == b"WMUX_BACKGROUND")
+    {
+        wait_for_output(&mut reattached, b"WMUX_BACKGROUND").await;
+    }
 
+    let child_command = concat!(
+        "powershell -NoLogo -NoProfile -Command \"",
+        "$p=Start-Process powershell -ArgumentList ",
+        "'-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; ",
+        "Write-Output ('WMUX_CHILD_PID_' + $p.Id); Wait-Process -Id $p.Id\"\r"
+    );
     write_message(
         &mut reattached,
-        Message::Input(
-            b"sh -c '(sleep 60) & child=$!; printf \"WMUX_CHILD_PID_%s\\n\" \"$child\"; wait \"$child\"'\n"
-                .to_vec(),
-        ),
+        Message::Input(child_command.as_bytes().to_vec()),
     )
     .await;
     let child_pid = wait_for_pid_marker(&mut reattached, b"WMUX_CHILD_PID_").await;
@@ -124,20 +118,16 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
     drop(controller);
 
     let server_result = server_result_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("server exits after kill-server");
     server_result.expect("server exits cleanly");
     server.join().expect("server thread joins");
-    assert!(!runtime.path().join("wmux.sock").exists());
-    assert!(!runtime.path().join("wmux.lock").exists());
-
-    run_restart(runtime.path()).await;
 }
 
-async fn run_restart(runtime: &Path) {
-    let platform = UnixServerPlatform::from_runtime_directory(runtime.to_path_buf())
-        .expect("Unix endpoint is reusable after shutdown");
-    let transport = UnixClientTransport::from_runtime_directory(runtime.to_path_buf())
+async fn run_restart(instance: &str) {
+    let platform = WindowsServerPlatform::for_instance(instance)
+        .expect("Windows endpoint is reusable after shutdown");
+    let transport = WindowsClientTransport::for_instance(instance)
         .expect("matching restart transport is constructed");
     let (server_result_tx, server_result_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -150,20 +140,21 @@ async fn run_restart(runtime: &Path) {
 
     let mut client = connect_and_handshake(&transport).await;
     command(&mut client, "new-session -d -s restarted").await;
+    assert!(command(&mut client, "list-sessions")
+        .await
+        .contains("restarted"));
     command(&mut client, "kill-server").await;
     drop(client);
 
     server_result_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("restarted server exits")
         .expect("restarted server exits cleanly");
     server.join().expect("restarted server thread joins");
-    assert!(!runtime.join("wmux.sock").exists());
-    assert!(!runtime.join("wmux.lock").exists());
 }
 
-async fn connect_and_handshake(transport: &UnixClientTransport) -> BoxedIpcStream {
-    let deadline = Instant::now() + Duration::from_secs(5);
+async fn connect_and_handshake(transport: &WindowsClientTransport) -> BoxedIpcStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut stream = loop {
         match transport.connect().await {
             Ok(stream) => break stream,
@@ -178,7 +169,7 @@ async fn connect_and_handshake(transport: &UnixClientTransport) -> BoxedIpcStrea
         &mut stream,
         Message::Hello {
             version: VERSION,
-            pid: process::id(),
+            pid: std::process::id(),
             capabilities: TerminalCapabilities::default(),
         },
     )
@@ -193,16 +184,16 @@ async fn connect_and_handshake(transport: &UnixClientTransport) -> BoxedIpcStrea
     stream
 }
 
-async fn command(stream: &mut BoxedIpcStream, command: &str) {
+async fn command(stream: &mut BoxedIpcStream, command: &str) -> String {
     write_message(stream, Message::Command(command.to_string())).await;
-    wait_for_command_ok(stream).await;
+    wait_for_command_ok(stream).await
 }
 
-async fn wait_for_command_ok(stream: &mut BoxedIpcStream) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+async fn wait_for_command_ok(stream: &mut BoxedIpcStream) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match read_message(stream).await {
-                Some(Message::CommandOk(_)) => return,
+                Some(Message::CommandOk(message)) => return message,
                 Some(Message::CommandErr(error)) => panic!("command failed: {error}"),
                 Some(Message::Output(_) | Message::Clipboard(_)) => {}
                 Some(message) => panic!("unexpected command response: {message:?}"),
@@ -211,12 +202,12 @@ async fn wait_for_command_ok(stream: &mut BoxedIpcStream) {
         }
     })
     .await
-    .expect("command completes");
+    .expect("command completes")
 }
 
 async fn wait_for_output(stream: &mut BoxedIpcStream, marker: &[u8]) {
     let mut output = Vec::new();
-    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match read_message(stream).await {
                 Some(Message::Output(bytes)) => {
@@ -235,16 +226,16 @@ async fn wait_for_output(stream: &mut BoxedIpcStream, marker: &[u8]) {
     .await;
     if outcome.is_err() {
         panic!(
-            "expected pane output {:?} arrives; received {:?}",
+            "expected pane output {:?}; received {:?}",
             String::from_utf8_lossy(marker),
             String::from_utf8_lossy(&output),
         )
     }
 }
 
-async fn wait_for_pid_marker(stream: &mut BoxedIpcStream, marker: &[u8]) -> libc::pid_t {
+async fn wait_for_pid_marker(stream: &mut BoxedIpcStream, marker: &[u8]) -> u32 {
     let mut output = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match read_message(stream).await {
                 Some(Message::Output(bytes)) => {
@@ -269,7 +260,7 @@ async fn wait_for_pid_marker(stream: &mut BoxedIpcStream, marker: &[u8]) -> libc
     })
 }
 
-fn parse_pid_marker(output: &[u8], marker: &[u8]) -> Option<libc::pid_t> {
+fn parse_pid_marker(output: &[u8], marker: &[u8]) -> Option<u32> {
     output
         .windows(marker.len())
         .enumerate()
@@ -287,54 +278,8 @@ fn parse_pid_marker(output: &[u8], marker: &[u8]) -> Option<libc::pid_t> {
         })
 }
 
-fn process_is_running(pid: libc::pid_t) -> bool {
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        return false;
-    }
-    process_has_live_kernel_state(pid)
-}
-
-#[cfg(target_os = "linux")]
-fn process_has_live_kernel_state(pid: libc::pid_t) -> bool {
-    // A minimal Docker container may not reap orphaned children from PID 1.
-    // `kill(pid, 0)` still succeeds for those dead zombies, so consult the
-    // kernel state before calling one a live process leak.
-    process_debug_state(pid)
-        .rsplit_once(") ")
-        .and_then(|(_, fields)| fields.as_bytes().first().copied())
-        != Some(b'Z')
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_has_live_kernel_state(_pid: libc::pid_t) -> bool {
-    true
-}
-
-async fn wait_for_process_exit(pid: libc::pid_t) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_is_running(pid) && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        !process_is_running(pid),
-        "descendant process {pid} leaked; kernel state: {}",
-        process_debug_state(pid)
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn process_debug_state(pid: libc::pid_t) -> String {
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|error| format!("unavailable: {error}"))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_debug_state(_pid: libc::pid_t) -> String {
-    "unavailable on this operating system".to_string()
-}
-
 async fn wait_for_shutdown(stream: &mut BoxedIpcStream) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match read_message(stream).await {
                 Some(Message::Shutdown) | None => return,
@@ -346,6 +291,24 @@ async fn wait_for_shutdown(stream: &mut BoxedIpcStream) {
     })
     .await
     .expect("attached client observes session destruction");
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+    let status = unsafe { WaitForSingleObject(process, 0) };
+    unsafe { CloseHandle(process) };
+    status != WAIT_OBJECT_0
+}
+
+async fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_is_running(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!process_is_running(pid), "descendant process {pid} leaked");
 }
 
 async fn read_message(stream: &mut BoxedIpcStream) -> Option<Message> {

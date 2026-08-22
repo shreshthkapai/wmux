@@ -558,5 +558,8 @@ dependencies = [
  "crossterm",
  "tokio",
  "windows-sys 0.61.2",
+ "wmux-config",
  "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
 ]
