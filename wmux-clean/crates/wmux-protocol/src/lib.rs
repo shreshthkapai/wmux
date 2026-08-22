@@ -1,12 +1,17 @@
 use std::io::{self, IoSlice, Read, Write};
+use wmux_core::{
+    ClientId, ControlNotification, ControlRecord, JobId, PaneId, SessionId, WindowId,
+    MAX_CONTROL_NAME_BYTES, MAX_CONTROL_OUTPUT_BYTES, MAX_CONTROL_TEXT_BYTES,
+};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
-pub const VERSION: u32 = 6;
-pub const MAGIC: [u8; 4] = *b"WMX6";
+pub const VERSION: u32 = 7;
+pub const MAGIC: [u8; 4] = *b"WMX7";
 pub const FRAME_HEADER_LEN: usize = 9;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 const KEY_PREFIX_LEN: usize = 6;
-const ENCODED_HEADER_LEN: usize = FRAME_HEADER_LEN + KEY_PREFIX_LEN;
+const CONTROL_OUTPUT_PREFIX_LEN: usize = 9;
+const ENCODED_HEADER_LEN: usize = FRAME_HEADER_LEN + CONTROL_OUTPUT_PREFIX_LEN;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalCapabilities(u32);
@@ -119,6 +124,12 @@ pub enum Message {
     Mouse(MouseEvent),
     Output(Vec<u8>),
     Clipboard(Vec<u8>),
+    EnterControl,
+    ControlCommand {
+        sequence: u64,
+        command: String,
+    },
+    ControlRecord(ControlRecord),
     Resize {
         cols: u16,
         rows: u16,
@@ -144,6 +155,9 @@ impl Message {
             Self::Paste(_) => 12,
             Self::Mouse(_) => 13,
             Self::Clipboard(_) => 14,
+            Self::EnterControl => 15,
+            Self::ControlCommand { .. } => 16,
+            Self::ControlRecord(_) => 17,
         }
     }
 
@@ -179,6 +193,19 @@ impl EncodedFrame {
                     header,
                     header_len: ENCODED_HEADER_LEN,
                     payload: EncodedPayload::Owned(event.raw),
+                }
+            }
+            Message::ControlRecord(ControlRecord::Output { pane, bytes }) => {
+                let mut header = [0; ENCODED_HEADER_LEN];
+                header[..FRAME_HEADER_LEN]
+                    .copy_from_slice(&frame_header(17, CONTROL_OUTPUT_PREFIX_LEN + bytes.len()));
+                header[FRAME_HEADER_LEN] = 2;
+                header[FRAME_HEADER_LEN + 1..ENCODED_HEADER_LEN]
+                    .copy_from_slice(&pane.raw().to_le_bytes());
+                Self {
+                    header,
+                    header_len: ENCODED_HEADER_LEN,
+                    payload: EncodedPayload::Owned(bytes),
                 }
             }
             message => {
@@ -231,6 +258,17 @@ impl EncodedPayload {
             Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => {
                 Self::Owned(text.into_bytes())
             }
+            Message::ControlCommand { sequence, command } => {
+                let mut bytes = Vec::with_capacity(8 + command.len());
+                bytes.extend_from_slice(&sequence.to_le_bytes());
+                bytes.extend_from_slice(command.as_bytes());
+                Self::Owned(bytes)
+            }
+            Message::ControlRecord(record) => {
+                let mut bytes = Vec::with_capacity(control_record_len(&record));
+                encode_control_record(&record, &mut bytes);
+                Self::Owned(bytes)
+            }
             Message::Input(bytes)
             | Message::Paste(bytes)
             | Message::Output(bytes)
@@ -247,7 +285,7 @@ impl EncodedPayload {
                 encode_mouse(event, &mut bytes);
                 Self::Inline { bytes, len: 7 }
             }
-            Message::Detach | Message::Shutdown => Self::Inline {
+            Message::Detach | Message::Shutdown | Message::EnterControl => Self::Inline {
                 bytes: [0; 12],
                 len: 0,
             },
@@ -269,6 +307,22 @@ pub fn write_message(mut writer: impl Write, message: &Message) -> io::Result<()
             .copy_from_slice(&frame_header(11, KEY_PREFIX_LEN + event.raw.len()));
         encode_key_prefix(event, &mut header[FRAME_HEADER_LEN..]);
         return write_vectored_all(&mut writer, &header, &event.raw);
+    }
+    if let Message::ControlRecord(ControlRecord::Output { pane, bytes }) = message {
+        let mut header = [0; ENCODED_HEADER_LEN];
+        header[..FRAME_HEADER_LEN]
+            .copy_from_slice(&frame_header(17, CONTROL_OUTPUT_PREFIX_LEN + bytes.len()));
+        header[FRAME_HEADER_LEN] = 2;
+        header[FRAME_HEADER_LEN + 1..].copy_from_slice(&pane.raw().to_le_bytes());
+        return write_vectored_all(&mut writer, &header, bytes);
+    }
+    if matches!(
+        message,
+        Message::ControlCommand { .. } | Message::ControlRecord(_)
+    ) {
+        let frame = encode_frame(message);
+        writer.write_all(&frame)?;
+        return Ok(());
     }
     let mut fixed = [0_u8; 12];
     let payload = borrowed_payload(message, &mut fixed);
@@ -322,6 +376,9 @@ fn borrowed_payload<'a>(message: &'a Message, fixed: &'a mut [u8; 12]) -> &'a [u
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => {
             text.as_bytes()
         }
+        Message::ControlCommand { .. } | Message::ControlRecord(_) => {
+            unreachable!("structured control messages use an owned payload")
+        }
         Message::Input(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
@@ -336,7 +393,7 @@ fn borrowed_payload<'a>(message: &'a Message, fixed: &'a mut [u8; 12]) -> &'a [u
             encode_mouse(*event, fixed);
             &fixed[..7]
         }
-        Message::Detach | Message::Shutdown => &[],
+        Message::Detach | Message::Shutdown | Message::EnterControl => &[],
     }
 }
 
@@ -428,6 +485,8 @@ fn payload_len(message: &Message) -> usize {
     match message {
         Message::Hello { .. } | Message::HelloOk { .. } => 12,
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => text.len(),
+        Message::ControlCommand { command, .. } => 8 + command.len(),
+        Message::ControlRecord(record) => control_record_len(record),
         Message::Input(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
@@ -435,7 +494,7 @@ fn payload_len(message: &Message) -> usize {
         Message::Key(event) => KEY_PREFIX_LEN + event.raw.len(),
         Message::Resize { .. } => 4,
         Message::Mouse(_) => 7,
-        Message::Detach | Message::Shutdown => 0,
+        Message::Detach | Message::Shutdown | Message::EnterControl => 0,
     }
 }
 
@@ -458,6 +517,11 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => {
             out.extend_from_slice(text.as_bytes());
         }
+        Message::ControlCommand { sequence, command } => {
+            out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(command.as_bytes());
+        }
+        Message::ControlRecord(record) => encode_control_record(record, out),
         Message::Input(bytes)
         | Message::Paste(bytes)
         | Message::Output(bytes)
@@ -479,7 +543,7 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
             encode_mouse(*event, &mut bytes);
             out.extend_from_slice(&bytes[..7]);
         }
-        Message::Detach | Message::Shutdown => {}
+        Message::Detach | Message::Shutdown | Message::EnterControl => {}
     }
 }
 
@@ -527,8 +591,315 @@ fn decode_payload_owned(tag: u8, payload: Vec<u8>) -> io::Result<Message> {
         12 => Ok(Message::Paste(payload)),
         13 => decode_mouse(&payload).map(Message::Mouse),
         14 => Ok(Message::Clipboard(payload)),
+        15 => {
+            require_empty(&payload)?;
+            Ok(Message::EnterControl)
+        }
+        16 => decode_control_command(payload),
+        17 => decode_control_record(&payload).map(Message::ControlRecord),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
     }
+}
+
+fn control_record_len(record: &ControlRecord) -> usize {
+    match record {
+        ControlRecord::Ready => 1,
+        ControlRecord::Begin { .. } => 9,
+        ControlRecord::Output { bytes, .. } => 9 + bytes.len(),
+        ControlRecord::Notification(notification) => 1 + control_notification_len(notification),
+        ControlRecord::End { output, .. } => 9 + output.len(),
+        ControlRecord::Error { message, .. } => 9 + message.len(),
+        ControlRecord::Pause { pane } => 2 + usize::from(pane.is_some()) * 8,
+    }
+}
+
+fn control_notification_len(notification: &ControlNotification) -> usize {
+    match notification {
+        ControlNotification::ClientAttached { .. }
+        | ControlNotification::ClientDetached { .. }
+        | ControlNotification::SessionCreated { .. }
+        | ControlNotification::SessionClosed { .. }
+        | ControlNotification::WindowCreated { .. }
+        | ControlNotification::WindowClosed { .. }
+        | ControlNotification::PaneCreated { .. }
+        | ControlNotification::PaneClosed { .. } => 9,
+        ControlNotification::BufferChanged { name }
+        | ControlNotification::BufferDeleted { name } => {
+            2 + name.as_ref().map_or(0, |name| 4 + name.len())
+        }
+        ControlNotification::JobFinished { exit_code, .. } => {
+            10 + usize::from(exit_code.is_some()) * 4
+        }
+    }
+}
+
+fn encode_control_record(record: &ControlRecord, out: &mut Vec<u8>) {
+    match record {
+        ControlRecord::Ready => out.push(0),
+        ControlRecord::Begin { sequence } => {
+            out.push(1);
+            out.extend_from_slice(&sequence.to_le_bytes());
+        }
+        ControlRecord::Output { pane, bytes } => {
+            out.push(2);
+            out.extend_from_slice(&pane.raw().to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        ControlRecord::Notification(notification) => {
+            out.push(3);
+            encode_control_notification(notification, out);
+        }
+        ControlRecord::End { sequence, output } => {
+            out.push(4);
+            out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(output.as_bytes());
+        }
+        ControlRecord::Error { sequence, message } => {
+            out.push(5);
+            out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(message.as_bytes());
+        }
+        ControlRecord::Pause { pane } => {
+            out.push(6);
+            encode_optional_id(pane.map(PaneId::raw), out);
+        }
+    }
+}
+
+fn encode_control_notification(notification: &ControlNotification, out: &mut Vec<u8>) {
+    let (tag, id) = match notification {
+        ControlNotification::ClientAttached { client } => (0, Some(client.raw())),
+        ControlNotification::ClientDetached { client } => (1, Some(client.raw())),
+        ControlNotification::SessionCreated { session } => (2, Some(session.raw())),
+        ControlNotification::SessionClosed { session } => (3, Some(session.raw())),
+        ControlNotification::WindowCreated { window } => (4, Some(window.raw())),
+        ControlNotification::WindowClosed { window } => (5, Some(window.raw())),
+        ControlNotification::PaneCreated { pane } => (6, Some(pane.raw())),
+        ControlNotification::PaneClosed { pane } => (7, Some(pane.raw())),
+        ControlNotification::BufferChanged { name } => {
+            out.push(8);
+            encode_optional_string(name.as_deref(), out);
+            return;
+        }
+        ControlNotification::BufferDeleted { name } => {
+            out.push(9);
+            encode_optional_string(name.as_deref(), out);
+            return;
+        }
+        ControlNotification::JobFinished { job, exit_code } => {
+            out.push(10);
+            out.extend_from_slice(&job.raw().to_le_bytes());
+            match exit_code {
+                Some(exit_code) => {
+                    out.push(1);
+                    out.extend_from_slice(&exit_code.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            return;
+        }
+    };
+    out.push(tag);
+    out.extend_from_slice(
+        &id.expect("fixed lifecycle notification has an ID")
+            .to_le_bytes(),
+    );
+}
+
+fn encode_optional_id(id: Option<u64>, out: &mut Vec<u8>) {
+    match id {
+        Some(id) => {
+            out.push(1);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_optional_string(value: Option<&str>, out: &mut Vec<u8>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_control_command(payload: Vec<u8>) -> io::Result<Message> {
+    if payload.len() < 8 || payload.len() - 8 > MAX_CONTROL_TEXT_BYTES {
+        return Err(bad_control("bad control command"));
+    }
+    let sequence = u64::from_le_bytes(payload[..8].try_into().expect("length checked"));
+    let command = std::str::from_utf8(&payload[8..])
+        .map_err(|_| bad_control("invalid control command utf8"))?
+        .to_string();
+    Ok(Message::ControlCommand { sequence, command })
+}
+
+fn decode_control_record(payload: &[u8]) -> io::Result<ControlRecord> {
+    let mut cursor = ControlCursor::new(payload);
+    let record = match cursor.byte()? {
+        0 => ControlRecord::Ready,
+        1 => ControlRecord::Begin {
+            sequence: cursor.u64()?,
+        },
+        2 => {
+            let pane = PaneId::new(cursor.u64()?);
+            let length = cursor.remaining().len();
+            if length > MAX_CONTROL_OUTPUT_BYTES {
+                return Err(bad_control("control output exceeds 65536 bytes"));
+            }
+            ControlRecord::Output {
+                pane,
+                bytes: cursor.take(length)?.to_vec(),
+            }
+        }
+        3 => ControlRecord::Notification(decode_control_notification(&mut cursor)?),
+        4 => ControlRecord::End {
+            sequence: cursor.u64()?,
+            output: cursor.remaining_text(MAX_CONTROL_TEXT_BYTES)?,
+        },
+        5 => ControlRecord::Error {
+            sequence: cursor.u64()?,
+            message: cursor.remaining_text(MAX_CONTROL_TEXT_BYTES)?,
+        },
+        6 => ControlRecord::Pause {
+            pane: decode_optional_id(&mut cursor)?.map(PaneId::new),
+        },
+        _ => return Err(bad_control("unknown control record tag")),
+    };
+    cursor.finish()?;
+    Ok(record)
+}
+
+fn decode_control_notification(cursor: &mut ControlCursor<'_>) -> io::Result<ControlNotification> {
+    Ok(match cursor.byte()? {
+        0 => ControlNotification::ClientAttached {
+            client: ClientId::new(cursor.u64()?),
+        },
+        1 => ControlNotification::ClientDetached {
+            client: ClientId::new(cursor.u64()?),
+        },
+        2 => ControlNotification::SessionCreated {
+            session: SessionId::new(cursor.u64()?),
+        },
+        3 => ControlNotification::SessionClosed {
+            session: SessionId::new(cursor.u64()?),
+        },
+        4 => ControlNotification::WindowCreated {
+            window: WindowId::new(cursor.u64()?),
+        },
+        5 => ControlNotification::WindowClosed {
+            window: WindowId::new(cursor.u64()?),
+        },
+        6 => ControlNotification::PaneCreated {
+            pane: PaneId::new(cursor.u64()?),
+        },
+        7 => ControlNotification::PaneClosed {
+            pane: PaneId::new(cursor.u64()?),
+        },
+        8 => ControlNotification::BufferChanged {
+            name: decode_optional_string(cursor)?,
+        },
+        9 => ControlNotification::BufferDeleted {
+            name: decode_optional_string(cursor)?,
+        },
+        10 => ControlNotification::JobFinished {
+            job: JobId::new(cursor.u64()?),
+            exit_code: match cursor.byte()? {
+                0 => None,
+                1 => Some(cursor.u32()?),
+                _ => return Err(bad_control("bad optional exit code")),
+            },
+        },
+        _ => return Err(bad_control("unknown control notification tag")),
+    })
+}
+
+fn decode_optional_id(cursor: &mut ControlCursor<'_>) -> io::Result<Option<u64>> {
+    match cursor.byte()? {
+        0 => Ok(None),
+        1 => cursor.u64().map(Some),
+        _ => Err(bad_control("bad optional ID")),
+    }
+}
+
+fn decode_optional_string(cursor: &mut ControlCursor<'_>) -> io::Result<Option<String>> {
+    match cursor.byte()? {
+        0 => Ok(None),
+        1 => {
+            let length = cursor.u32()? as usize;
+            if length > MAX_CONTROL_NAME_BYTES {
+                return Err(bad_control("control name exceeds 65536 bytes"));
+            }
+            cursor.text(length).map(Some)
+        }
+        _ => Err(bad_control("bad optional string")),
+    }
+}
+
+struct ControlCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ControlCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+    fn byte(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("exact slice"),
+        ))
+    }
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("exact slice"),
+        ))
+    }
+    fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| bad_control("control length overflow"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| bad_control("truncated control record"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+    fn text(&mut self, length: usize) -> io::Result<String> {
+        std::str::from_utf8(self.take(length)?)
+            .map(str::to_string)
+            .map_err(|_| bad_control("invalid control record utf8"))
+    }
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
+    fn remaining_text(&mut self, maximum: usize) -> io::Result<String> {
+        if self.remaining().len() > maximum {
+            return Err(bad_control("control text exceeds limit"));
+        }
+        let length = self.remaining().len();
+        self.text(length)
+    }
+    fn finish(&self) -> io::Result<()> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(bad_control("trailing control record bytes"))
+        }
+    }
+}
+
+fn bad_control(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn encode_key_prefix(event: &WireKeyEvent, out: &mut [u8]) {
@@ -704,11 +1075,15 @@ mod tests {
         WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAGIC, MAX_FRAME, VERSION,
     };
     use std::io;
+    use wmux_core::{
+        ClientId, ControlNotification, ControlRecord, JobId, PaneId, SessionId, WindowId,
+        MAX_CONTROL_OUTPUT_BYTES,
+    };
     use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
     #[test]
     fn roundtrips_all_basics() {
-        assert_eq!(MAGIC, *b"WMX6");
+        assert_eq!(MAGIC, *b"WMX7");
         let messages = [
             Message::Hello {
                 version: VERSION,
@@ -731,6 +1106,12 @@ mod tests {
                 row: 40,
             }),
             Message::Clipboard(b"selected text".to_vec()),
+            Message::EnterControl,
+            Message::ControlCommand {
+                sequence: 7,
+                command: "list-sessions".to_string(),
+            },
+            Message::ControlRecord(ControlRecord::Begin { sequence: 7 }),
             Message::Resize { cols: 80, rows: 24 },
             Message::Detach,
         ];
@@ -814,8 +1195,8 @@ mod tests {
 
     #[test]
     fn protocol_documentation_matches_wire_constants() {
-        assert_eq!(VERSION, 6);
-        assert_eq!(MAGIC, *b"WMX6");
+        assert_eq!(VERSION, 7);
+        assert_eq!(MAGIC, *b"WMX7");
         let documentation = include_str!("../../../docs/ipc-protocol.md");
         assert!(documentation
             .lines()
@@ -836,7 +1217,7 @@ mod tests {
             raw: "\u{3bb}".as_bytes().to_vec(),
         });
         let frame = encode_frame(&message);
-        assert_eq!(frame, b"WMX6\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
+        assert_eq!(frame, b"WMX7\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
         assert_eq!(read_message(frame.as_slice()).unwrap(), Some(message));
     }
 
@@ -875,6 +1256,101 @@ mod tests {
                 assert!(error.to_string().len() <= 4 * 1024);
             }
         }
+    }
+
+    #[test]
+    fn control_records_roundtrip_every_variant_and_preserve_binary_output() {
+        let records = vec![
+            ControlRecord::Ready,
+            ControlRecord::Begin { sequence: 8 },
+            ControlRecord::Output {
+                pane: PaneId::new(9),
+                bytes: vec![0, 0xff, b'\\', b'\n'],
+            },
+            ControlRecord::Notification(ControlNotification::ClientAttached {
+                client: ClientId::new(1),
+            }),
+            ControlRecord::Notification(ControlNotification::ClientDetached {
+                client: ClientId::new(1),
+            }),
+            ControlRecord::Notification(ControlNotification::SessionCreated {
+                session: SessionId::new(2),
+            }),
+            ControlRecord::Notification(ControlNotification::SessionClosed {
+                session: SessionId::new(2),
+            }),
+            ControlRecord::Notification(ControlNotification::WindowCreated {
+                window: WindowId::new(3),
+            }),
+            ControlRecord::Notification(ControlNotification::WindowClosed {
+                window: WindowId::new(3),
+            }),
+            ControlRecord::Notification(ControlNotification::PaneCreated {
+                pane: PaneId::new(4),
+            }),
+            ControlRecord::Notification(ControlNotification::PaneClosed {
+                pane: PaneId::new(4),
+            }),
+            ControlRecord::Notification(ControlNotification::BufferChanged {
+                name: Some("named".into()),
+            }),
+            ControlRecord::Notification(ControlNotification::BufferDeleted { name: None }),
+            ControlRecord::Notification(ControlNotification::JobFinished {
+                job: JobId::new(5),
+                exit_code: Some(2),
+            }),
+            ControlRecord::End {
+                sequence: 8,
+                output: "done".into(),
+            },
+            ControlRecord::Error {
+                sequence: 9,
+                message: "failed".into(),
+            },
+            ControlRecord::Pause {
+                pane: Some(PaneId::new(9)),
+            },
+            ControlRecord::Pause { pane: None },
+        ];
+        for record in records {
+            let message = Message::ControlRecord(record);
+            assert_eq!(
+                read_message(encode_frame(&message).as_slice()).unwrap(),
+                Some(message)
+            );
+        }
+    }
+
+    #[test]
+    fn control_output_encoding_retains_the_payload_allocation() {
+        let bytes = vec![b'x'; MAX_CONTROL_OUTPUT_BYTES];
+        let pointer = bytes.as_ptr();
+        let frame = EncodedFrame::from_message(Message::ControlRecord(ControlRecord::Output {
+            pane: PaneId::new(3),
+            bytes,
+        }));
+        assert_eq!(frame.payload().as_ptr(), pointer);
+        assert_eq!(frame.header().len(), FRAME_HEADER_LEN + 9);
+    }
+
+    #[test]
+    fn malformed_control_payloads_are_rejected_without_panics() {
+        for payload in [vec![], vec![1], vec![3, 0xff], vec![6, 2], vec![0, 1]] {
+            assert_eq!(
+                decode_frame_payload_owned(17, payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut oversized = vec![2];
+        oversized.extend_from_slice(&1_u64.to_le_bytes());
+        oversized.resize(9 + MAX_CONTROL_OUTPUT_BYTES + 1, 0);
+        assert_eq!(
+            decode_frame_payload_owned(17, oversized)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(decode_frame_payload_owned(16, vec![0; 7]).is_err());
     }
 
     fn key_payload(tag: u8, modifiers: u8, value: u32) -> Vec<u8> {

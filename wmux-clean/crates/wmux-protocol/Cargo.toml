@@ -9,6 +9,7 @@ name = "wmux_protocol"
 path = "src/lib.rs"
 
 [dependencies]
+wmux-core = { path = "../wmux-core" }
 wmux-platform = { path = "../wmux-platform" }
 
 [lints]

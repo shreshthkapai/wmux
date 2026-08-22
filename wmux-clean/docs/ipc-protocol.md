@@ -1,7 +1,7 @@
 # IPC Protocol
 
-Protocol version: 6
-Wire magic: WMX6
+Protocol version: 7
+Wire magic: WMX7
 Maximum frame payload: 16777216 bytes
 
 wmux IPC is a versioned, framed byte protocol between disposable clients and
@@ -15,7 +15,7 @@ Every frame has a 9-byte header followed by the declared payload:
 
 | Offset | Size | Field | Encoding |
 | --- | ---: | --- | --- |
-| 0 | 4 | magic | ASCII `WMX6` |
+| 0 | 4 | magic | ASCII `WMX7` |
 | 4 | 1 | message tag | unsigned byte |
 | 5 | 4 | payload length | little-endian `u32` |
 
@@ -41,6 +41,9 @@ output, paste, key raw bytes, and clipboard payloads may contain any byte.
 | 12 | `Paste` | opaque paste bytes |
 | 13 | `Mouse` | kind `u8`, button `u8`, modifiers `u8`, column `u16`, row `u16` |
 | 14 | `Clipboard` | opaque clipboard bytes |
+| 15 | `EnterControl` | empty |
+| 16 | `ControlCommand` | sequence `u64`, UTF-8 command text |
+| 17 | `ControlRecord` | structured record tag and record payload |
 
 `Hello` and `HelloOk` payloads are exactly 12 bytes. Capability bit 0 means
 synchronized output and bit 1 means scroll-region support; unknown bits are
@@ -72,7 +75,7 @@ the protocol and may be empty.
 
 ## Handshake and identity
 
-The first client frame must be `Hello` with version 6. A compatible server
+The first client frame must be `Hello` with version 7. A compatible server
 answers `HelloOk` before accepting commands. A numeric mismatch returns a
 protocol-version error naming both versions. Invalid magic means an
 incompatible service owns the endpoint; the client reports that condition and
@@ -97,3 +100,19 @@ The server may emit multiple ordinary frames before a command result. During
 graceful shutdown, the requesting client receives its complete `CommandOk`
 frame and other attached clients receive a complete `Shutdown` frame before
 their connection writers return.
+
+## Control records
+
+After the normal handshake, `EnterControl` changes one disposable client into
+a structured control consumer. The server answers with a `Ready` record.
+`ControlCommand` sequences must increase monotonically. Each accepted command
+produces `Begin`, zero or more ordered notifications or output records, and one
+terminal `End` or `Error` record.
+
+The first control-record byte identifies `Ready`, `Begin`, `Output`,
+`Notification`, `End`, `Error`, or `Pause`. Sequences and stable object IDs are
+little-endian `u64` values. Pane output remains arbitrary bytes and is limited
+to 65,536 bytes per record. Command, result, and error text is bounded to 1
+MiB. Optional notification names are length-prefixed and bounded to 65,536
+bytes. Invalid tags, truncated integers or lengths, trailing fixed-record
+bytes, invalid textual UTF-8, and over-limit fields are rejected.

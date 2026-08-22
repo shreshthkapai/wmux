@@ -1,4 +1,5 @@
 pub mod command;
+pub mod control;
 pub mod copy_mode;
 pub mod event;
 pub mod formats;
@@ -22,6 +23,10 @@ pub use command::{
     resolve_command_name, Command, CommandCompletion, CommandEffect, CommandList, CommandOutcome,
     CommandParseError, CommandQueue, CommandSource, QueuedCommand, SendKey, SessionSelector,
     SourcePosition, SourceSpan,
+};
+pub use control::{
+    ControlNotification, ControlRecord, MAX_CONTROL_NAME_BYTES, MAX_CONTROL_OUTPUT_BYTES,
+    MAX_CONTROL_TEXT_BYTES,
 };
 pub use copy_mode::{CopyMode, CopyModeResult, CopyPosition, SearchDirection};
 pub use event::{ClientInput, ServerEvent};
