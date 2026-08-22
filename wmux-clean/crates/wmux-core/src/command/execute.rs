@@ -118,6 +118,27 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
                 depth: *depth,
                 ancestors: Arc::clone(ancestors),
             }),
+            Command::RunShell {
+                background,
+                command,
+            } => effects.push(CommandEffect::StartJob {
+                command: command.clone(),
+                background: *background,
+                continuation: crate::JobContinuation::RunShell,
+            }),
+            Command::IfShell {
+                background,
+                shell_command,
+                if_true,
+                if_false,
+            } => effects.push(CommandEffect::StartJob {
+                command: shell_command.clone(),
+                background: *background,
+                continuation: crate::JobContinuation::IfShell {
+                    if_true: if_true.clone(),
+                    if_false: if_false.clone(),
+                },
+            }),
             Command::NewSession { attach, .. } => {
                 if let Some(pane) = result.attached_pane {
                     effects.push(CommandEffect::EnsurePane { pane });

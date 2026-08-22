@@ -6,6 +6,7 @@ clients. Shared multiplexer behavior lives in `wmux-core`, `wmux-server`, and
 
 ```text
 error       classified and bounded diagnostics
+job         shell-job requests, events, stable job tokens, backend dispatch
 pane        PTY requests, events, stable pane tokens, backend dispatch
 transport   authenticated listener/client byte streams and daemon launch
 terminal    normalized input, rendering, clipboard, size, restoration guard
@@ -102,6 +103,22 @@ central `EXPECTED_DIFFERENCES` registry. The registry remains empty in Phase 6.
 Platform-specific assertions may test mechanics, but shared semantic exceptions
 must be registered with the affected platform, observable contract, rationale,
 and evidence issue.
+
+## Non-interactive shell jobs
+
+Phase 7 adds a distinct job backend for `run-shell`, `if-shell`, hooks, and
+later format expansion. `PlatformJobId` is an opaque wmux token, never a PID or
+native handle. A spawn supplies a shell command, optional working directory,
+and explicit environment changes. Adapters combine output into bounded chunks,
+emit at most one `Exited`, and finish with exactly one terminal `Closed`; no
+event may follow close.
+
+Job output uses reusable 16 KiB reads and a bounded 64-entry adapter queue.
+Termination and backend drop apply to the complete process tree and reap native
+resources. Shared code owns job limits, captured-output limits, foreground
+command-queue suspension, branch selection, and hook dispatch. Native code
+owns shell selection, redirection, process groups or Job Objects, waiting, and
+cleanup.
 
 Changing any public platform request/event, ordering rule, identity obligation,
 error classification, terminal-restoration behavior, or performance budget

@@ -4,11 +4,13 @@
 //! records, and signal numbers belong in platform adapter crates.
 
 mod error;
+mod job;
 mod pane;
 mod terminal;
 mod transport;
 
 pub use error::{PlatformError, PlatformErrorKind, PlatformResult, MAX_PLATFORM_DIAGNOSTIC_BYTES};
+pub use job::{JobBackend, JobEvent, JobNotifier, JobRequest, PlatformJobId, SpawnJob};
 pub use pane::{
     CommandSpec, PlatformEvent, PlatformNotifier, PlatformPaneId, PlatformRequest, PtyBackend,
     PtyEvent, SpawnPane, TerminationMode,
@@ -25,9 +27,10 @@ pub use transport::{
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandSpec, MouseButton, MouseEvent, MouseEventKind, MouseModifiers, PeerIdentity,
-        PlatformError, PlatformErrorKind, PlatformEvent, PlatformPaneId, PlatformRequest,
-        SpawnPane, TerminalKeyModifiers, TerminalSize, TerminationMode,
+        CommandSpec, JobEvent, JobRequest, MouseButton, MouseEvent, MouseEventKind, MouseModifiers,
+        PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformJobId,
+        PlatformPaneId, PlatformRequest, SpawnJob, SpawnPane, TerminalKeyModifiers, TerminalSize,
+        TerminationMode,
     };
     use std::{ffi::OsString, path::PathBuf};
 
@@ -37,6 +40,8 @@ mod tests {
     fn platform_contract_is_thread_safe_and_handle_free() {
         assert_send_sync::<PlatformEvent>();
         assert_send_sync::<PlatformRequest>();
+        assert_send_sync::<JobEvent>();
+        assert_send_sync::<JobRequest>();
         assert_send_sync::<MouseEvent>();
 
         let pane = PlatformPaneId::new(7);
@@ -123,5 +128,27 @@ mod tests {
             },
             PlatformEvent::PtyClosed { pane }
         );
+    }
+
+    #[test]
+    fn job_contract_is_opaque_and_has_terminal_close() {
+        let job = PlatformJobId::new(11);
+        let request = JobRequest::Spawn(SpawnJob {
+            job,
+            command: "printf job".to_owned(),
+            cwd: Some(PathBuf::from("workspace")),
+            environment: vec![(OsString::from("WMUX_JOB"), OsString::from("1"))],
+        });
+
+        assert_eq!(job.raw(), 11);
+        assert!(matches!(request, JobRequest::Spawn(_)));
+        assert_ne!(
+            JobEvent::Exited {
+                job,
+                exit_code: Some(0)
+            },
+            JobEvent::Closed { job }
+        );
+        assert!(!format!("{job:?}").contains("pid"));
     }
 }

@@ -1,4 +1,4 @@
-use crate::{PlatformNotifier, PlatformResult, PtyBackend};
+use crate::{JobBackend, JobNotifier, PlatformNotifier, PlatformResult, PtyBackend};
 use std::{ffi::OsString, fmt, future::Future, path::PathBuf, pin::Pin};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -69,6 +69,8 @@ pub trait ServerPlatform: Send {
         &mut self,
         notifier: PlatformNotifier,
     ) -> PlatformResult<Box<dyn PtyBackend>>;
+
+    fn create_job_backend(&mut self, notifier: JobNotifier) -> PlatformResult<Box<dyn JobBackend>>;
 }
 
 pub trait ClientTransport: Send + Sync {

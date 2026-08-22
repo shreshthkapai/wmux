@@ -6,10 +6,11 @@ use crate::{
 use std::{collections::BTreeMap, io, sync::Arc};
 use tokio::{runtime::Handle as TokioHandle, sync::mpsc::error::TryRecvError};
 use wmux_platform::{
-    AcceptedConnection, BoxedIpcStream, ClientTransport, DaemonSpec, Endpoint, PeerIdentity,
-    PlatformError, PlatformErrorKind, PlatformEvent, PlatformFuture, PlatformNotifier,
-    PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend, ServerListener, ServerPlatform,
-    SpawnPane, TerminalBackend, TerminalInput, TerminalModeGuard, TerminalSize, TerminationMode,
+    AcceptedConnection, BoxedIpcStream, ClientTransport, DaemonSpec, Endpoint, JobBackend,
+    JobNotifier, PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformFuture,
+    PlatformNotifier, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend, ServerListener,
+    ServerPlatform, SpawnPane, TerminalBackend, TerminalInput, TerminalModeGuard, TerminalSize,
+    TerminationMode,
 };
 
 const ERROR_PIPE_BUSY_RAW: i32 = 231;
@@ -72,6 +73,10 @@ impl ServerPlatform for WindowsServerPlatform {
             TokioHandle::current(),
             notifier,
         )))
+    }
+
+    fn create_job_backend(&mut self, notifier: JobNotifier) -> PlatformResult<Box<dyn JobBackend>> {
+        Ok(Box::new(crate::job::WindowsJobBackend::new(notifier)))
     }
 }
 

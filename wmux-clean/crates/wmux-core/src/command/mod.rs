@@ -6,10 +6,10 @@ use std::{
 };
 
 use crate::{
-    ClientId, FormatContext, FormatEngine, HookEvent, KeyBinding, KeyCode, KeyTableTarget,
-    OptionScope, OptionTarget, OptionValue, PaneId, ResizeDirection, ResolveContext,
-    ResolvedTarget, ServerState, SessionId, SplitDirection, TargetError, TargetKind,
-    TargetResolver, TargetSpec,
+    ClientId, FormatContext, FormatEngine, HookEvent, JobContinuation, KeyBinding, KeyCode,
+    KeyTableTarget, OptionScope, OptionTarget, OptionValue, PaneId, ResizeDirection,
+    ResolveContext, ResolvedTarget, ServerState, SessionId, SplitDirection, TargetError,
+    TargetKind, TargetResolver, TargetSpec,
 };
 
 mod execute;
@@ -203,6 +203,16 @@ pub enum Command {
         target: Option<TargetSpec>,
         template: String,
     },
+    RunShell {
+        background: bool,
+        command: String,
+    },
+    IfShell {
+        background: bool,
+        shell_command: String,
+        if_true: CommandList,
+        if_false: Option<CommandList>,
+    },
     SetBuffer {
         name: Option<String>,
         data: Vec<u8>,
@@ -370,6 +380,11 @@ pub enum CommandEffect {
         pane: PaneId,
         bytes: Arc<[u8]>,
         bracketed: bool,
+    },
+    StartJob {
+        command: String,
+        background: bool,
+        continuation: JobContinuation,
     },
     Notify {
         event: HookEvent,
@@ -912,6 +927,9 @@ pub(super) fn execute_state_command(
                 },
                 Err(error) => error_result(queued.sequence, error),
             }
+        }
+        Command::RunShell { .. } | Command::IfShell { .. } => {
+            command_ok(queued.sequence, String::new(), None)
         }
         Command::SetBuffer { name, data, .. } => {
             let result = match name {
@@ -1594,6 +1612,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("display"),
     },
     CommandEntry {
+        name: "if-shell",
+        alias: Some("if"),
+    },
+    CommandEntry {
         name: "kill-pane",
         alias: Some("killp"),
     },
@@ -1680,6 +1702,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "rotate-window",
         alias: Some("rotatew"),
+    },
+    CommandEntry {
+        name: "run-shell",
+        alias: Some("run"),
     },
     CommandEntry {
         name: "save-buffer",
@@ -1805,6 +1831,8 @@ pub(super) fn parse_single_command(
         }
         "confirm-before" => parse_confirm_before(argv, depth),
         "display-message" => parse_display_message(argv),
+        "run-shell" => parse_run_shell(argv),
+        "if-shell" => parse_if_shell(argv, depth),
         "set-buffer" => parse_set_buffer(argv),
         "load-buffer" => parse_load_buffer(argv),
         "save-buffer" => parse_save_buffer(argv),
@@ -2098,6 +2126,56 @@ fn parse_display_message(argv: &[String]) -> Result<Command, CommandParseError> 
         target,
         template: positionals.remove(0),
     })
+}
+
+fn parse_run_shell(argv: &[String]) -> Result<Command, CommandParseError> {
+    let (background, positionals) = parse_shell_arguments(argv)?;
+    if positionals.len() != 1 {
+        return Err(CommandParseError::new(
+            "run-shell requires exactly one shell command",
+        ));
+    }
+    Ok(Command::RunShell {
+        background,
+        command: positionals[0].clone(),
+    })
+}
+
+fn parse_if_shell(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
+    let (background, positionals) = parse_shell_arguments(argv)?;
+    if !(2..=3).contains(&positionals.len()) {
+        return Err(CommandParseError::new(
+            "if-shell requires a shell command, true commands, and optional false commands",
+        ));
+    }
+    let if_true = parser::parse_nested_command(&positionals[1..2], depth)?;
+    let if_false = positionals
+        .get(2)
+        .map(|commands| parser::parse_nested_command(std::slice::from_ref(commands), depth))
+        .transpose()?;
+    Ok(Command::IfShell {
+        background,
+        shell_command: positionals[0].clone(),
+        if_true,
+        if_false,
+    })
+}
+
+fn parse_shell_arguments(argv: &[String]) -> Result<(bool, Vec<String>), CommandParseError> {
+    let mut background = false;
+    let mut positionals = Vec::new();
+    let mut options = true;
+    for argument in &argv[1..] {
+        match argument.as_str() {
+            "--" if options => options = false,
+            "-b" if options => background = true,
+            option if options && option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => positionals.push(argument.clone()),
+        }
+    }
+    Ok((background, positionals))
 }
 
 fn parse_set_hook(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
@@ -2993,6 +3071,32 @@ fn format_command(command: &Command) -> String {
             arguments.push(template.clone());
             "display-message"
         }
+        Command::RunShell {
+            background,
+            command,
+        } => {
+            if *background {
+                arguments.push("-b".to_string());
+            }
+            arguments.push(command.clone());
+            "run-shell"
+        }
+        Command::IfShell {
+            background,
+            shell_command,
+            if_true,
+            if_false,
+        } => {
+            if *background {
+                arguments.push("-b".to_string());
+            }
+            arguments.push(shell_command.clone());
+            arguments.push(format_command_list(if_true));
+            if let Some(if_false) = if_false {
+                arguments.push(format_command_list(if_false));
+            }
+            "if-shell"
+        }
         Command::SetBuffer {
             name,
             data,
@@ -3347,6 +3451,31 @@ mod tests {
             "list-buffers extra",
             "delete-buffer -x",
             "paste-buffer -t",
+        ] {
+            assert!(parse_command_text(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn shell_job_commands_parse_foreground_background_and_nested_branches() {
+        assert!(matches!(
+            &parse_command_text("run -b 'printf fast'").unwrap()[0],
+            Command::RunShell { background: true, command } if command == "printf fast"
+        ));
+        let parsed = parse_command_text(
+            "if-shell 'test -f marker' 'display-message yes' 'display-message no'",
+        )
+        .unwrap();
+        assert!(matches!(
+            &parsed[0],
+            Command::IfShell { background: false, shell_command, if_true, if_false: Some(if_false) }
+                if shell_command == "test -f marker" && if_true.len() == 1 && if_false.len() == 1
+        ));
+        for invalid in [
+            "run-shell",
+            "run-shell -x command",
+            "if-shell test",
+            "if-shell test yes no extra",
         ] {
             assert!(parse_command_text(invalid).is_err(), "accepted {invalid:?}");
         }

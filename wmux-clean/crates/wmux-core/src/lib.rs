@@ -5,6 +5,7 @@ pub mod formats;
 pub mod grid;
 pub mod hooks;
 pub mod ids;
+pub mod jobs;
 pub mod keys;
 pub mod layout;
 pub mod options;
@@ -28,6 +29,7 @@ pub use formats::{FormatContext, FormatEngine, FormatError, MAX_FORMAT_BYTES, MA
 pub use grid::{Cell, Color, Grid, Line, Style};
 pub use hooks::{HookError, HookEvent, HookStore, MAX_HOOK_DEPTH, MAX_HOOK_REGISTRATIONS};
 pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, WinlinkId};
+pub use jobs::{Job, JobContinuation, JobId, JobStore, MAX_JOBS, MAX_JOB_OUTPUT_BYTES};
 pub use keys::{
     route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
     KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTableTarget, KeyTables,

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod ipc;
+mod job;
 mod platform;
 mod process;
 mod pty;

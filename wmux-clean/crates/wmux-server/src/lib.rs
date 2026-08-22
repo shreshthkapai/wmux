@@ -23,14 +23,16 @@ use wmux_core::{
     build_window_scene_with_client_overlay, build_window_structure, execute, parse_command_text,
     render_damage_from_structure, render_diff_scene_with_capabilities, route_key, BareKey,
     ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue, CommandSource,
-    CopyMode, CopyModeResult, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
-    PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
-    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
+    CopyMode, CopyModeResult, InputMode, InputRoute, JobContinuation, JobId, KeyCode, KeyEvent,
+    KeyModifiers, Line, PaneId, PaneSceneOverrides, PaneViewport, QueuedCommand,
+    RenderCapabilities, RenderState, RetainedPaneFrame, ServerEvent, ServerState, StructuralScene,
+    Style,
 };
 use wmux_platform::{
-    AcceptedConnection, BoxedIpcStream, MouseButton, MouseEvent, MouseEventKind, PeerIdentity,
-    PlatformError, PlatformErrorKind, PlatformEvent, PlatformPaneId, PlatformRequest, PtyBackend,
-    ServerPlatform, SpawnPane, TerminalSize, TerminationMode,
+    AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
+    MouseEventKind, PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformJobId,
+    PlatformPaneId, PlatformRequest, PtyBackend, ServerPlatform, SpawnJob, SpawnPane, TerminalSize,
+    TerminationMode,
 };
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
@@ -88,10 +90,19 @@ async fn run_async(mut platform: Box<dyn ServerPlatform>, config: WmuxConfig) ->
     let pty_backend = platform
         .create_pty_backend(notifier)
         .map_err(PlatformError::into_io)?;
+    let notify_owner = owner_tx.clone();
+    let job_notifier = Arc::new(move |_| {
+        let _ = notify_owner.send(OwnerMessage::PlatformReady);
+    });
+    let job_backend = platform
+        .create_job_backend(job_notifier)
+        .map_err(PlatformError::into_io)?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let state_owner = thread::Builder::new()
         .name("wmux-state-owner".to_string())
-        .spawn(move || ServerOwner::new(config, pty_backend, shutdown_tx).run(owner_rx))?;
+        .spawn(move || {
+            ServerOwner::new(config, pty_backend, job_backend, shutdown_tx).run(owner_rx)
+        })?;
 
     eprintln!("wmux clean server listening on {endpoint_name}");
     let mut connections = JoinSet::new();
@@ -502,8 +513,11 @@ struct Runtime {
     resize_repaint_holds: BTreeMap<PaneId, ResizeRepaintHold>,
     history_growth: Vec<(PaneId, u64)>,
     pty_backend: Box<dyn PtyBackend>,
+    job_backend: Box<dyn JobBackend>,
     #[cfg(test)]
     test_platform: TestPtyHandle,
+    #[cfg(test)]
+    test_jobs: TestJobHandle,
     #[cfg(test)]
     test_inputs: Vec<(PaneId, Vec<u8>)>,
 }
@@ -545,6 +559,79 @@ impl TestPtyHandle {
 #[cfg(test)]
 struct TestPtyBackend {
     state: TestPtyHandle,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestJobState {
+    requests: Vec<JobRequest>,
+    events: BTreeMap<PlatformJobId, VecDeque<JobEvent>>,
+    notifier: Option<wmux_platform::JobNotifier>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestJobHandle(Arc<std::sync::Mutex<TestJobState>>);
+
+#[cfg(test)]
+impl TestJobHandle {
+    fn emit(&self, job: PlatformJobId, event: JobEvent) {
+        let notifier = {
+            let mut state = self.0.lock().unwrap();
+            state.events.entry(job).or_default().push_back(event);
+            state.notifier.clone()
+        };
+        if let Some(notifier) = notifier {
+            notifier(job);
+        }
+    }
+
+    fn requests(&self) -> Vec<JobRequest> {
+        self.0.lock().unwrap().requests.clone()
+    }
+    fn set_notifier(&self, notifier: wmux_platform::JobNotifier) {
+        self.0.lock().unwrap().notifier = Some(notifier);
+    }
+}
+
+#[cfg(test)]
+struct TestJobBackend {
+    state: TestJobHandle,
+}
+
+#[cfg(test)]
+impl TestJobBackend {
+    fn pair() -> (Self, TestJobHandle) {
+        let state = TestJobHandle::default();
+        (
+            Self {
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+}
+
+#[cfg(test)]
+impl JobBackend for TestJobBackend {
+    fn submit(&mut self, request: JobRequest) -> wmux_platform::PlatformResult<()> {
+        self.state.0.lock().unwrap().requests.push(request);
+        Ok(())
+    }
+
+    fn try_next_event(
+        &mut self,
+        job: PlatformJobId,
+    ) -> wmux_platform::PlatformResult<Option<JobEvent>> {
+        Ok(self
+            .state
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .get_mut(&job)
+            .and_then(VecDeque::pop_front))
+    }
 }
 
 #[cfg(test)]
@@ -590,7 +677,11 @@ struct OutputResult {
 }
 
 impl Runtime {
-    fn with_backend(config: WmuxConfig, pty_backend: Box<dyn PtyBackend>) -> Self {
+    fn with_backends(
+        config: WmuxConfig,
+        pty_backend: Box<dyn PtyBackend>,
+        job_backend: Box<dyn JobBackend>,
+    ) -> Self {
         Self {
             state: ServerState::new(),
             queue: CommandQueue::default(),
@@ -601,8 +692,11 @@ impl Runtime {
             resize_repaint_holds: BTreeMap::new(),
             history_growth: Vec::new(),
             pty_backend,
+            job_backend,
             #[cfg(test)]
             test_platform: TestPtyHandle::default(),
+            #[cfg(test)]
+            test_jobs: TestJobHandle::default(),
             #[cfg(test)]
             test_inputs: Vec::new(),
         }
@@ -611,8 +705,10 @@ impl Runtime {
     #[cfg(test)]
     fn with_config(config: WmuxConfig) -> Self {
         let (backend, handle) = TestPtyBackend::pair();
-        let mut runtime = Self::with_backend(config, Box::new(backend));
+        let (job_backend, job_handle) = TestJobBackend::pair();
+        let mut runtime = Self::with_backends(config, Box::new(backend), Box::new(job_backend));
         runtime.test_platform = handle;
+        runtime.test_jobs = job_handle;
         runtime
     }
 
@@ -1278,10 +1374,11 @@ impl ServerOwner {
     fn new(
         config: WmuxConfig,
         pty_backend: Box<dyn PtyBackend>,
+        job_backend: Box<dyn JobBackend>,
         shutdown_tx: oneshot::Sender<()>,
     ) -> Self {
         let mut owner = Self {
-            runtime: Runtime::with_backend(config, pty_backend),
+            runtime: Runtime::with_backends(config, pty_backend, job_backend),
             clients: BTreeMap::new(),
             pending_pastes: VecDeque::new(),
             started_at: Instant::now(),
@@ -1354,6 +1451,9 @@ impl ServerOwner {
             }
 
             if self.process_command_queue(COMMANDS_PER_TURN) {
+                did_work = true;
+            }
+            if self.process_job_events(CONTROL_EVENTS_PER_TURN) {
                 did_work = true;
             }
             if self.process_pending_pastes() {
@@ -1682,6 +1782,9 @@ impl ServerOwner {
                 None if outcome.ok => Ok(outcome.message),
                 None => Err(outcome.message),
             };
+            if self.runtime.state.jobs.owns_sequence(queued.sequence) {
+                continue;
+            }
             let completion = self.runtime.queue.finish(queued, result);
             if !terminal_response_sent {
                 if let Some(completion) = completion {
@@ -1693,6 +1796,135 @@ impl ServerOwner {
             }
         }
         processed
+    }
+
+    fn process_job_events(&mut self, budget: usize) -> bool {
+        let jobs = self.runtime.state.jobs.ids().collect::<Vec<_>>();
+        let mut processed = false;
+        let mut remaining = budget;
+        for job in jobs {
+            while remaining > 0 {
+                let event = match self
+                    .runtime
+                    .job_backend
+                    .try_next_event(PlatformJobId::new(job.raw()))
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        eprintln!("shell job backend error for {}: {error}", job.raw());
+                        break;
+                    }
+                };
+                let Some(event) = event else { break };
+                processed = true;
+                remaining -= 1;
+                match event {
+                    JobEvent::Output { bytes, .. } => {
+                        self.runtime.state.jobs.append_output(job, &bytes);
+                    }
+                    JobEvent::Exited { exit_code, .. } => {
+                        self.runtime.state.jobs.mark_exited(job, exit_code);
+                    }
+                    JobEvent::BackendError { error, .. } => {
+                        self.runtime.state.jobs.append_output(
+                            job,
+                            format!("wmux job backend error: {error}\n").as_bytes(),
+                        );
+                    }
+                    JobEvent::Closed { .. } => self.finish_job(job),
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        processed
+    }
+
+    fn finish_job(&mut self, job_id: JobId) {
+        let Some(job) = self.runtime.state.jobs.finish(job_id) else {
+            return;
+        };
+        let exit_code = job.exit_code();
+        let success = exit_code == Some(0);
+        let mut output = String::from_utf8_lossy(job.output()).into_owned();
+        if job.output_truncated() {
+            output.push_str("\n[wmux: job output truncated at 1048576 bytes]");
+        }
+
+        if let Some(owner) = job.owner {
+            if let JobContinuation::IfShell { if_true, if_false } = &job.continuation {
+                let branch = if success {
+                    Some(if_true)
+                } else {
+                    if_false.as_ref()
+                };
+                if let Some(branch) = branch {
+                    if let Err(error) = self
+                        .runtime
+                        .queue
+                        .insert_after_active(&owner, branch.clone())
+                    {
+                        eprintln!("wmux if-shell continuation error: {error}");
+                    }
+                }
+            }
+            if let Err(error) = self.insert_hook_notification(
+                &owner,
+                wmux_core::HookEvent::JobFinished,
+                wmux_core::OptionTarget::Server,
+            ) {
+                eprintln!("wmux job-finished hook error: {error}");
+            }
+            let result = match job.continuation {
+                JobContinuation::RunShell if success => Ok(output),
+                JobContinuation::RunShell => Err(job_failure(exit_code, &output)),
+                JobContinuation::IfShell { .. } => Ok(String::new()),
+            };
+            if let Some(completion) = self.runtime.queue.finish(owner, result) {
+                self.send_command_completion(completion);
+            }
+            return;
+        }
+
+        if let JobContinuation::IfShell { if_true, if_false } = job.continuation {
+            let branch = if success { Some(if_true) } else { if_false };
+            if let Some(branch) = branch {
+                if let Err(error) = self.runtime.queue.push_list(job.client, branch, job.source) {
+                    eprintln!("wmux background if-shell continuation error: {error}");
+                }
+            }
+        } else if !success {
+            eprintln!("{}", job_failure(exit_code, &output));
+        }
+        self.enqueue_hook_notification(
+            job.source,
+            wmux_core::HookEvent::JobFinished,
+            wmux_core::OptionTarget::Server,
+        );
+    }
+
+    fn enqueue_hook_notification(
+        &mut self,
+        source: CommandSource,
+        event: wmux_core::HookEvent,
+        target: wmux_core::OptionTarget,
+    ) {
+        let depth = match source {
+            CommandSource::Hook { depth } if depth >= wmux_core::MAX_HOOK_DEPTH => return,
+            CommandSource::Hook { depth } => depth + 1,
+            _ => 1,
+        };
+        let path = self.runtime.state.option_path(target);
+        for commands in self.runtime.state.hooks.resolve(&path, event).to_vec() {
+            if let Err(error) = self.runtime.queue.push_list(
+                ClientId::new(0),
+                commands,
+                CommandSource::Hook { depth },
+            ) {
+                eprintln!("wmux hook queue error: {error}");
+            }
+        }
     }
 
     fn process_pending_pastes(&mut self) -> bool {
@@ -1901,6 +2133,36 @@ impl ServerOwner {
                     suffix_sent: false,
                     bracketed,
                 });
+                Ok(false)
+            }
+            CommandEffect::StartJob {
+                command,
+                background,
+                continuation,
+            } => {
+                let job = self
+                    .runtime
+                    .state
+                    .jobs
+                    .start(command.clone(), background, continuation, queued.clone())
+                    .map_err(io::Error::other)?;
+                let environment = self
+                    .runtime
+                    .config
+                    .pane_environment(job.raw())
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect();
+                let request = JobRequest::Spawn(SpawnJob {
+                    job: PlatformJobId::new(job.raw()),
+                    command,
+                    cwd: std::env::current_dir().ok(),
+                    environment,
+                });
+                if let Err(error) = self.runtime.job_backend.submit(request) {
+                    self.runtime.state.jobs.finish(job);
+                    return Err(error.into_io());
+                }
                 Ok(false)
             }
             CommandEffect::Notify { event, target } => {
@@ -2407,6 +2669,11 @@ impl ServerOwner {
         }
         self.shutdown = ShutdownState::Draining;
         self.runtime.shutdown_platform_panes();
+        for job in self.runtime.state.jobs.ids().collect::<Vec<_>>() {
+            let _ = self.runtime.job_backend.submit(JobRequest::Terminate {
+                job: PlatformJobId::new(job.raw()),
+            });
+        }
 
         let clients = self.clients.keys().copied().collect::<Vec<_>>();
         let mut failed = Vec::new();
@@ -2532,6 +2799,19 @@ fn load_source_commands(
             Arc::<[PathBuf]>::from(nested_ancestors),
         )
         .map_err(io::Error::other)
+}
+
+fn job_failure(exit_code: Option<u32>, output: &str) -> String {
+    let status = exit_code.map_or_else(
+        || "unknown status".to_string(),
+        |code| format!("status {code}"),
+    );
+    let diagnostic = output.trim_end();
+    if diagnostic.is_empty() {
+        format!("shell command failed with {status}")
+    } else {
+        format!("shell command failed with {status}: {diagnostic}")
+    }
 }
 
 fn read_buffer_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -2849,8 +3129,8 @@ mod tests {
     use super::{
         collect_pane_events, read_async_message, run_with_platform_and_config, write_async_message,
         write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause,
-        Runtime, ServerOwner, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN,
-        PER_PANE_OUTPUT_TIME,
+        Runtime, ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
+        COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME,
     };
     use std::{
         thread,
@@ -2863,10 +3143,10 @@ mod tests {
         OptionTarget, OptionValue, ServerEvent, SplitDirection,
     };
     use wmux_platform::{
-        AcceptedConnection, Endpoint, MouseButton, MouseEvent, MouseEventKind, MouseModifiers,
-        PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformFuture,
-        PlatformNotifier, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend,
-        ServerListener, ServerPlatform, TerminalSize,
+        AcceptedConnection, Endpoint, JobBackend, JobNotifier, MouseButton, MouseEvent,
+        MouseEventKind, MouseModifiers, PeerIdentity, PlatformError, PlatformErrorKind,
+        PlatformEvent, PlatformFuture, PlatformNotifier, PlatformPaneId, PlatformRequest,
+        PlatformResult, PtyBackend, ServerListener, ServerPlatform, TerminalSize,
     };
     use wmux_protocol::{Message, TerminalCapabilities, VERSION};
     use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
@@ -2902,6 +3182,7 @@ mod tests {
     struct MemoryServerPlatform {
         listener: Option<MemoryListener>,
         pty: TestPtyHandle,
+        jobs: TestJobHandle,
     }
 
     impl ServerPlatform for MemoryServerPlatform {
@@ -2925,6 +3206,16 @@ mod tests {
             self.pty.set_notifier(notifier);
             Ok(Box::new(TestPtyBackend {
                 state: self.pty.clone(),
+            }))
+        }
+
+        fn create_job_backend(
+            &mut self,
+            notifier: JobNotifier,
+        ) -> PlatformResult<Box<dyn JobBackend>> {
+            self.jobs.set_notifier(notifier);
+            Ok(Box::new(TestJobBackend {
+                state: self.jobs.clone(),
             }))
         }
     }
@@ -2956,6 +3247,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
         let owner = PeerIdentity::from_token(b"memory-owner");
         let pty = TestPtyHandle::default();
+        let jobs = TestJobHandle::default();
         (
             MemoryServerPlatform {
                 listener: Some(MemoryListener {
@@ -2964,6 +3256,7 @@ mod tests {
                     accepted: accepted_rx,
                 }),
                 pty: pty.clone(),
+                jobs,
             },
             MemoryConnector {
                 accepted: accepted_tx,
@@ -3156,6 +3449,107 @@ mod tests {
         assert_eq!(
             owner.runtime.state.paste_buffers.len(),
             usize::from(wmux_core::MAX_HOOK_DEPTH) + 1
+        );
+    }
+
+    #[test]
+    fn foreground_jobs_pause_only_the_originating_invocation_and_resume_in_place() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let (tx, mut rx) = mpsc::channel(8);
+        owner
+            .clients
+            .insert(client, ClientView::new(tx, TerminalCapabilities::default()));
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("run-shell 'echo ready'; set-option -g @after resumed").unwrap(),
+            CommandSource::ClientRequest,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner
+            .runtime
+            .state
+            .option(OptionTarget::Server, "@after")
+            .is_err());
+        let requests = owner.runtime.test_jobs.requests();
+        let wmux_platform::JobRequest::Spawn(spawn) = &requests[0] else {
+            panic!("job spawns")
+        };
+        assert_eq!(spawn.command, "echo ready");
+        let job = spawn.job;
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Output {
+                job,
+                bytes: b"ready\r\n".to_vec(),
+            },
+        );
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(0),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@after")
+                .unwrap(),
+            OptionValue::String("resumed".to_string())
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::CommandOk(message))) if message == "ready\r\n"
+        ));
+    }
+
+    #[test]
+    fn if_shell_selects_exactly_one_serialized_branch() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        owner.enqueue_command_list(
+            client,
+            parse_command_text(
+                "if-shell false 'set-option -g @branch true' 'set-option -g @branch false'",
+            )
+            .unwrap(),
+            CommandSource::KeyBinding,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let wmux_platform::JobRequest::Spawn(spawn) = &owner.runtime.test_jobs.requests()[0] else {
+            panic!("job spawns")
+        };
+        let job = spawn.job;
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(1),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@branch")
+                .unwrap(),
+            OptionValue::String("false".to_string())
         );
     }
 

@@ -1,6 +1,7 @@
 pub mod conpty;
 pub mod console;
 pub mod daemon;
+mod job;
 pub mod pipe;
 pub mod platform;
 

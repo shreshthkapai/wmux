@@ -6,9 +6,9 @@ use crate::{
 use std::path::PathBuf;
 use tokio::runtime::Handle as TokioHandle;
 use wmux_platform::{
-    AcceptedConnection, BoxedIpcStream, ClientTransport, DaemonSpec, Endpoint, PeerIdentity,
-    PlatformError, PlatformErrorKind, PlatformFuture, PlatformNotifier, PlatformResult, PtyBackend,
-    ServerListener, ServerPlatform,
+    AcceptedConnection, BoxedIpcStream, ClientTransport, DaemonSpec, Endpoint, JobBackend,
+    JobNotifier, PeerIdentity, PlatformError, PlatformErrorKind, PlatformFuture, PlatformNotifier,
+    PlatformResult, PtyBackend, ServerListener, ServerPlatform,
 };
 
 pub struct UnixServerPlatform {
@@ -54,6 +54,10 @@ impl ServerPlatform for UnixServerPlatform {
             TokioHandle::current(),
             notifier,
         )))
+    }
+
+    fn create_job_backend(&mut self, notifier: JobNotifier) -> PlatformResult<Box<dyn JobBackend>> {
+        Ok(Box::new(crate::job::UnixJobBackend::new(notifier)))
     }
 }
 
