@@ -49,6 +49,28 @@ server, and verify endpoint cleanup. The Linux loaded suite additionally
 exercises the reference-model child descriptor discipline: pane, job, and
 daemon children cannot inherit unrelated server descriptors.
 
+### Phase 8 beta-core evidence
+
+Phase 8 keeps the 16-case protocol-v7 portable suite unchanged and adds an
+external deterministic stress gate through the real server loop. On
+2026-08-22, two Windows runs and two Linux runs produced conformance aggregate
+`d5670ad858ef5735` and stress aggregate `d537f5686435cc2e` every time.
+`EXPECTED_DIFFERENCES` remains empty.
+
+The native lifecycle suites now use isolated endpoints and real ConPTY/PTY
+processes to cover abrupt client loss, reconnect and attach, detach with
+background output, reattach, descendant cleanup, endpoint removal, and restart
+on the same endpoint. Windows passed 350 workspace tests; Linux passed 354.
+The conformance executable, Unix adapter, server, and client compile for both
+Apple targets, but no native macOS runner has executed this commit. Phase 8 is
+therefore recorded as **Beta Core implementation complete; native macOS
+runtime gate pending**.
+
+The exact automation/manual statuses and discrepancy classifications are in
+[compatibility-matrix.md](compatibility-matrix.md) and
+[known-differences.md](known-differences.md). Commands, scenario limits, and
+fingerprints are in [beta-core-gate.md](beta-core-gate.md).
+
 ### Phase 6 portable contract evidence
 
 The portable suite contains 14 cases and produces aggregate fingerprint
@@ -84,11 +106,11 @@ reference comparison limits.
 
 | Contract | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| Portable semantic suite | Enforced | Enforced in CI | Enforced in CI |
-| PTY input/output | ConPTY IOCP test | Native PTY tests verified | Native PTY CI gate configured |
-| Process-tree cleanup | Job Object descendant test | Process-group descendant tests verified | Process-group CI gate configured |
-| Native transport | Named-pipe tests | AF_UNIX and `SO_PEERCRED` tests verified | AF_UNIX and `getpeereid` CI gate configured |
-| Full native lifecycle | Windows protocol lifecycle | Real Linux socket/PTY lifecycle verified | Native lifecycle CI gate configured |
+| Portable semantic suite | `verified` | `verified` | `compile-only` |
+| PTY input/output | `verified` | `verified` | `compile-only` |
+| Process-tree cleanup | `verified` | `verified` | `manual-pending` |
+| Native transport | `verified` | `verified` | `compile-only` |
+| Full native lifecycle | `verified` | `verified` | `manual-pending` |
 
 ### Phase 6 Unix lifecycle evidence
 

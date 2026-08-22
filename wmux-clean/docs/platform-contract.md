@@ -216,3 +216,32 @@ terminal close event. Unix jobs use `/bin/sh -c`, a dedicated process group,
 combined bounded output, group termination, and the same descriptor sanitation
 as pane and daemon children. Shared job IDs, limits, command suspension,
 capture, hooks, and control records remain OS-neutral.
+
+## Phase 8 verification evidence
+
+The Phase 8 local gate on 2026-08-22 produced:
+
+- 350 Windows and 354 Linux workspace tests with strict workspace clippy;
+- identical 16-case portable aggregate `d5670ad858ef5735` twice on both hosts;
+- identical full stress aggregate `d537f5686435cc2e` twice on both hosts;
+- isolated real Windows and Linux lifecycle tests covering abrupt disconnect,
+  authoritative reattach, native descendant cleanup, endpoint removal, and
+  restart on the same endpoint;
+- exact native terminal-mode round-trip tests plus shared client tests proving
+  one guard release on every recoverable attach exit;
+- 30-second sanitizer fuzz smoke for command, protocol, and terminal input on
+  Linux with no crash artifact;
+- Intel and Apple Silicon compile checks for conformance, the Unix adapter,
+  server, and client; and
+- the unchanged Windows full release performance gate.
+
+Stress exposed one shared ordering defect: close after a resize hold could omit
+deferred final output. The server now publishes that frame before close and a
+focused regression protects the ordering contract. Client error cleanup and
+the Windows crate's cross-target gate were also tightened. These changes do
+not move native state into shared crates or alter the frozen platform API.
+
+Actual native macOS execution remains pending. The authoritative evidence and
+status vocabulary are recorded in [beta-core-gate.md](beta-core-gate.md),
+[compatibility-matrix.md](compatibility-matrix.md), and
+[known-differences.md](known-differences.md).

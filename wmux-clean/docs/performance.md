@@ -339,3 +339,35 @@ the pane-output allocation through encoding and slices emitted records to 64
 KiB, while the server reserves reply capacity inside its existing bounded
 per-client queue. Phase 7 shell jobs execute outside the state-owner loop and
 return bounded chunks through the unchanged semantic platform dispatch seam.
+
+## Phase 8 Beta-Core Performance Gate
+
+The Phase 8 Windows full release gate on 2026-08-22 passed every existing
+threshold without changing a workload or floor. Selected results were:
+
+| Scenario | Result |
+| --- | ---: |
+| `parser-codex` throughput | 143.36 MiB/s |
+| `parser-claude` throughput | 144.60 MiB/s |
+| `frame-codex` p95 | 61.0 us |
+| `frame-claude` p95 | 85.2 us |
+| `hybrid-frame-codex` p95 | 60.1 us |
+| `hybrid-frame-claude` p95 | 79.9 us |
+| `scene-frame-codex` p95 | 168.9 us |
+| `idle-input-render` p95 | 3.1 us |
+| `history-resize-100k` p95 | 22.8 us |
+| `split-storm` p95 | 38.2 us |
+| `detach-backlog` throughput | 132.44 MiB/s |
+| `multiple-clients` p95 | 158.8 us |
+| `key-unbound` | 161,439,524 operations/second |
+| `key-prefix-binding` | 57,833,622 operations/second |
+| `command-queue` | 12,535,130 operations/second |
+| `command-text` | 721,123 operations/second |
+| `platform-dispatch` | 149,876,053 operations/second |
+
+The detached-output workload ended with queue depth zero and 1.53 MiB peak
+live memory; eight-client rendering peaked at 1.43 MiB with queue depth eight.
+The stress gate separately verifies correctness and bounds under 32 panes, 32
+clients, a stalled client, 100,000 history lines, and a 16 MiB paste. Exact
+Phase 8 commands and fingerprints are recorded in
+[beta-core-gate.md](beta-core-gate.md).
