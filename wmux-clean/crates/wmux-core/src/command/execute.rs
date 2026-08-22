@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-use std::borrow::Borrow;
+use std::{borrow::Borrow, sync::Arc};
 
 use super::{Command, CommandEffect, CommandOutcome, QueuedCommand, MAX_SEND_BYTES};
 use crate::ServerState;
@@ -55,6 +55,15 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
                     commands: commands.clone(),
                 });
             }
+            Command::SourceFile {
+                path,
+                depth,
+                ancestors,
+            } => effects.push(CommandEffect::SourceFile {
+                path: path.clone(),
+                depth: *depth,
+                ancestors: Arc::clone(ancestors),
+            }),
             Command::NewSession { attach, .. } => {
                 if let Some(pane) = result.attached_pane {
                     effects.push(CommandEffect::EnsurePane { pane });

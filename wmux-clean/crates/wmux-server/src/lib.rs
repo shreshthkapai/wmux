@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::OpenOptions,
-    io::{self, IoSlice, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, IoSlice, Read, Write},
+    path::{Path, PathBuf},
     process,
     sync::{
         mpsc::{self, Receiver, TryRecvError as StdTryRecvError},
@@ -54,6 +55,7 @@ const PER_PANE_OUTPUT_BYTES: usize = 64 * 1024;
 const PER_PANE_OUTPUT_TIME: Duration = Duration::from_millis(1);
 const OUTPUT_ROUND_TIME: Duration = Duration::from_millis(4);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SOURCE_FILE_BYTES: usize = 1024 * 1024;
 
 pub fn run_with_platform(platform: Box<dyn ServerPlatform>) -> io::Result<()> {
     run_with_platform_and_config(platform, load_config())
@@ -1244,23 +1246,49 @@ impl ServerOwner {
         pty_backend: Box<dyn PtyBackend>,
         shutdown_tx: oneshot::Sender<()>,
     ) -> Self {
-        Self {
+        let mut owner = Self {
             runtime: Runtime::with_backend(config, pty_backend),
             clients: BTreeMap::new(),
             started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: Some(shutdown_tx),
-        }
+        };
+        owner.enqueue_startup_config();
+        owner
     }
 
     #[cfg(test)]
     fn new_test(config: WmuxConfig) -> Self {
-        Self {
+        let mut owner = Self {
             runtime: Runtime::with_config(config),
             clients: BTreeMap::new(),
             started_at: Instant::now(),
             shutdown: ShutdownState::Running,
             shutdown_tx: None,
+        };
+        owner.enqueue_startup_config();
+        owner
+    }
+
+    fn enqueue_startup_config(&mut self) {
+        let source = self.runtime.config.command_source().text();
+        if source.trim().is_empty() {
+            return;
+        }
+        match parse_command_text(source) {
+            Ok(commands) => {
+                if let Err(error) =
+                    self.runtime
+                        .queue
+                        .push_list(ClientId::new(0), commands, CommandSource::Config)
+                {
+                    eprintln!("wmux startup config queue error: {error}");
+                }
+            }
+            Err(error) => eprintln!(
+                "wmux config command error at {}: {error}",
+                config_path().display()
+            ),
         }
     }
 
@@ -1723,10 +1751,28 @@ impl ServerOwner {
                 self.begin_shutdown(requester, response);
                 Ok(true)
             }
+            CommandEffect::SourceFile {
+                path,
+                depth,
+                ancestors,
+            } => {
+                let commands = load_source_commands(&path, depth, &ancestors)?;
+                self.runtime
+                    .queue
+                    .insert_after_active(queued, commands)
+                    .map_err(io::Error::other)?;
+                Ok(false)
+            }
         }
     }
 
     fn send_command_completion(&mut self, completion: wmux_core::CommandCompletion) {
+        if matches!(completion.source, CommandSource::Config) {
+            if let Err(message) = completion.result {
+                eprintln!("wmux config command error: {message}");
+            }
+            return;
+        }
         match completion.result {
             Ok(message) if completion.requires_reply() => {
                 self.send_critical(completion.client, Message::CommandOk(message));
@@ -2233,6 +2279,62 @@ impl ServerOwner {
     }
 }
 
+fn load_source_commands(
+    requested: &Path,
+    depth: u8,
+    ancestors: &[PathBuf],
+) -> io::Result<CommandList> {
+    let resolved = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else if let Some(parent) = ancestors.last().and_then(|path| path.parent()) {
+        parent.join(requested)
+    } else {
+        std::env::current_dir()?.join(requested)
+    };
+    let canonical = fs::canonicalize(&resolved).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("source-file {}: {error}", resolved.display()),
+        )
+    })?;
+    if ancestors.contains(&canonical) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source-file cycle at {}", canonical.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(&canonical)?
+        .take((MAX_SOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SOURCE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source-file {} exceeds 1048576 bytes", canonical.display()),
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source-file {} is not UTF-8: {error}", canonical.display()),
+        )
+    })?;
+    let parsed = parse_command_text(text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source-file {}: {error}", canonical.display()),
+        )
+    })?;
+    let mut nested_ancestors = ancestors.to_vec();
+    nested_ancestors.push(canonical);
+    parsed
+        .with_source_context(
+            depth.saturating_add(1),
+            Arc::<[PathBuf]>::from(nested_ancestors),
+        )
+        .map_err(io::Error::other)
+}
+
 fn render_full_for_client(
     runtime: &mut Runtime,
     client: ClientId,
@@ -2513,10 +2615,10 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::mpsc;
-    use wmux_config::WmuxConfig;
+    use wmux_config::{parse_config, WmuxConfig};
     use wmux_core::{
         parse_command_text, Command, CommandList, CommandSource, KeyBinding, KeyCode, KeyTableName,
-        ServerEvent, SplitDirection,
+        OptionTarget, OptionValue, ServerEvent, SplitDirection,
     };
     use wmux_platform::{
         AcceptedConnection, Endpoint, MouseButton, MouseEvent, MouseEventKind, MouseModifiers,
@@ -2627,6 +2729,77 @@ mod tests {
             },
             pty,
         )
+    }
+
+    #[test]
+    fn startup_config_commands_use_the_shared_serialized_queue() {
+        let config = parse_config(
+            "agent_compat = true\nset-option -g buffer-limit 60\nset-option -g @source config\n",
+        )
+        .unwrap();
+        let mut owner = ServerOwner::new_test(config);
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "buffer-limit")
+                .unwrap(),
+            OptionValue::Number(60)
+        );
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@source")
+                .unwrap(),
+            OptionValue::String("config".to_string())
+        );
+    }
+
+    #[test]
+    fn source_file_parses_whole_file_and_inserts_commands_in_place() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "wmux-source-file-{}-{nonce}.wmux",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "set-option -g @first loaded\nset-option -g @second after\n",
+        )
+        .unwrap();
+
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        owner.enqueue_command_list(
+            client,
+            parse_command_text(&format!("source-file '{}'", path.display())).unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@first")
+                .unwrap(),
+            OptionValue::String("loaded".to_string())
+        );
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .option(OptionTarget::Server, "@second")
+                .unwrap(),
+            OptionValue::String("after".to_string())
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {

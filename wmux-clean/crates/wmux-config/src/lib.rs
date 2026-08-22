@@ -12,6 +12,27 @@ pub struct WmuxConfig {
     pub agent_compat: bool,
     pub agent_ui: AgentUi,
     pub pane_env: BTreeMap<String, String>,
+    command_source: ConfigCommandSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigCommandSource {
+    text: String,
+    first_line: usize,
+}
+
+impl ConfigCommandSource {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn first_line(&self) -> usize {
+        self.first_line
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +48,10 @@ impl Default for WmuxConfig {
             agent_compat: true,
             agent_ui: AgentUi::Plain,
             pane_env: agent_env(AgentUi::Plain),
+            command_source: ConfigCommandSource {
+                text: String::new(),
+                first_line: 1,
+            },
         }
     }
 }
@@ -56,6 +81,10 @@ impl WmuxConfig {
                 .or_insert_with(|| format!("%{pane_id}"));
         }
         env.into_iter().collect()
+    }
+
+    pub fn command_source(&self) -> &ConfigCommandSource {
+        &self.command_source
     }
 }
 
@@ -103,16 +132,25 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
     let mut agent_compat = None;
     let mut agent_ui = None;
     let mut explicit_env = BTreeMap::new();
+    let mut command_text = String::with_capacity(input.len());
 
     for (line_index, raw_line) in input.lines().enumerate() {
         let line = strip_comment(raw_line).trim();
         if line.is_empty() {
+            command_text.push('\n');
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("line {}: expected key = value", line_index + 1));
+            command_text.push_str(raw_line);
+            command_text.push('\n');
+            continue;
         };
         let key = key.trim();
+        if key.chars().any(char::is_whitespace) {
+            command_text.push_str(raw_line);
+            command_text.push('\n');
+            continue;
+        }
         let value = unquote(value.trim()).to_string();
         if key == "agent_compat" {
             agent_compat = Some(parse_bool(&value).ok_or_else(|| {
@@ -137,6 +175,7 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
         } else {
             return Err(format!("line {}: unknown option {key}", line_index + 1));
         }
+        command_text.push('\n');
     }
 
     let agent_compat = agent_compat.unwrap_or(true);
@@ -151,6 +190,10 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
         agent_compat,
         agent_ui,
         pane_env,
+        command_source: ConfigCommandSource {
+            text: command_text,
+            first_line: 1,
+        },
     })
 }
 
@@ -314,5 +357,28 @@ mod tests {
         assert!(env
             .iter()
             .any(|(key, value)| key == "TMUX_PANE" && value == "%7"));
+    }
+
+    #[test]
+    fn functional_lines_are_retained_with_original_source_lines() {
+        let config = parse_config(
+            "agent_compat = true\n\
+             set-option -g buffer-limit 60\n\
+             # a comment\n\
+             bind-key q display-message '#{session_name}'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.command_source().text(),
+            "\nset-option -g buffer-limit 60\n\nbind-key q display-message '#{session_name}'\n"
+        );
+        assert_eq!(config.command_source().first_line(), 1);
+    }
+
+    #[test]
+    fn invalid_bootstrap_assignment_is_not_misclassified_as_a_command() {
+        let error = parse_config("agent_compat = maybe\n").unwrap_err();
+        assert_eq!(error, "line 1: agent_compat must be true or false");
     }
 }

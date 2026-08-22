@@ -1,6 +1,7 @@
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -23,6 +24,7 @@ pub use parser::{
 const MAX_CONFIRM_PROMPT_BYTES: usize = 4 * 1024;
 const MAX_SEND_BYTES: usize = 1024 * 1024;
 const MAX_SEND_REPEAT: u16 = 10_000;
+pub const MAX_SOURCE_DEPTH: u8 = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandList(Arc<[Command]>);
@@ -45,6 +47,32 @@ impl CommandList {
 
     pub fn iter(&self) -> std::slice::Iter<'_, Command> {
         self.0.iter()
+    }
+
+    pub fn with_source_context(
+        &self,
+        depth: u8,
+        ancestors: Arc<[PathBuf]>,
+    ) -> Result<Self, CommandParseError> {
+        if depth > MAX_SOURCE_DEPTH {
+            return Err(CommandParseError::new(
+                "source-file depth exceeds 16 levels",
+            ));
+        }
+        Self::new(
+            self.0
+                .iter()
+                .cloned()
+                .map(|command| match command {
+                    Command::SourceFile { path, .. } => Command::SourceFile {
+                        path,
+                        depth,
+                        ancestors: Arc::clone(&ancestors),
+                    },
+                    command => command,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -161,6 +189,11 @@ pub enum Command {
         target: Option<TargetSpec>,
         template: String,
     },
+    SourceFile {
+        path: PathBuf,
+        depth: u8,
+        ancestors: Arc<[PathBuf]>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +270,7 @@ impl CommandCompletion {
 pub enum CommandSource {
     ClientRequest,
     KeyBinding,
+    Config,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,6 +306,11 @@ pub enum CommandEffect {
     Shutdown {
         requester: ClientId,
     },
+    SourceFile {
+        path: PathBuf,
+        depth: u8,
+        ancestors: Arc<[PathBuf]>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +327,7 @@ struct PendingInvocation {
     source: CommandSource,
     commands: CommandList,
     next: usize,
+    inserted: VecDeque<Command>,
     messages: String,
 }
 
@@ -328,6 +368,7 @@ impl CommandQueue {
                 source,
                 commands,
                 next: 0,
+                inserted: VecDeque::new(),
                 messages: String::new(),
             });
         self.mark_ready(client);
@@ -341,8 +382,13 @@ impl CommandQueue {
                 continue;
             }
             let invocation = self.pending.get_mut(&client)?.front_mut()?;
-            let command = invocation.commands[invocation.next].clone();
-            invocation.next += 1;
+            let command = if let Some(command) = invocation.inserted.pop_front() {
+                command
+            } else {
+                let command = invocation.commands[invocation.next].clone();
+                invocation.next += 1;
+                command
+            };
             self.next_sequence = self
                 .next_sequence
                 .checked_add(1)
@@ -353,12 +399,44 @@ impl CommandQueue {
                 client,
                 command,
                 source: invocation.source,
-                final_in_list: invocation.next == invocation.commands.len(),
+                final_in_list: invocation.inserted.is_empty()
+                    && invocation.next == invocation.commands.len(),
             };
             self.active.insert(client, invocation.id);
             return Some(queued);
         }
         None
+    }
+
+    pub fn insert_after_active(
+        &mut self,
+        active: &QueuedCommand,
+        commands: CommandList,
+    ) -> Result<(), CommandParseError> {
+        if self.active.get(&active.client) != Some(&active.invocation) {
+            return Err(CommandParseError::new("command invocation is not active"));
+        }
+        let invocation = self
+            .pending
+            .get_mut(&active.client)
+            .and_then(|invocations| invocations.front_mut())
+            .filter(|invocation| invocation.id == active.invocation)
+            .ok_or_else(|| CommandParseError::new("active command invocation is missing"))?;
+        let remaining = invocation
+            .commands
+            .len()
+            .saturating_sub(invocation.next)
+            .saturating_add(invocation.inserted.len());
+        if remaining
+            .checked_add(commands.len())
+            .is_none_or(|count| count > MAX_COMMANDS)
+        {
+            return Err(CommandParseError::new("command list exceeds 256 commands"));
+        }
+        for command in commands.iter().rev() {
+            invocation.inserted.push_front(command.clone());
+        }
+        Ok(())
     }
 
     pub fn finish(
@@ -395,7 +473,9 @@ impl CommandQueue {
                         }
                         invocation.messages.push_str(&message);
                     }
-                    if command.final_in_list {
+                    if invocation.inserted.is_empty()
+                        && invocation.next == invocation.commands.len()
+                    {
                         let invocation = invocations.pop_front().expect("front was checked above");
                         completion = Some(CommandCompletion {
                             invocation: invocation.id,
@@ -662,6 +742,12 @@ pub(super) fn execute_state_command(
                 Err(error) => error_result(queued.sequence, error),
             }
         }
+        Command::SourceFile { .. } => CommandResult {
+            sequence: queued.sequence,
+            ok: true,
+            message: String::new(),
+            attached_pane: None,
+        },
         Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
             sequence: queued.sequence,
             ok: true,
@@ -1345,6 +1431,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("splitw"),
     },
     CommandEntry {
+        name: "source-file",
+        alias: Some("source"),
+    },
+    CommandEntry {
         name: "start-server",
         alias: Some("start"),
     },
@@ -1416,6 +1506,7 @@ pub(super) fn parse_single_command(
         }
         "confirm-before" => parse_confirm_before(argv, depth),
         "display-message" => parse_display_message(argv),
+        "source-file" => parse_source_file(argv),
         "set-option" => parse_set_option(argv, OptionScope::Session),
         "set-window-option" => parse_set_option(argv, OptionScope::Window),
         "show-options" => parse_show_options(argv, OptionScope::Session),
@@ -1564,6 +1655,18 @@ pub(super) fn parse_single_command(
             })
         }
         _ => unreachable!("resolved command is missing a parser: {command}"),
+    }
+}
+
+fn parse_source_file(argv: &[String]) -> Result<Command, CommandParseError> {
+    match argv {
+        [_, path] => Ok(Command::SourceFile {
+            path: PathBuf::from(path),
+            depth: 0,
+            ancestors: Arc::from([]),
+        }),
+        [_] => Err(CommandParseError::new("source-file requires a path")),
+        _ => Err(CommandParseError::new("too many arguments for source-file")),
     }
 }
 
@@ -2330,6 +2433,10 @@ fn format_command(command: &Command) -> String {
             arguments.push(template.clone());
             "display-message"
         }
+        Command::SourceFile { path, .. } => {
+            arguments.push(path.to_string_lossy().into_owned());
+            "source-file"
+        }
     };
 
     if arguments.is_empty() {
@@ -2577,6 +2684,67 @@ mod tests {
                 .message
                 .contains("no matching pane")
         );
+    }
+
+    #[test]
+    fn inserted_commands_run_before_the_remaining_active_invocation() {
+        let mut queue = CommandQueue::default();
+        let client = crate::ClientId::new(1);
+        queue
+            .push_list(
+                client,
+                list("display-message first; display-message last"),
+                CommandSource::ClientRequest,
+            )
+            .unwrap();
+
+        let first = queue.pop().unwrap();
+        assert!(matches!(
+            &first.command,
+            Command::DisplayMessage { template, .. } if template == "first"
+        ));
+        queue
+            .insert_after_active(
+                &first,
+                list("display-message inserted-1; display-message inserted-2"),
+            )
+            .unwrap();
+        assert!(queue.finish(first, Ok(String::new())).is_none());
+
+        for expected in ["inserted-1", "inserted-2", "last"] {
+            let queued = queue.pop().unwrap();
+            assert!(matches!(
+                &queued.command,
+                Command::DisplayMessage { template, .. } if template == expected
+            ));
+            let completion = queue.finish(queued, Ok(String::new()));
+            if expected == "last" {
+                assert!(completion.is_some());
+            } else {
+                assert!(completion.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn source_file_is_a_bounded_semantic_effect_with_parseable_paths() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let outcome = execute_one(&mut state, client, "source-file 'configs/work file.wmux'");
+
+        assert!(outcome.ok);
+        assert_eq!(
+            outcome.effects.as_slice(),
+            [CommandEffect::SourceFile {
+                path: std::path::PathBuf::from("configs/work file.wmux"),
+                depth: 0,
+                ancestors: std::sync::Arc::from([]),
+            }]
+        );
+        assert!(parse_command_text("source-file")
+            .unwrap_err()
+            .to_string()
+            .contains("requires a path"));
     }
 
     #[test]
