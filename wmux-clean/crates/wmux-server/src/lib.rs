@@ -23,10 +23,10 @@ use wmux_core::{
     build_window_scene_with_client_overlay, build_window_structure, execute, parse_command_text,
     render_damage_from_structure, render_diff_scene_with_capabilities, route_key, BareKey,
     ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue, CommandSource,
-    CopyMode, CopyModeResult, InputMode, InputRoute, JobContinuation, JobId, KeyCode, KeyEvent,
-    KeyModifiers, Line, PaneId, PaneSceneOverrides, PaneViewport, QueuedCommand,
-    RenderCapabilities, RenderState, RetainedPaneFrame, ServerEvent, ServerState, StructuralScene,
-    Style,
+    ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode, InputRoute,
+    JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId, PaneSceneOverrides,
+    PaneViewport, QueuedCommand, RenderCapabilities, RenderState, RetainedPaneFrame, ServerEvent,
+    ServerState, StructuralScene, Style,
 };
 use wmux_platform::{
     AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
@@ -54,6 +54,7 @@ const PASTES_PER_TURN: usize = 64;
 const PASTE_CHUNK_BYTES: usize = 64 * 1024;
 const CLIENT_OUTPUT_MESSAGES: usize = 64;
 const CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const CONTROL_OUTPUT_RESERVE_BYTES: usize = 128 * 1024;
 const CLIENT_MAX_FRAME_BYTES: usize = FRAME_HEADER_LEN + MAX_FRAME;
 const PER_PANE_OUTPUT_BYTES: usize = 64 * 1024;
 const PER_PANE_OUTPUT_TIME: Duration = Duration::from_millis(1);
@@ -212,6 +213,12 @@ enum OwnerMessage {
     InvalidCommand {
         client: ClientId,
         message: String,
+    },
+    EnterControl(ClientId),
+    ControlCommand {
+        client: ClientId,
+        sequence: u64,
+        command: String,
     },
     Disconnect(ClientId),
     OutboundDrained {
@@ -382,6 +389,14 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
                 });
             }
         },
+        Message::EnterControl => return Some(OwnerMessage::EnterControl(client)),
+        Message::ControlCommand { sequence, command } => {
+            return Some(OwnerMessage::ControlCommand {
+                client,
+                sequence,
+                command,
+            });
+        }
         Message::Input(bytes) => ServerEvent::ClientInput {
             client,
             input: ClientInput::Bytes(bytes),
@@ -512,6 +527,7 @@ struct Runtime {
     sync_started_at: BTreeMap<PaneId, Instant>,
     resize_repaint_holds: BTreeMap<PaneId, ResizeRepaintHold>,
     history_growth: Vec<(PaneId, u64)>,
+    published_output: Vec<(PaneId, Vec<u8>)>,
     pty_backend: Box<dyn PtyBackend>,
     job_backend: Box<dyn JobBackend>,
     #[cfg(test)]
@@ -691,6 +707,7 @@ impl Runtime {
             sync_started_at: BTreeMap::new(),
             resize_repaint_holds: BTreeMap::new(),
             history_growth: Vec::new(),
+            published_output: Vec::new(),
             pty_backend,
             job_backend,
             #[cfg(test)]
@@ -1055,6 +1072,9 @@ impl Runtime {
                 self.output_ring.push_back(pane_id);
             }
             let applied = self.apply_pty_output(pane_id, &collected.bytes);
+            if !collected.bytes.is_empty() {
+                self.published_output.push((pane_id, collected.bytes));
+            }
             result.changed |= applied.changed;
             result.publishable |= applied.publishable;
             result.synchronized_commit |= applied.synchronized_commit;
@@ -1075,6 +1095,10 @@ impl Runtime {
             }
         }
         result
+    }
+
+    fn take_published_output(&mut self) -> Vec<(PaneId, Vec<u8>)> {
+        std::mem::take(&mut self.published_output)
     }
 }
 
@@ -1258,6 +1282,14 @@ struct ClientView {
     capabilities: RenderCapabilities,
     scroll_offsets: BTreeMap<PaneId, usize>,
     copy_mode: Option<CopyMode>,
+    control: Option<ControlClient>,
+}
+
+struct ControlClient {
+    next_sequence: u64,
+    paused: bool,
+    pause_sent: bool,
+    subscribed_output: bool,
 }
 
 impl ClientView {
@@ -1279,6 +1311,7 @@ impl ClientView {
             },
             scroll_offsets: BTreeMap::new(),
             copy_mode: None,
+            control: None,
         }
     }
 
@@ -1461,6 +1494,9 @@ impl ServerOwner {
             }
 
             let output = self.runtime.process_output_round(OutputBudget::default());
+            for (pane, bytes) in self.runtime.take_published_output() {
+                self.publish_control_output(pane, &bytes);
+            }
             self.anchor_scrolled_views();
             if output.changed {
                 if output.publishable {
@@ -1584,6 +1620,12 @@ impl ServerOwner {
                     self.send_critical(client, Message::CommandErr(message));
                 }
             }
+            OwnerMessage::EnterControl(client) => self.enter_control(client),
+            OwnerMessage::ControlCommand {
+                client,
+                sequence,
+                command,
+            } => self.handle_control_command(client, sequence, command),
             OwnerMessage::Disconnect(client) => self.disconnect_client(client, true),
             OwnerMessage::OutboundDrained { client, bytes } => {
                 if let Some(view) = self.clients.get_mut(&client) {
@@ -1599,9 +1641,106 @@ impl ServerOwner {
         }
     }
 
+    fn enter_control(&mut self, client: ClientId) {
+        let Some(view) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if view.control.is_some() {
+            self.send_control_record(
+                client,
+                ControlRecord::Error {
+                    sequence: 0,
+                    message: "client is already in control mode".to_string(),
+                },
+            );
+            return;
+        }
+        view.control = Some(ControlClient {
+            next_sequence: 1,
+            paused: false,
+            pause_sent: false,
+            subscribed_output: true,
+        });
+        self.send_control_record(client, ControlRecord::Ready);
+    }
+
+    fn handle_control_command(&mut self, client: ClientId, sequence: u64, command: String) {
+        let expected = self
+            .clients
+            .get(&client)
+            .and_then(|view| view.control.as_ref())
+            .map(|control| control.next_sequence);
+        let Some(expected) = expected else {
+            self.send_critical(
+                client,
+                Message::CommandErr(
+                    "enter control mode before sending control commands".to_string(),
+                ),
+            );
+            return;
+        };
+        self.send_control_record(client, ControlRecord::Begin { sequence });
+        if sequence != expected {
+            self.send_control_record(
+                client,
+                ControlRecord::Error {
+                    sequence,
+                    message: format!(
+                        "out-of-order control sequence {sequence}; expected {expected}"
+                    ),
+                },
+            );
+            return;
+        }
+        let Some(next_sequence) = sequence.checked_add(1) else {
+            self.send_control_record(
+                client,
+                ControlRecord::Error {
+                    sequence,
+                    message: "control sequence space exhausted".to_string(),
+                },
+            );
+            return;
+        };
+        if let Some(control) = self
+            .clients
+            .get_mut(&client)
+            .and_then(|view| view.control.as_mut())
+        {
+            control.next_sequence = next_sequence;
+        }
+        let commands = match parse_command_text(&command) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.send_control_record(
+                    client,
+                    ControlRecord::Error {
+                        sequence,
+                        message: error.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+        if let Err(error) =
+            self.runtime
+                .queue
+                .push_list(client, commands, CommandSource::Control { sequence })
+        {
+            self.send_control_record(
+                client,
+                ControlRecord::Error {
+                    sequence,
+                    message: error.to_string(),
+                },
+            );
+        }
+    }
+
     fn handle_event(&mut self, event: ServerEvent) -> io::Result<()> {
         match event {
             ServerEvent::PtyOutput { pane, bytes } => {
+                self.publish_control_output(pane, &bytes);
                 let output = self.runtime.apply_pty_output(pane, &bytes);
                 self.anchor_scrolled_views();
                 if output.publishable {
@@ -1851,6 +1990,10 @@ impl ServerOwner {
         if job.output_truncated() {
             output.push_str("\n[wmux: job output truncated at 1048576 bytes]");
         }
+        self.publish_control_notification(ControlNotification::JobFinished {
+            job: job_id,
+            exit_code,
+        });
 
         if let Some(owner) = job.owner {
             if let JobContinuation::IfShell { if_true, if_false } = &job.continuation {
@@ -1994,6 +2137,16 @@ impl ServerOwner {
                 Ok(false)
             }
             CommandEffect::RefreshClient { client } => {
+                if let Some(control) = self
+                    .clients
+                    .get_mut(&client)
+                    .and_then(|view| view.control.as_mut())
+                {
+                    control.paused = false;
+                    control.pause_sent = false;
+                    control.subscribed_output = true;
+                    return Ok(false);
+                }
                 let destroyed = self.client_session_is_destroyed(client);
                 if destroyed && matches!(queued.source, CommandSource::ClientRequest) {
                     self.send_critical(client, Message::CommandOk(success_message.to_string()));
@@ -2053,15 +2206,28 @@ impl ServerOwner {
             CommandEffect::DetachClient { client } => {
                 if matches!(queued.source, CommandSource::ClientRequest) {
                     self.send_critical(client, Message::CommandOk(success_message.to_string()));
+                } else if let CommandSource::Control { sequence } = queued.source {
+                    self.send_control_record(
+                        client,
+                        ControlRecord::End {
+                            sequence,
+                            output: success_message.to_string(),
+                        },
+                    );
                 }
                 self.disconnect_client(client, false);
                 Ok(true)
             }
             CommandEffect::Shutdown { requester } => {
-                let response = if matches!(queued.source, CommandSource::ClientRequest) {
-                    Message::CommandOk(success_message.to_string())
-                } else {
-                    Message::Shutdown
+                let response = match queued.source {
+                    CommandSource::ClientRequest => Message::CommandOk(success_message.to_string()),
+                    CommandSource::Control { sequence } => {
+                        Message::ControlRecord(ControlRecord::End {
+                            sequence,
+                            output: success_message.to_string(),
+                        })
+                    }
+                    _ => Message::Shutdown,
                 };
                 self.begin_shutdown(requester, response);
                 Ok(true)
@@ -2178,6 +2344,9 @@ impl ServerOwner {
         event: wmux_core::HookEvent,
         target: wmux_core::OptionTarget,
     ) -> io::Result<()> {
+        if let Some(notification) = control_notification(event, target) {
+            self.publish_control_notification(notification);
+        }
         let depth = match queued.source {
             CommandSource::Hook { depth } if depth >= wmux_core::MAX_HOOK_DEPTH => return Ok(()),
             CommandSource::Hook { depth } => depth + 1,
@@ -2202,6 +2371,31 @@ impl ServerOwner {
     }
 
     fn send_command_completion(&mut self, completion: wmux_core::CommandCompletion) {
+        if let CommandSource::Control { sequence } = completion.source {
+            match completion.result {
+                Ok(output) if output.len() <= wmux_core::MAX_CONTROL_TEXT_BYTES => {
+                    self.send_control_record(
+                        completion.client,
+                        ControlRecord::End { sequence, output },
+                    );
+                }
+                Ok(_) => self.send_control_record(
+                    completion.client,
+                    ControlRecord::Error {
+                        sequence,
+                        message: "control command output exceeds 1048576 bytes".to_string(),
+                    },
+                ),
+                Err(message) => self.send_control_record(
+                    completion.client,
+                    ControlRecord::Error {
+                        sequence,
+                        message: bounded_control_text(message),
+                    },
+                ),
+            }
+            return;
+        }
         if matches!(completion.source, CommandSource::Config) {
             if let Err(message) = completion.result {
                 eprintln!("wmux config command error: {message}");
@@ -2663,6 +2857,110 @@ impl ServerOwner {
         }
     }
 
+    fn send_control_record(&mut self, client: ClientId, record: ControlRecord) {
+        self.send_critical(client, Message::ControlRecord(record));
+    }
+
+    fn publish_control_notification(&mut self, notification: ControlNotification) {
+        let clients = self
+            .clients
+            .iter()
+            .filter_map(|(client, view)| view.control.is_some().then_some(*client))
+            .collect::<Vec<_>>();
+        for client in clients {
+            self.send_control_record(client, ControlRecord::Notification(notification.clone()));
+        }
+    }
+
+    fn publish_control_output(&mut self, pane: PaneId, bytes: &[u8]) {
+        let clients = self
+            .clients
+            .iter()
+            .filter_map(|(client, view)| {
+                view.control
+                    .as_ref()
+                    .filter(|control| control.subscribed_output && !control.paused)
+                    .and_then(|_| {
+                        self.control_client_observes_pane(*client, pane)
+                            .then_some(*client)
+                    })
+            })
+            .collect::<Vec<_>>();
+        for client in clients {
+            for chunk in bytes.chunks(wmux_core::MAX_CONTROL_OUTPUT_BYTES) {
+                let message = Message::ControlRecord(ControlRecord::Output {
+                    pane,
+                    bytes: chunk.to_vec(),
+                });
+                let should_pause = self.clients.get(&client).is_none_or(|view| {
+                    view.outbound.capacity() <= 2
+                        || view.queued_bytes.saturating_add(message.wire_len())
+                            > CLIENT_OUTPUT_BYTES - CONTROL_OUTPUT_RESERVE_BYTES
+                });
+                let delivered = !should_pause
+                    && self
+                        .clients
+                        .get_mut(&client)
+                        .is_some_and(|view| view.try_enqueue(Outbound::Message(message)).is_ok());
+                if !delivered {
+                    self.pause_control_output(client, Some(pane));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn control_client_observes_pane(&self, client: ClientId, pane: PaneId) -> bool {
+        let Some(session_id) = self
+            .runtime
+            .state
+            .clients
+            .get(&client)
+            .and_then(|client| client.attached_session)
+        else {
+            return false;
+        };
+        let Some(window) = self.runtime.state.panes.get(&pane).map(|pane| pane.window) else {
+            return false;
+        };
+        self.runtime
+            .state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| {
+                session.winlinks.iter().any(|winlink| {
+                    self.runtime
+                        .state
+                        .winlinks
+                        .get(winlink)
+                        .is_some_and(|winlink| winlink.window == window)
+                })
+            })
+    }
+
+    fn pause_control_output(&mut self, client: ClientId, pane: Option<PaneId>) {
+        let send_pause = self
+            .clients
+            .get_mut(&client)
+            .and_then(|view| view.control.as_mut())
+            .is_some_and(|control| {
+                control.paused = true;
+                if control.pause_sent {
+                    false
+                } else {
+                    control.pause_sent = true;
+                    true
+                }
+            });
+        if send_pause {
+            if let Some(view) = self.clients.get_mut(&client) {
+                let _ = view.try_enqueue(Outbound::Message(Message::ControlRecord(
+                    ControlRecord::Pause { pane },
+                )));
+            }
+        }
+    }
+
     fn begin_shutdown(&mut self, requester: ClientId, response: Message) {
         if self.is_shutting_down() {
             return;
@@ -2811,6 +3109,55 @@ fn job_failure(exit_code: Option<u32>, output: &str) -> String {
         format!("shell command failed with {status}")
     } else {
         format!("shell command failed with {status}: {diagnostic}")
+    }
+}
+
+fn bounded_control_text(mut text: String) -> String {
+    if text.len() <= wmux_core::MAX_CONTROL_TEXT_BYTES {
+        return text;
+    }
+    let mut end = wmux_core::MAX_CONTROL_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+fn control_notification(
+    event: wmux_core::HookEvent,
+    target: wmux_core::OptionTarget,
+) -> Option<ControlNotification> {
+    use wmux_core::{HookEvent, OptionTarget};
+    match (event, target) {
+        (HookEvent::ClientAttached, OptionTarget::Client(client)) => {
+            Some(ControlNotification::ClientAttached { client })
+        }
+        (HookEvent::ClientDetached, OptionTarget::Client(client)) => {
+            Some(ControlNotification::ClientDetached { client })
+        }
+        (HookEvent::SessionCreated, OptionTarget::Session(session)) => {
+            Some(ControlNotification::SessionCreated { session })
+        }
+        (HookEvent::SessionClosed, OptionTarget::Session(session)) => {
+            Some(ControlNotification::SessionClosed { session })
+        }
+        (HookEvent::WindowCreated, OptionTarget::Window(window)) => {
+            Some(ControlNotification::WindowCreated { window })
+        }
+        (HookEvent::WindowClosed, OptionTarget::Window(window)) => {
+            Some(ControlNotification::WindowClosed { window })
+        }
+        (HookEvent::PaneCreated, OptionTarget::Pane(pane)) => {
+            Some(ControlNotification::PaneCreated { pane })
+        }
+        (HookEvent::PaneClosed, OptionTarget::Pane(pane)) => {
+            Some(ControlNotification::PaneClosed { pane })
+        }
+        (HookEvent::BufferChanged, _) => Some(ControlNotification::BufferChanged { name: None }),
+        (HookEvent::BufferDeleted, _) => Some(ControlNotification::BufferDeleted { name: None }),
+        (HookEvent::JobFinished, _) => None,
+        _ => None,
     }
 }
 
@@ -3139,8 +3486,9 @@ mod tests {
     use tokio::sync::mpsc;
     use wmux_config::{parse_config, WmuxConfig};
     use wmux_core::{
-        parse_command_text, Command, CommandList, CommandSource, KeyBinding, KeyCode, KeyTableName,
-        OptionTarget, OptionValue, ServerEvent, SplitDirection,
+        parse_command_text, Command, CommandList, CommandSource, ControlNotification,
+        ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget, OptionValue, ServerEvent,
+        SplitDirection,
     };
     use wmux_platform::{
         AcceptedConnection, Endpoint, JobBackend, JobNotifier, MouseButton, MouseEvent,
@@ -3551,6 +3899,112 @@ mod tests {
                 .unwrap(),
             OptionValue::String("false".to_string())
         );
+    }
+
+    #[test]
+    fn control_commands_are_monotonic_and_emit_structured_ordered_records() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let (tx, mut rx) = mpsc::channel(16);
+        owner
+            .clients
+            .insert(client, ClientView::new(tx, TerminalCapabilities::default()));
+        owner.enter_control(client);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Ready
+            )))
+        ));
+
+        owner.handle_control_command(client, 1, "set-buffer -b observed data".to_string());
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Begin { sequence: 1 }
+            )))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Notification(ControlNotification::BufferChanged { .. })
+            )))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::End { sequence: 1, .. }
+            )))
+        ));
+
+        owner.handle_control_command(client, 1, "list-sessions".to_string());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Begin { sequence: 1 }
+            )))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(ControlRecord::Error { sequence: 1, message })))
+                if message.contains("expected 2")
+        ));
+
+        owner.handle_control_command(client, 2, "not-a-command".to_string());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Begin { sequence: 2 }
+            )))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(
+                ControlRecord::Error { sequence: 2, .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn control_output_is_sliced_filtered_and_pauses_before_replies_are_starved() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("control", 80, 24);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        owner
+            .clients
+            .insert(client, ClientView::new(tx, TerminalCapabilities::default()));
+        owner.enter_control(client);
+        let _ = rx.try_recv();
+
+        owner.publish_control_output(created.pane, &vec![b'x'; 64 * 1024 + 1]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(ControlRecord::Output { pane, bytes })))
+                if pane == created.pane && bytes.len() == 64 * 1024
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Outbound::Message(Message::ControlRecord(ControlRecord::Output { bytes, .. })))
+                if bytes == b"x"
+        ));
+
+        for _ in 0..64 {
+            owner.publish_control_output(created.pane, &[b'y'; 64 * 1024]);
+            if owner.clients[&client].control.as_ref().unwrap().paused {
+                break;
+            }
+        }
+        assert!(owner.clients[&client].control.as_ref().unwrap().paused);
+        owner.handle_control_command(client, 1, "refresh-client".to_string());
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(!owner.clients[&client].control.as_ref().unwrap().paused);
     }
 
     async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {

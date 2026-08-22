@@ -320,6 +320,7 @@ impl CommandCompletion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandSource {
     ClientRequest,
+    Control { sequence: u64 },
     KeyBinding,
     Config,
     Hook { depth: u8 },

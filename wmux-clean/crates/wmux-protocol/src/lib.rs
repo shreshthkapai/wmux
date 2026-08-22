@@ -191,7 +191,7 @@ impl EncodedFrame {
                 encode_key_prefix(&event, &mut header[FRAME_HEADER_LEN..]);
                 Self {
                     header,
-                    header_len: ENCODED_HEADER_LEN,
+                    header_len: FRAME_HEADER_LEN + KEY_PREFIX_LEN,
                     payload: EncodedPayload::Owned(event.raw),
                 }
             }
@@ -306,7 +306,11 @@ pub fn write_message(mut writer: impl Write, message: &Message) -> io::Result<()
         header[..FRAME_HEADER_LEN]
             .copy_from_slice(&frame_header(11, KEY_PREFIX_LEN + event.raw.len()));
         encode_key_prefix(event, &mut header[FRAME_HEADER_LEN..]);
-        return write_vectored_all(&mut writer, &header, &event.raw);
+        return write_vectored_all(
+            &mut writer,
+            &header[..FRAME_HEADER_LEN + KEY_PREFIX_LEN],
+            &event.raw,
+        );
     }
     if let Message::ControlRecord(ControlRecord::Output { pane, bytes }) = message {
         let mut header = [0; ENCODED_HEADER_LEN];
