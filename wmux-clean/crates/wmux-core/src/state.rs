@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ClientId, ConfirmationState, KeyCode, KeyTableName, KeyTables, LayoutNode, PaneId, Rect,
-    ResizeDirection, Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId,
-    WinlinkId,
+    ClientId, ConfirmationState, KeyCode, KeyTableName, KeyTables, LayoutNode, OptionError,
+    OptionStore, OptionTarget, OptionValue, PaneId, Rect, ResizeDirection, Screen, SessionGroupId,
+    SessionId, SplitDirection, TerminalEngine, WindowId, WinlinkId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +105,7 @@ pub struct ServerState {
     pub windows: BTreeMap<WindowId, Window>,
     pub panes: BTreeMap<PaneId, Pane>,
     pub key_tables: KeyTables,
+    pub options: OptionStore,
     pending_pane_resizes: BTreeMap<PaneId, PaneResize>,
 }
 
@@ -119,6 +120,7 @@ impl ServerState {
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
             key_tables: KeyTables::tmux_defaults(),
+            options: OptionStore::new(),
             pending_pane_resizes: BTreeMap::new(),
         }
     }
@@ -143,6 +145,52 @@ impl ServerState {
 
     pub fn remove_client(&mut self, client: ClientId) {
         self.clients.remove(&client);
+        self.options.remove_target(OptionTarget::Client(client));
+    }
+
+    pub fn option(&self, target: OptionTarget, name: &str) -> Result<OptionValue, OptionError> {
+        self.options.get(&self.option_path(target), name)
+    }
+
+    pub fn option_path(&self, target: OptionTarget) -> Vec<OptionTarget> {
+        let mut path = vec![target];
+        match target {
+            OptionTarget::Server => {}
+            OptionTarget::Session(_) => path.push(OptionTarget::Server),
+            OptionTarget::Client(client) => {
+                if let Some(session) = self
+                    .clients
+                    .get(&client)
+                    .and_then(|client| client.attached_session)
+                {
+                    path.push(OptionTarget::Session(session));
+                }
+                path.push(OptionTarget::Server);
+            }
+            OptionTarget::Window(window) => {
+                if let Some(session) = self.session_for_window(window) {
+                    path.push(OptionTarget::Session(session));
+                }
+                path.push(OptionTarget::Server);
+            }
+            OptionTarget::Pane(pane) => {
+                if let Some(window) = self.panes.get(&pane).map(|pane| pane.window) {
+                    path.push(OptionTarget::Window(window));
+                    if let Some(session) = self.session_for_window(window) {
+                        path.push(OptionTarget::Session(session));
+                    }
+                }
+                path.push(OptionTarget::Server);
+            }
+        }
+        path
+    }
+
+    fn session_for_window(&self, window: WindowId) -> Option<SessionId> {
+        self.winlinks
+            .values()
+            .find(|winlink| winlink.window == window)
+            .map(|winlink| winlink.session)
     }
 
     pub fn create_session(
@@ -567,6 +615,7 @@ impl ServerState {
             }
         }
         self.panes.remove(&pane);
+        self.options.remove_target(OptionTarget::Pane(pane));
         self.pending_pane_resizes.remove(&pane);
         self.recompute_window_layout(window);
         self.refresh_attached_panes();
@@ -575,8 +624,10 @@ impl ServerState {
 
     pub fn kill_window(&mut self, window: WindowId) -> Option<Vec<PaneId>> {
         let killed = self.windows.remove(&window)?.panes;
+        self.options.remove_target(OptionTarget::Window(window));
         for pane in &killed {
             self.panes.remove(pane);
+            self.options.remove_target(OptionTarget::Pane(*pane));
             self.pending_pane_resizes.remove(pane);
         }
         let winlinks = self
@@ -661,6 +712,7 @@ impl ServerState {
 
     fn remove_session_record(&mut self, session: SessionId) -> Option<Session> {
         let removed = self.sessions.remove(&session)?;
+        self.options.remove_target(OptionTarget::Session(session));
         for client in self.clients.values_mut() {
             if client.attached_session == Some(session) {
                 client.attached_session = None;
