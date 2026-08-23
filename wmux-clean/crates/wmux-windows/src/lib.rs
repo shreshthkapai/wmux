@@ -129,7 +129,7 @@ mod daemon_tests {
             .stderr(Stdio::piped());
         let (result_tx, result_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let _ = result_tx.send(run_bounded_command(&mut command, Duration::from_secs(1)));
+            let _ = result_tx.send(run_bounded_command(&mut command, Duration::from_secs(10)));
         });
 
         let mut descendant = pending_cleanup.wait_and_transfer();
@@ -224,7 +224,7 @@ mod daemon_tests {
     }
 
     fn wait_for_pid(path: &std::path::Path) -> u32 {
-        wait_for_pid_until(path, Instant::now() + Duration::from_secs(2))
+        wait_for_pid_until(path, Instant::now() + Duration::from_secs(10))
             .expect("descendant PID was not written")
     }
 

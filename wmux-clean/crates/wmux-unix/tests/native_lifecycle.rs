@@ -93,7 +93,7 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
 
     write_message(
         &mut attached,
-        Message::Input(b"(sleep 1; printf 'WMUX_%s' BACKGROUND) &\n".to_vec()),
+        Message::Input(b"(sleep 1; printf '\r\nWMUX_%s\r\n' BACKGROUND) &\n".to_vec()),
     )
     .await;
     write_message(&mut attached, Message::Detach).await;

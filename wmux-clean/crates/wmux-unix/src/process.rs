@@ -259,7 +259,7 @@ mod tests {
     use super::{open_pty, reset_signal_state, spawn_pane};
     use std::{
         ffi::OsString,
-        fs::{self, File},
+        fs,
         io::Read,
         os::fd::{AsRawFd, OwnedFd},
         path::{Path, PathBuf},
@@ -332,7 +332,7 @@ mod tests {
     fn pane_child_does_not_inherit_unrelated_parent_descriptors() {
         let directory = TestDirectory::new();
         let marker_path = directory.path().join("must-not-reach-pane-child");
-        let marker = File::create(&marker_path).expect("marker descriptor opens");
+        let marker = fs::File::create(&marker_path).expect("marker descriptor opens");
         let descriptor = marker.as_raw_fd();
         let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
         assert_ne!(flags, -1, "marker descriptor flags are readable");
