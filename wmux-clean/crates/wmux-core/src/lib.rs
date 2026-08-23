@@ -37,8 +37,8 @@ pub use ids::{ClientId, PaneId, SessionGroupId, SessionId, TimerId, WindowId, Wi
 pub use jobs::{Job, JobContinuation, JobId, JobStore, MAX_JOBS, MAX_JOB_OUTPUT_BYTES};
 pub use keys::{
     route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
-    KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTableTarget, KeyTables,
-    MAX_KEY_NAME_BYTES, MAX_KEY_TABLE_NAME_BYTES,
+    KeyModifiers, KeyParseError, KeyTable, KeyTableName, KeyTableTarget, KeyTables, PromptState,
+    MAX_KEY_NAME_BYTES, MAX_KEY_TABLE_NAME_BYTES, MAX_PROMPT_INPUT_BYTES,
 };
 pub use layout::{LayoutNode, Rect, ResizeDirection, SplitDirection};
 pub use options::{

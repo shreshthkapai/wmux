@@ -70,7 +70,7 @@ payload is never rewritten, so unbound passthrough remains byte-exact. This
 matches tmux's legacy printable-key behavior while tolerating layout-dependent
 Windows console modifier reporting.
 
-## Tables, routing, and confirmation
+## Tables, routing, prompts, and confirmation
 
 The server owns sorted compact binding tables with binary-search lookup.
 Phase 4 provides `root`, `prefix`, and `copy-mode` tables, a `C-b` prefix, and
@@ -80,11 +80,25 @@ only after a repeatable binding. `bind-key`, `unbind-key`, and `list-keys`
 mutate or inspect those server-owned tables. Binding command lists are shared
 by `Arc`, so dispatch does not reparse command text.
 
-Routing order is confirmation, copy mode, prefix transition, active-table
-binding, then unbound passthrough. Repeatable bindings retain prefix state until
-their deadline. Client input state is independent, while tables are shared by
-the server. Paste and existing mouse-mode precedence remain outside ordinary
-key-table routing.
+Routing order is editing prompt, confirmation, copy mode, prefix transition,
+active-table binding, then unbound passthrough. Repeatable bindings retain
+prefix state until their deadline. Client input state is independent, while
+tables are shared by the server. Paste and existing mouse-mode precedence
+remain outside ordinary key-table routing.
+
+`C-b ,` and `C-b $` follow tmux's window- and session-rename model. Each opens
+a server-owned `command-prompt` over the status row, prefilled with the current
+name. The prompt expands and captures a stable target ID when it opens, so a
+later focus change cannot redirect the rename. Enter submits the resulting
+rename through the serialized command queue; Escape or `C-c` cancels. Left,
+Right, Home, End, Backspace, Delete, and `C-u` edit the bounded input without
+forwarding any bytes to the pane. Cursor movement and deletion use grapheme
+boundaries.
+
+The default prefix table also exposes tmux-compatible actions already backed
+by wmux semantics: `d` detaches, `]` pastes, `r` refreshes, `C-o` rotates,
+`{`/`}` swap panes, Control-arrows resize by one cell, and Alt-arrows resize by
+five cells. The resize bindings are repeatable; the others reset prefix state.
 
 The default `C-b x`, `C-b &`, and `C-b X` bindings use `confirm-before` for
 pane, window, and current-session destruction respectively. Lowercase `x`
@@ -104,13 +118,15 @@ error stops only the rest of that invocation. Binding invocations follow the
 same ordering but do not require a command reply.
 
 Core execution returns typed effects for pane creation/input, copy mode,
-client refresh, confirmation, detach, and shutdown. The server applies those
-effects in order. This keeps target resolution and mux semantics testable
-without allowing core code to access a PTY, native handle, clock, lock, or IO.
+client refresh, editing prompts, confirmation, detach, and shutdown. The
+server applies those effects in order. This keeps target resolution and mux
+semantics testable without allowing core code to access a PTY, native handle,
+clock, lock, or IO.
 
 The completed command surface includes `bind-key`, `unbind-key`, `list-keys`,
 `send-keys`, `send-prefix`, `switch-client`, `refresh-client`, and
-`confirm-before`, alongside the existing session/window/pane commands.
+`confirm-before`, `command-prompt`, `rename-window`, and `rename-session`,
+alongside the existing session/window/pane commands.
 
 ## Performance evidence
 

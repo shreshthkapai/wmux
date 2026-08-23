@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::{
     ClientId, ConfirmationState, HookStore, JobStore, KeyCode, KeyTableName, KeyTables, LayoutNode,
-    OptionError, OptionStore, OptionTarget, OptionValue, PaneId, PasteBufferStore, Rect,
-    ResizeDirection, Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine, WindowId,
-    WinlinkId,
+    OptionError, OptionStore, OptionTarget, OptionValue, PaneId, PasteBufferStore, PromptState,
+    Rect, ResizeDirection, Screen, SessionGroupId, SessionId, SplitDirection, TerminalEngine,
+    WindowId, WinlinkId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +17,7 @@ pub struct Client {
     pub repeat_deadline_ms: Option<u64>,
     pub last_repeatable_key: Option<KeyCode>,
     pub confirmation: Option<ConfirmationState>,
+    pub prompt: Option<PromptState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,6 +146,7 @@ impl ServerState {
                 repeat_deadline_ms: None,
                 last_repeatable_key: None,
                 confirmation: None,
+                prompt: None,
             },
         );
         id
@@ -552,6 +554,11 @@ impl ServerState {
 
     pub fn rename_window(&mut self, window: WindowId, name: impl Into<String>) -> Option<()> {
         self.windows.get_mut(&window)?.name = name.into();
+        Some(())
+    }
+
+    pub fn rename_session(&mut self, session: SessionId, name: impl Into<String>) -> Option<()> {
+        self.sessions.get_mut(&session)?.name = name.into();
         Some(())
     }
 

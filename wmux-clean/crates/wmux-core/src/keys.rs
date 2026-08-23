@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
-use crate::{parse_command_text, Client, ClientId, CommandList, ServerState};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::{parse_command_text, quote_argument, Client, ClientId, CommandList, ServerState};
 
 const MODIFIER_SHIFT: u32 = 60;
 const TAG_SHIFT: u32 = 32;
@@ -9,6 +11,7 @@ const REPEAT_TIME_MS: u64 = 500;
 const MAX_KEY_TABLES: usize = u16::MAX as usize + 1;
 pub const MAX_KEY_NAME_BYTES: usize = 256;
 pub const MAX_KEY_TABLE_NAME_BYTES: usize = 256;
+pub const MAX_PROMPT_INPUT_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BareKey {
@@ -677,6 +680,20 @@ fn build_tmux_defaults() -> KeyTables {
         ("n", "next-window"),
         ("p", "previous-window"),
         ("l", "last-window"),
+        (
+            ",",
+            "command-prompt -p 'rename-window: ' -I '#{window_name}' 'rename-window -t #{window_id} -- %%'",
+        ),
+        (
+            "$",
+            "command-prompt -p 'rename-session: ' -I '#{session_name}' 'rename-session -t #{session_id} -- %%'",
+        ),
+        ("d", "detach-client"),
+        ("]", "paste-buffer -p"),
+        ("r", "refresh-client"),
+        ("C-o", "rotate-window"),
+        ("{", "swap-pane -U"),
+        ("}", "swap-pane -D"),
         ("z", "resize-pane -Z"),
         ("[", "copy-mode"),
         ("x", "confirm-before -p 'kill-pane? (y/n)' kill-pane"),
@@ -698,13 +715,29 @@ fn build_tmux_defaults() -> KeyTables {
             &format!("select-window -t {index}"),
         );
     }
+    for (key, command) in [
+        ("C-Up", "resize-pane -U 1"),
+        ("C-Down", "resize-pane -D 1"),
+        ("C-Left", "resize-pane -L 1"),
+        ("C-Right", "resize-pane -R 1"),
+        ("M-Up", "resize-pane -U 5"),
+        ("M-Down", "resize-pane -D 5"),
+        ("M-Left", "resize-pane -L 5"),
+        ("M-Right", "resize-pane -R 5"),
+    ] {
+        bind_default_with_repeat(&mut tables, key, command, true);
+    }
     tables
 }
 
 fn bind_default(tables: &mut KeyTables, key: &str, command: &str) {
+    bind_default_with_repeat(tables, key, command, false);
+}
+
+fn bind_default_with_repeat(tables: &mut KeyTables, key: &str, command: &str, repeatable: bool) {
     let binding = KeyBinding {
         key: KeyCode::parse(key).expect("default key is valid"),
-        repeatable: false,
+        repeatable,
         commands: parse_command_text(command).expect("default binding command is valid"),
     };
     tables
@@ -717,6 +750,35 @@ fn bind_default(tables: &mut KeyTables, key: &str, command: &str) {
 pub struct ConfirmationState {
     pub prompt: String,
     pub commands: CommandList,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptState {
+    pub prompt: String,
+    pub input: String,
+    pub cursor: usize,
+    pub template: String,
+}
+
+impl PromptState {
+    pub fn new(prompt: String, input: String, template: String) -> Self {
+        let cursor = input.len();
+        Self {
+            prompt,
+            input,
+            cursor,
+            template,
+        }
+    }
+
+    pub fn display(&self) -> String {
+        let mut display = String::with_capacity(self.prompt.len() + self.input.len() + 3);
+        display.push_str(&self.prompt);
+        display.push_str(&self.input[..self.cursor]);
+        display.push('▏');
+        display.push_str(&self.input[self.cursor..]);
+        display
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -744,6 +806,10 @@ pub fn route_key(
     let Some(client) = state.clients.get_mut(&client) else {
         return InputRoute::Consumed;
     };
+
+    if client.prompt.is_some() {
+        return route_prompt(client, event);
+    }
 
     if client.confirmation.is_some() {
         return route_confirmation(client, event);
@@ -781,6 +847,122 @@ pub fn route_key(
 
     reset_key_state(client);
     route_root(tables, client, event)
+}
+
+fn route_prompt(client: &mut Client, event: KeyEvent) -> InputRoute {
+    let modifiers = event.code.modifiers();
+    let control_only = modifiers == KeyModifiers::CONTROL;
+    if control_only {
+        match event.code.bare_key() {
+            BareKey::Char('c') => {
+                client.prompt = None;
+            }
+            BareKey::Char('u') => {
+                if let Some(prompt) = client.prompt.as_mut() {
+                    prompt.input.drain(..prompt.cursor);
+                    prompt.cursor = 0;
+                }
+            }
+            _ => {}
+        }
+        return InputRoute::Consumed;
+    }
+    if modifiers.bits() & !KeyModifiers::SHIFT.bits() != 0 {
+        return InputRoute::Consumed;
+    }
+
+    match event.code.bare_key() {
+        BareKey::Enter => {
+            let Some(prompt) = client.prompt.as_ref() else {
+                return InputRoute::Consumed;
+            };
+            let command = prompt
+                .template
+                .replace("%%", &quote_argument(&prompt.input));
+            match parse_command_text(&command) {
+                Ok(commands) => {
+                    client.prompt = None;
+                    InputRoute::Commands(commands)
+                }
+                Err(_) => InputRoute::Consumed,
+            }
+        }
+        BareKey::Escape => {
+            client.prompt = None;
+            InputRoute::Consumed
+        }
+        BareKey::Home => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                prompt.cursor = 0;
+            }
+            InputRoute::Consumed
+        }
+        BareKey::End => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                prompt.cursor = prompt.input.len();
+            }
+            InputRoute::Consumed
+        }
+        BareKey::Left => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                prompt.cursor = prompt.input[..prompt.cursor]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(index, _)| index);
+            }
+            InputRoute::Consumed
+        }
+        BareKey::Right => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                prompt.cursor = prompt.input[prompt.cursor..]
+                    .grapheme_indices(true)
+                    .nth(1)
+                    .map_or(prompt.input.len(), |(index, _)| prompt.cursor + index);
+            }
+            InputRoute::Consumed
+        }
+        BareKey::Backspace => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                let start = prompt.input[..prompt.cursor]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(index, _)| index);
+                prompt.input.drain(start..prompt.cursor);
+                prompt.cursor = start;
+            }
+            InputRoute::Consumed
+        }
+        BareKey::Delete => {
+            if let Some(prompt) = client.prompt.as_mut() {
+                let end = prompt.input[prompt.cursor..]
+                    .grapheme_indices(true)
+                    .nth(1)
+                    .map_or(prompt.input.len(), |(index, _)| prompt.cursor + index);
+                prompt.input.drain(prompt.cursor..end);
+            }
+            InputRoute::Consumed
+        }
+        BareKey::Char(character) => {
+            insert_prompt_character(client, character);
+            InputRoute::Consumed
+        }
+        BareKey::Space => {
+            insert_prompt_character(client, ' ');
+            InputRoute::Consumed
+        }
+        _ => InputRoute::Consumed,
+    }
+}
+
+fn insert_prompt_character(client: &mut Client, character: char) {
+    let Some(prompt) = client.prompt.as_mut() else {
+        return;
+    };
+    if prompt.input.len() + character.len_utf8() > MAX_PROMPT_INPUT_BYTES {
+        return;
+    }
+    prompt.input.insert(prompt.cursor, character);
+    prompt.cursor += character.len_utf8();
 }
 
 fn route_confirmation(client: &mut Client, event: KeyEvent) -> InputRoute {
@@ -845,9 +1027,9 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        route_key, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode, KeyEvent,
-        KeyModifiers, KeyTable, KeyTableName, KeyTableTarget, KeyTables, MAX_KEY_NAME_BYTES,
-        MAX_KEY_TABLE_NAME_BYTES,
+        route_key, BareKey, ConfirmationState, InputMode, InputRoute, KeyBinding, KeyCode,
+        KeyEvent, KeyModifiers, KeyTable, KeyTableName, KeyTableTarget, KeyTables, PromptState,
+        MAX_KEY_NAME_BYTES, MAX_KEY_TABLE_NAME_BYTES,
     };
     use crate::{parse_command_text, ClientInput, Command, ServerState, SplitDirection};
 
@@ -863,6 +1045,13 @@ mod tests {
         KeyEvent::new(
             KeyCode::character(character, KeyModifiers::NONE),
             character.to_string().into_bytes(),
+        )
+    }
+
+    fn special(key: BareKey) -> KeyEvent {
+        KeyEvent::new(
+            KeyCode::try_new(key, KeyModifiers::NONE).unwrap(),
+            Vec::new(),
         )
     }
 
@@ -1037,6 +1226,64 @@ mod tests {
                 &binding.commands[0],
                 Command::ConfirmBefore { commands, .. }
                     if commands[0] == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn everyday_tmux_defaults_are_bound_to_existing_server_commands() {
+        let tables = KeyTables::tmux_defaults();
+        let prefix = tables.table(KeyTableName::PREFIX).unwrap();
+
+        for (key, expected) in [
+            ("d", Command::DetachClient),
+            ("r", Command::RefreshClient),
+            (
+                "]",
+                Command::PasteBuffer {
+                    name: None,
+                    delete: false,
+                    bracketed: true,
+                    target: None,
+                },
+            ),
+            ("C-o", Command::RotateWindow { reverse: false }),
+            (
+                "{",
+                Command::SwapPane {
+                    direction: crate::ResizeDirection::Up,
+                },
+            ),
+            (
+                "}",
+                Command::SwapPane {
+                    direction: crate::ResizeDirection::Down,
+                },
+            ),
+        ] {
+            let binding = prefix.get(KeyCode::parse(key).unwrap()).unwrap();
+            assert!(!binding.repeatable, "{key} should not enter repeat mode");
+            assert_eq!(binding.commands[0], expected, "wrong binding for {key}");
+        }
+
+        for (key, direction, amount) in [
+            ("C-Up", crate::ResizeDirection::Up, 1),
+            ("C-Down", crate::ResizeDirection::Down, 1),
+            ("C-Left", crate::ResizeDirection::Left, 1),
+            ("C-Right", crate::ResizeDirection::Right, 1),
+            ("M-Up", crate::ResizeDirection::Up, 5),
+            ("M-Down", crate::ResizeDirection::Down, 5),
+            ("M-Left", crate::ResizeDirection::Left, 5),
+            ("M-Right", crate::ResizeDirection::Right, 5),
+        ] {
+            let binding = prefix.get(KeyCode::parse(key).unwrap()).unwrap();
+            assert!(binding.repeatable, "{key} should remain in repeat mode");
+            assert!(matches!(
+                &binding.commands[0],
+                Command::ResizePane {
+                    target: crate::command::ResizeTarget::Direction(actual),
+                    amount: actual_amount,
+                } if *actual == direction && *actual_amount == amount
             ));
         }
     }
@@ -1292,6 +1539,80 @@ mod tests {
             ),
             InputRoute::Commands(commands)
         );
+    }
+
+    #[test]
+    fn prompt_editing_is_grapheme_safe_and_never_sends_input_to_the_pane() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        state.clients.get_mut(&client).unwrap().prompt = Some(PromptState::new(
+            "rename-window: ".to_string(),
+            "ae\u{301}z".to_string(),
+            "rename-window -- %%".to_string(),
+        ));
+
+        assert_eq!(
+            route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                special(BareKey::Left),
+                0
+            ),
+            InputRoute::Consumed
+        );
+        assert_eq!(
+            route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                special(BareKey::Backspace),
+                1,
+            ),
+            InputRoute::Consumed
+        );
+        assert_eq!(state.clients[&client].prompt.as_ref().unwrap().input, "az");
+        assert_eq!(
+            route_key(&mut state, client, InputMode::Normal, character('λ'), 2),
+            InputRoute::Consumed
+        );
+
+        let route = route_key(
+            &mut state,
+            client,
+            InputMode::Normal,
+            special(BareKey::Enter),
+            3,
+        );
+        assert!(matches!(
+            route,
+            InputRoute::Commands(commands)
+                if matches!(&commands[0], Command::RenameWindow { name, .. } if name == "aλz")
+        ));
+        assert!(state.clients[&client].prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_escape_cancels_without_releasing_commands_or_bytes() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        state.clients.get_mut(&client).unwrap().prompt = Some(PromptState::new(
+            "rename-window: ".to_string(),
+            "shell".to_string(),
+            "rename-window -- %%".to_string(),
+        ));
+
+        assert_eq!(
+            route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                special(BareKey::Escape),
+                0,
+            ),
+            InputRoute::Consumed
+        );
+        assert!(state.clients[&client].prompt.is_none());
     }
 
     #[test]

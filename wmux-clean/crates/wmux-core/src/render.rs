@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     Cell, Color, CursorStyle, DamageOperation, Line, PaneId, Rect, Screen, ServerState, SessionId,
-    Style, WindowId,
+    SplitDirection, Style, WindowId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,11 +230,18 @@ pub fn build_window_structure(
             .collect()
     };
     let borders = if window.zoomed.is_none() && panes.len() > 1 {
+        let two_pane_split = (panes.len() == 2).then(|| match &window.layout {
+            crate::LayoutNode::Split { direction, .. } => {
+                (*direction, panes[0].pane, panes[1].pane)
+            }
+            crate::LayoutNode::Leaf(_) => unreachable!("two panes require a split layout"),
+        });
         border_spans(
             window.layout.borders(full),
             full,
             &panes,
             window.active_pane,
+            two_pane_split,
         )
     } else {
         Vec::new()
@@ -264,6 +271,7 @@ fn border_spans(
     bounds: Rect,
     panes: &[PaneSpan],
     active_pane: PaneId,
+    two_pane_split: Option<(SplitDirection, PaneId, PaneId)>,
 ) -> Vec<BorderSpan> {
     const UP: u8 = 1;
     const RIGHT: u8 = 2;
@@ -313,25 +321,32 @@ fn border_spans(
         {
             directions |= LEFT;
         }
-        let active = active_rect.is_some_and(|rect| {
-            border_touches_rect(x, y, rect)
-                || y.checked_sub(1).is_some_and(|y| {
-                    border_topology_has(&topology, bounds, x, Some(y))
-                        && border_touches_rect(x, y, rect)
-                })
-                || x.checked_add(1).is_some_and(|x| {
-                    border_topology_has(&topology, bounds, x, Some(y))
-                        && border_touches_rect(x, y, rect)
-                })
-                || y.checked_add(1).is_some_and(|y| {
-                    border_topology_has(&topology, bounds, x, Some(y))
-                        && border_touches_rect(x, y, rect)
-                })
-                || x.checked_sub(1).is_some_and(|x| {
-                    border_topology_has(&topology, bounds, x, Some(y))
-                        && border_touches_rect(x, y, rect)
-                })
-        });
+        let active = two_pane_split
+            .and_then(|split| two_pane_border_owner(bounds, x, y, split))
+            .map_or_else(
+                || {
+                    active_rect.is_some_and(|rect| {
+                        border_touches_rect(x, y, rect)
+                            || y.checked_sub(1).is_some_and(|y| {
+                                border_topology_has(&topology, bounds, x, Some(y))
+                                    && border_touches_rect(x, y, rect)
+                            })
+                            || x.checked_add(1).is_some_and(|x| {
+                                border_topology_has(&topology, bounds, x, Some(y))
+                                    && border_touches_rect(x, y, rect)
+                            })
+                            || y.checked_add(1).is_some_and(|y| {
+                                border_topology_has(&topology, bounds, x, Some(y))
+                                    && border_touches_rect(x, y, rect)
+                            })
+                            || x.checked_sub(1).is_some_and(|x| {
+                                border_topology_has(&topology, bounds, x, Some(y))
+                                    && border_touches_rect(x, y, rect)
+                            })
+                    })
+                },
+                |owner| owner == active_pane,
+            );
         let ch = border_glyph(directions, active);
         if let Some(last) = spans.last_mut() {
             if last.row == y
@@ -350,6 +365,32 @@ fn border_spans(
         });
     }
     spans
+}
+
+fn two_pane_border_owner(
+    bounds: Rect,
+    x: u16,
+    y: u16,
+    (direction, first, second): (SplitDirection, PaneId, PaneId),
+) -> Option<PaneId> {
+    match direction {
+        SplitDirection::LeftRight => {
+            let first_rows = bounds.rows.saturating_add(1) / 2;
+            Some(if y.saturating_sub(bounds.y) < first_rows {
+                first
+            } else {
+                second
+            })
+        }
+        SplitDirection::TopBottom => {
+            let first_cols = bounds.cols.saturating_add(1) / 2;
+            Some(if x.saturating_sub(bounds.x) < first_cols {
+                first
+            } else {
+                second
+            })
+        }
+    }
 }
 
 fn border_topology_index(bounds: Rect, x: u16, y: u16) -> Option<usize> {
@@ -1729,6 +1770,58 @@ mod tests {
     }
 
     #[test]
+    fn two_side_by_side_panes_move_the_heavy_half_when_focus_changes() {
+        let mut server = ServerState::new();
+        let created = server.create_session("horizontal-focus", 17, 5);
+        let second = server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                17,
+                4,
+            )
+            .unwrap();
+
+        let second_active = build_window_scene(&server, created.session, 17, 5).unwrap();
+        assert_eq!(server.window(created.window).unwrap().active_pane, second);
+        assert_eq!(second_active.lines[0].cell(8).unwrap().ch(), '│');
+        assert_eq!(second_active.lines[3].cell(8).unwrap().ch(), '┃');
+
+        server.select_pane(created.window, created.pane).unwrap();
+        let first_active = build_window_scene(&server, created.session, 17, 5).unwrap();
+        assert_eq!(first_active.lines[0].cell(8).unwrap().ch(), '┃');
+        assert_eq!(first_active.lines[3].cell(8).unwrap().ch(), '│');
+        assert_ne!(first_active.lines, second_active.lines);
+    }
+
+    #[test]
+    fn two_stacked_panes_move_the_heavy_half_when_focus_changes() {
+        let mut server = ServerState::new();
+        let created = server.create_session("vertical-focus", 12, 7);
+        let second = server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::TopBottom,
+                12,
+                6,
+            )
+            .unwrap();
+
+        let second_active = build_window_scene(&server, created.session, 12, 7).unwrap();
+        assert_eq!(server.window(created.window).unwrap().active_pane, second);
+        assert_eq!(second_active.lines[2].cell(0).unwrap().ch(), '─');
+        assert_eq!(second_active.lines[2].cell(11).unwrap().ch(), '━');
+
+        server.select_pane(created.window, created.pane).unwrap();
+        let first_active = build_window_scene(&server, created.session, 12, 7).unwrap();
+        assert_eq!(first_active.lines[2].cell(0).unwrap().ch(), '━');
+        assert_eq!(first_active.lines[2].cell(11).unwrap().ch(), '─');
+        assert_ne!(first_active.lines, second_active.lines);
+    }
+
+    #[test]
     fn nested_splits_draw_connected_box_junctions() {
         let mut server = ServerState::new();
         let created = server.create_session("junctions", 12, 6);
@@ -2040,9 +2133,9 @@ mod tests {
         let first = scene.lines[0].text();
         let second = scene.lines[1].text();
 
-        assert!(first.starts_with("abcde┃"));
-        assert!(second.starts_with("fghij┃"));
-        assert_eq!(scene.lines[0].cell(5).map(|cell| cell.ch()), Some('┃'));
+        assert!(first.starts_with("abcde│"));
+        assert!(second.starts_with("fghij│"));
+        assert_eq!(scene.lines[0].cell(5).map(|cell| cell.ch()), Some('│'));
     }
 
     #[test]

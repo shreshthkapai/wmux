@@ -1847,6 +1847,12 @@ impl ServerOwner {
         } else {
             InputMode::Normal
         };
+        let prompt_before = self
+            .runtime
+            .state
+            .clients
+            .get(&client)
+            .and_then(client_prompt_text);
         let had_confirmation = self
             .runtime
             .state
@@ -1854,17 +1860,25 @@ impl ServerOwner {
             .get(&client)
             .is_some_and(|client| client.confirmation.is_some());
         let route = route_key(&mut self.runtime.state, client, mode, event, now_ms);
-        let confirmation_closed = had_confirmation
-            && self
-                .runtime
-                .state
-                .clients
-                .get(&client)
-                .is_some_and(|client| client.confirmation.is_none());
-        if confirmation_closed {
+        let prompt_after = self
+            .runtime
+            .state
+            .clients
+            .get(&client)
+            .and_then(client_prompt_text);
+        if prompt_before != prompt_after {
             if let Some(view) = self.clients.get_mut(&client) {
-                view.full_render = true;
-                view.render_state.invalidate();
+                if had_confirmation
+                    && self
+                        .runtime
+                        .state
+                        .clients
+                        .get(&client)
+                        .is_some_and(|client| client.confirmation.is_none())
+                {
+                    view.full_render = true;
+                    view.render_state.invalidate();
+                }
                 view.request_immediate_render(Instant::now());
             }
         }
@@ -2195,6 +2209,7 @@ impl ServerOwner {
             } => {
                 let mut installed = false;
                 if let Some(client) = self.runtime.state.clients.get_mut(&client) {
+                    client.prompt = None;
                     client.confirmation = Some(wmux_core::ConfirmationState { prompt, commands });
                     installed = true;
                 }
@@ -2202,6 +2217,25 @@ impl ServerOwner {
                     if let Some(view) = self.clients.get_mut(&client) {
                         view.full_render = true;
                         view.render_state.invalidate();
+                        view.request_immediate_render(Instant::now());
+                    }
+                }
+                Ok(false)
+            }
+            CommandEffect::Prompt {
+                client,
+                prompt,
+                input,
+                template,
+            } => {
+                let mut installed = false;
+                if let Some(client) = self.runtime.state.clients.get_mut(&client) {
+                    client.confirmation = None;
+                    client.prompt = Some(wmux_core::PromptState::new(prompt, input, template));
+                    installed = true;
+                }
+                if installed {
+                    if let Some(view) = self.clients.get_mut(&client) {
                         view.request_immediate_render(Instant::now());
                     }
                 }
@@ -3208,6 +3242,19 @@ fn path_io_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
+fn client_prompt_text(client: &wmux_core::Client) -> Option<String> {
+    client
+        .prompt
+        .as_ref()
+        .map(wmux_core::PromptState::display)
+        .or_else(|| {
+            client
+                .confirmation
+                .as_ref()
+                .map(|confirmation| confirmation.prompt.clone())
+        })
+}
+
 fn render_full_for_client(
     runtime: &mut Runtime,
     client: ClientId,
@@ -3220,12 +3267,11 @@ fn render_full_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
-    let confirmation_prompt = runtime
+    let prompt = runtime
         .state
         .clients
         .get(&client)
-        .and_then(|client| client.confirmation.as_ref())
-        .map(|confirmation| confirmation.prompt.clone());
+        .and_then(client_prompt_text);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
     let Some(scene) = build_window_scene_with_client_overlay(
@@ -3239,7 +3285,7 @@ fn render_full_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
-        confirmation_prompt.as_deref(),
+        prompt.as_deref(),
     ) else {
         return Vec::new();
     };
@@ -3258,12 +3304,11 @@ fn render_diff_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
-    let confirmation_prompt = runtime
+    let prompt = runtime
         .state
         .clients
         .get(&client)
-        .and_then(|client| client.confirmation.as_ref())
-        .map(|confirmation| confirmation.prompt.clone());
+        .and_then(client_prompt_text);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
     let Some(scene) = build_window_scene_with_client_overlay(
@@ -3277,7 +3322,7 @@ fn render_diff_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
-        confirmation_prompt.as_deref(),
+        prompt.as_deref(),
     ) else {
         return Vec::new();
     };
@@ -4408,6 +4453,163 @@ mod tests {
     }
 
     #[test]
+    fn prefix_comma_edits_window_name_in_status_without_reaching_the_pane() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("rename", 80, 24);
+        owner
+            .runtime
+            .state
+            .rename_window(created.window, "shell")
+            .unwrap();
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(client, view);
+        owner
+            .runtime
+            .add_test_platform_pane(created.pane, TerminalSize::new(80, 23));
+
+        for (character, modifiers, raw) in [
+            ('b', WireKeyModifiers::CONTROL, b"\x02".as_slice()),
+            (',', WireKeyModifiers::NONE, b",".as_slice()),
+        ] {
+            owner
+                .handle_wire_key_at(client, wire_char(character, modifiers, raw), 0)
+                .unwrap();
+        }
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.render_due_clients(Instant::now()));
+        let prompt_frame = outbound_rx.try_recv().unwrap();
+        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+            panic!("expected rename prompt render");
+        };
+        assert!(String::from_utf8_lossy(bytes).contains("rename-window: shell"));
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .drained(prompt_frame.wire_len());
+
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('u', WireKeyModifiers::CONTROL, b"\x15"),
+                1,
+            )
+            .unwrap();
+        for character in ['d', 'e', 'v'] {
+            owner
+                .handle_wire_key_at(
+                    client,
+                    wire_char(
+                        character,
+                        WireKeyModifiers::NONE,
+                        character.to_string().as_bytes(),
+                    ),
+                    2,
+                )
+                .unwrap();
+        }
+        owner
+            .handle_wire_key_at(
+                client,
+                WireKeyEvent {
+                    code: WireKeyCode::Enter,
+                    modifiers: WireKeyModifiers::NONE,
+                    raw: b"\r".to_vec(),
+                },
+                3,
+            )
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.runtime.state.windows[&created.window].name, "dev");
+        assert!(owner.runtime.test_inputs.is_empty());
+    }
+
+    #[test]
+    fn prefix_dollar_edits_session_name_without_reaching_the_pane() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("work", 80, 24);
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        owner.clients.insert(client, view);
+        owner
+            .runtime
+            .add_test_platform_pane(created.pane, TerminalSize::new(80, 23));
+
+        for (character, modifiers, raw) in [
+            ('b', WireKeyModifiers::CONTROL, b"\x02".as_slice()),
+            ('$', WireKeyModifiers::SHIFT, b"$".as_slice()),
+        ] {
+            owner
+                .handle_wire_key_at(client, wire_char(character, modifiers, raw), 0)
+                .unwrap();
+        }
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.render_due_clients(Instant::now()));
+        let prompt_frame = outbound_rx.try_recv().unwrap();
+        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+            panic!("expected rename prompt render");
+        };
+        assert!(String::from_utf8_lossy(bytes).contains("rename-session: work"));
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .drained(prompt_frame.wire_len());
+
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('u', WireKeyModifiers::CONTROL, b"\x15"),
+                1,
+            )
+            .unwrap();
+        for character in ['m', 'a', 'i', 'n'] {
+            owner
+                .handle_wire_key_at(
+                    client,
+                    wire_char(
+                        character,
+                        WireKeyModifiers::NONE,
+                        character.to_string().as_bytes(),
+                    ),
+                    2,
+                )
+                .unwrap();
+        }
+        owner
+            .handle_wire_key_at(
+                client,
+                WireKeyEvent {
+                    code: WireKeyCode::Enter,
+                    modifiers: WireKeyModifiers::NONE,
+                    raw: b"\r".to_vec(),
+                },
+                3,
+            )
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.runtime.state.sessions[&created.session].name, "main");
+        assert!(owner.runtime.test_inputs.is_empty());
+    }
+
+    #[test]
     fn server_owned_key_unbound_utf8_and_paste_reach_the_pane_once() {
         let (mut owner, client, pane) = attached_owner();
         owner
@@ -4684,7 +4886,7 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert!(matches!(
             &commands[0],
-            Command::RenameWindow { name } if name == "alpha beta"
+            Command::RenameWindow { name, .. } if name == "alpha beta"
         ));
     }
 

@@ -1,8 +1,10 @@
 use smallvec::SmallVec;
 use std::{borrow::Borrow, sync::Arc};
 
-use super::{Command, CommandEffect, CommandOutcome, QueuedCommand, MAX_SEND_BYTES};
-use crate::ServerState;
+use super::{
+    Command, CommandEffect, CommandOutcome, QueuedCommand, MAX_COMMAND_PROMPT_BYTES, MAX_SEND_BYTES,
+};
+use crate::{FormatContext, FormatEngine, ServerState};
 
 pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> CommandOutcome {
     let queued = queued.borrow();
@@ -60,6 +62,57 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
                     client: queued.client,
                     prompt: prompt.clone(),
                     commands: commands.clone(),
+                });
+            }
+            Command::CommandPrompt {
+                prompt,
+                input,
+                template,
+            } => {
+                let context = FormatContext::for_client(queued.client);
+                let expanded = (|| {
+                    Ok::<_, String>((
+                        FormatEngine::expand(state, context, prompt)
+                            .map_err(|error| error.to_string())?,
+                        FormatEngine::expand(state, context, input)
+                            .map_err(|error| error.to_string())?,
+                        FormatEngine::expand(state, context, template)
+                            .map_err(|error| error.to_string())?,
+                    ))
+                })();
+                let (prompt, input, template) = match expanded {
+                    Ok(expanded) => expanded,
+                    Err(message) => {
+                        return CommandOutcome {
+                            ok: false,
+                            message,
+                            effects,
+                        };
+                    }
+                };
+                if [prompt.len(), input.len(), template.len()]
+                    .into_iter()
+                    .any(|len| len > MAX_COMMAND_PROMPT_BYTES)
+                {
+                    return CommandOutcome {
+                        ok: false,
+                        message: "expanded command prompt field exceeds 4096 bytes".to_string(),
+                        effects,
+                    };
+                }
+                let validation = template.replace("%%", &super::quote_argument(""));
+                if let Err(error) = super::parse_command_text(&validation) {
+                    return CommandOutcome {
+                        ok: false,
+                        message: format!("invalid command prompt template: {error}"),
+                        effects,
+                    };
+                }
+                effects.push(CommandEffect::Prompt {
+                    client: queued.client,
+                    prompt,
+                    input,
+                    template,
                 });
             }
             Command::SetBuffer {
@@ -192,6 +245,7 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             | Command::SelectPane { .. }
             | Command::ResizePane { .. }
             | Command::RenameWindow { .. }
+            | Command::RenameSession { .. }
             | Command::RotateWindow { .. }
             | Command::SwapPane { .. }
             | Command::AttachSession { .. }

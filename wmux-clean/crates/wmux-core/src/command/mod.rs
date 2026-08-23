@@ -23,6 +23,7 @@ pub use parser::{
 };
 
 const MAX_CONFIRM_PROMPT_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_PROMPT_BYTES: usize = 4 * 1024;
 const MAX_SEND_BYTES: usize = 1024 * 1024;
 const MAX_SEND_REPEAT: u16 = 10_000;
 pub const MAX_SOURCE_DEPTH: u8 = 16;
@@ -123,6 +124,11 @@ pub enum Command {
         amount: u16,
     },
     RenameWindow {
+        target: Option<TargetSpec>,
+        name: String,
+    },
+    RenameSession {
+        target: Option<TargetSpec>,
         name: String,
     },
     RotateWindow {
@@ -171,6 +177,11 @@ pub enum Command {
     ConfirmBefore {
         prompt: String,
         commands: CommandList,
+    },
+    CommandPrompt {
+        prompt: String,
+        input: String,
+        template: String,
     },
     SetOption {
         scope: OptionScope,
@@ -352,6 +363,12 @@ pub enum CommandEffect {
         client: ClientId,
         prompt: String,
         commands: CommandList,
+    },
+    Prompt {
+        client: ClientId,
+        prompt: String,
+        input: String,
+        template: String,
     },
     DetachClient {
         client: ClientId,
@@ -687,7 +704,7 @@ pub(super) fn execute_state_command(
                 Err(error) => error_result(queued.sequence, error),
             }
         }
-        Command::RefreshClient | Command::ConfirmBefore { .. } => {
+        Command::RefreshClient | Command::ConfirmBefore { .. } | Command::CommandPrompt { .. } => {
             if !state.clients.contains_key(&queued.client) {
                 return error_result(queued.sequence, "no matching client");
             }
@@ -1267,16 +1284,38 @@ pub(super) fn execute_state_command(
                 attached_pane: pane,
             }
         }
-        Command::RenameWindow { name } => {
-            let resolved =
-                match resolve_command_target(state, queued.client, TargetKind::Window, None) {
-                    Ok(resolved) => resolved,
-                    Err(error) => return error_result(queued.sequence, error),
-                };
+        Command::RenameWindow { target, name } => {
+            let resolved = match resolve_command_target(
+                state,
+                queued.client,
+                TargetKind::Window,
+                target.as_ref(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result(queued.sequence, error),
+            };
             let (Some(session), Some(window)) = (resolved.session, resolved.window) else {
                 return error_result(queued.sequence, "session has no active window");
             };
             state.rename_window(window, name);
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: state.active_pane_for_session(session),
+            }
+        }
+        Command::RenameSession { target, name } => {
+            let session = match resolve_session_target(state, queued.client, target.as_ref()) {
+                Ok(session) => session,
+                Err(error) => return error_result(queued.sequence, error),
+            };
+            if let Some(existing) = TargetResolver::new(state).find_exact_session(&name) {
+                if existing != session {
+                    return error_result(queued.sequence, format!("duplicate session: {name}"));
+                }
+            }
+            state.rename_session(session, name);
             CommandResult {
                 sequence: queued.sequence,
                 ok: true,
@@ -1597,6 +1636,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: None,
     },
     CommandEntry {
+        name: "command-prompt",
+        alias: Some("commandp"),
+    },
+    CommandEntry {
         name: "confirm-before",
         alias: Some("confirm"),
     },
@@ -1687,6 +1730,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
     CommandEntry {
         name: "paste-buffer",
         alias: Some("pasteb"),
+    },
+    CommandEntry {
+        name: "rename-session",
+        alias: Some("rename"),
     },
     CommandEntry {
         name: "rename-window",
@@ -1831,6 +1878,7 @@ pub(super) fn parse_single_command(
             Ok(Command::RefreshClient)
         }
         "confirm-before" => parse_confirm_before(argv, depth),
+        "command-prompt" => parse_command_prompt(argv),
         "display-message" => parse_display_message(argv),
         "run-shell" => parse_run_shell(argv),
         "if-shell" => parse_if_shell(argv, depth),
@@ -1958,11 +2006,8 @@ pub(super) fn parse_single_command(
             },
             amount: resize_amount(argv),
         }),
-        "rename-window" => Ok(Command::RenameWindow {
-            name: flag_value(argv, "-n")
-                .or_else(|| argv.get(1).cloned())
-                .unwrap_or_else(|| "window".to_string()),
-        }),
+        "rename-window" => parse_rename(argv, false),
+        "rename-session" => parse_rename(argv, true),
         "rotate-window" => Ok(Command::RotateWindow {
             reverse: has_flag(argv, "-D"),
         }),
@@ -2626,6 +2671,117 @@ fn parse_switch_client(argv: &[String]) -> Result<Command, CommandParseError> {
     })
 }
 
+fn parse_command_prompt(argv: &[String]) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut prompt = String::new();
+    let mut input = String::new();
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "-p" => {
+                prompt = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -p"))?
+                    .clone();
+                index += 2;
+            }
+            "-I" => {
+                input = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -I"))?
+                    .clone();
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => break,
+        }
+    }
+    let template = match &argv[index..] {
+        [template] => template.clone(),
+        [] => {
+            return Err(CommandParseError::new(
+                "command-prompt requires a command template",
+            ))
+        }
+        _ => {
+            return Err(CommandParseError::new(
+                "command-prompt accepts one command template",
+            ))
+        }
+    };
+    if !template.contains("%%") {
+        return Err(CommandParseError::new(
+            "command-prompt template must contain %%",
+        ));
+    }
+    if [prompt.len(), input.len(), template.len()]
+        .into_iter()
+        .any(|len| len > MAX_COMMAND_PROMPT_BYTES)
+    {
+        return Err(CommandParseError::new(
+            "command prompt field exceeds 4096 bytes",
+        ));
+    }
+    Ok(Command::CommandPrompt {
+        prompt,
+        input,
+        template,
+    })
+}
+
+fn parse_rename(argv: &[String], session: bool) -> Result<Command, CommandParseError> {
+    let mut index = 1;
+    let mut target = None;
+    let mut name = None;
+    let mut options = true;
+    while let Some(argument) = argv.get(index) {
+        match argument.as_str() {
+            "--" if options => {
+                options = false;
+                index += 1;
+            }
+            "-t" if options => {
+                let raw = argv
+                    .get(index + 1)
+                    .ok_or_else(|| CommandParseError::new("missing argument for -t"))?;
+                target = Some(
+                    TargetSpec::parse(raw.clone())
+                        .map_err(|error| CommandParseError::new(error.to_string()))?,
+                );
+                index += 2;
+            }
+            "-n" if options && !session => {
+                name = Some(
+                    argv.get(index + 1)
+                        .ok_or_else(|| CommandParseError::new("missing argument for -n"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            option if options && option.starts_with('-') => {
+                return Err(CommandParseError::new(format!("unknown option: {option}")));
+            }
+            _ => {
+                if name.replace(argument.clone()).is_some() {
+                    return Err(CommandParseError::new(format!(
+                        "too many arguments for {}",
+                        argv[0]
+                    )));
+                }
+                index += 1;
+            }
+        }
+    }
+    let name =
+        name.ok_or_else(|| CommandParseError::new(format!("{} requires a name", argv[0])))?;
+    if session {
+        Ok(Command::RenameSession { target, name })
+    } else {
+        Ok(Command::RenameWindow { target, name })
+    }
+}
+
 fn parse_confirm_before(argv: &[String], depth: usize) -> Result<Command, CommandParseError> {
     let mut index = 1;
     let mut prompt = None;
@@ -2846,9 +3002,21 @@ fn format_command(command: &Command) -> String {
             }
             "resize-pane"
         }
-        Command::RenameWindow { name } => {
+        Command::RenameWindow { target, name } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            arguments.push("--".to_string());
             arguments.push(name.clone());
             "rename-window"
+        }
+        Command::RenameSession { target, name } => {
+            if let Some(target) = target {
+                arguments.extend(["-t".to_string(), target.to_string()]);
+            }
+            arguments.push("--".to_string());
+            arguments.push(name.clone());
+            "rename-session"
         }
         Command::RotateWindow { reverse } => {
             if *reverse {
@@ -2984,6 +3152,20 @@ fn format_command(command: &Command) -> String {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+        }
+        Command::CommandPrompt {
+            prompt,
+            input,
+            template,
+        } => {
+            arguments.extend([
+                "-p".to_string(),
+                prompt.clone(),
+                "-I".to_string(),
+                input.clone(),
+                template.clone(),
+            ]);
+            "command-prompt"
         }
         Command::SetOption {
             scope,

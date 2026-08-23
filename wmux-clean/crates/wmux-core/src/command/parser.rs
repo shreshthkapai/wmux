@@ -167,7 +167,7 @@ mod tests {
         let argv = parse_command_argv(&["rename-window".into(), "".into()]).unwrap();
         assert_eq!(text, argv);
         assert_eq!(text.len(), 1);
-        assert!(matches!(&text[0], Command::RenameWindow { name } if name.is_empty()));
+        assert!(matches!(&text[0], Command::RenameWindow { name, .. } if name.is_empty()));
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
             parse_command_text("neww -n one; rename-window 'two words'; list-sessions").unwrap();
         assert_eq!(list.len(), 3);
         assert!(matches!(&list[0], Command::NewWindow { name: Some(name) } if name == "one"));
-        assert!(matches!(&list[1], Command::RenameWindow { name } if name == "two words"));
+        assert!(matches!(&list[1], Command::RenameWindow { name, .. } if name == "two words"));
         assert!(matches!(&list[2], Command::ListSessions));
     }
 
@@ -222,7 +222,7 @@ mod tests {
         ] {
             let parsed =
                 parse_command_text(&format!("rename-window {}", quote_argument(argument))).unwrap();
-            assert!(matches!(&parsed[0], Command::RenameWindow { name } if name == argument));
+            assert!(matches!(&parsed[0], Command::RenameWindow { name, .. } if name == argument));
         }
 
         let mut argv = Vec::new();

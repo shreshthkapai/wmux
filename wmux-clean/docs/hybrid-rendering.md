@@ -49,10 +49,20 @@ single box-drawing glyphs; the edge adjacent to the active pane uses the
 matching heavy glyph and bold attribute. Nested layouts are reduced to proper
 corners, tees, and crossings before compact row spans are cached.
 
+For an exact two-pane layout, wmux follows tmux's shared-border ownership
+rule: a vertical separator belongs to the first pane on its top half and the
+second pane on its bottom half; a horizontal separator belongs to the first
+pane on its left half and the second pane on its right half. Only the active
+pane's owned half uses the heavy glyph. Moving focus therefore moves the thick
+half of the same separator instead of making the entire divider permanently
+heavy.
+
 This follows tmux's server-owned status and active-adjacent border selection,
 with zellij's focused/unfocused frame distinction, while keeping wmux's scene
-and client-baseline model. Confirmation prompts temporarily replace the status
-row and hide the physical cursor.
+and client-baseline model. Confirmation and editing prompts temporarily
+replace the status row and hide the physical cursor. Editing prompts update
+through client-scoped scene diffs, so typing does not mutate the pane grid or
+require a full-scene repaint.
 
 ## Direct pane damage
 
