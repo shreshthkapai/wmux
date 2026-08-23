@@ -30,14 +30,14 @@ behavior from entering the shared semantic path.
 
 ### Default UI evidence
 
-The accepted 16-case aggregate is `9468acb074c0244a` after adding the
-server-owned status row, connected box-drawing borders, and active-pane
-emphasis to the multiple-client scene fixture. Source audit confirms that this
-is the only portable case that composes renderer output; the remaining 15 case
-fingerprints retain their previous semantic inputs. Windows and Linux both
-produce the new aggregate and `EXPECTED_DIFFERENCES` remains empty. The
-conformance executable and shared runtime compile for both Apple targets, but
-the aggregate still requires a native macOS runner.
+The accepted 16-case aggregate is `c283cc090b2e4197` after adding the
+server-owned status row, connected box-drawing borders, active-pane emphasis,
+and stable full-terminal window-list centering to the multiple-client scene
+fixture. Source audit confirms that this is the only portable case that
+composes renderer output; the remaining 15 case fingerprints retain their
+previous semantic inputs. Windows produces the new aggregate and
+`EXPECTED_DIFFERENCES` remains empty. Linux and macOS confirmation still
+requires their native hosted runners.
 
 ### Phase 7 shared-semantics evidence
 
