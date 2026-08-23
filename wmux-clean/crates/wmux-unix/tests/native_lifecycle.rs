@@ -4,9 +4,12 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wmux_platform::{BoxedIpcStream, ClientTransport};
@@ -20,11 +23,9 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock is after Unix epoch")
-            .as_nanos();
-        Self(std::env::temp_dir().join(format!("wmux-native-lifecycle-{}-{nonce}", process::id())))
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self(test_temporary_root().join(format!("wn-{:x}-{nonce:x}", process::id())))
     }
 
     fn path(&self) -> &Path {
@@ -37,11 +38,21 @@ impl Drop for TestDirectory {
         if self
             .0
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("wmux-native-lifecycle-"))
+            .is_some_and(|name| name.to_string_lossy().starts_with("wn-"))
         {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn test_temporary_root() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn test_temporary_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

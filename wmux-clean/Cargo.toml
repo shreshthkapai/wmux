@@ -27,6 +27,7 @@ homepage = "https://github.com/shreshthkapai/wmux"
 publish = false
 
 [workspace.dependencies]
+close_fds = "0.3.2"
 crossterm = { version = "0.28", default-features = false, features = ["bracketed-paste", "events", "windows"] }
 libc = "0.2"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal", "socket", "term"] }

@@ -155,8 +155,9 @@ mod tests {
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process::{self, Command},
+        sync::atomic::{AtomicU64, Ordering},
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wmux_platform::{
@@ -169,15 +170,10 @@ mod tests {
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("test clock is after Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "wmux-unix-platform-test-{label}-{}-{nonce}",
-                process::id()
-            ));
+        fn new(_label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = test_temporary_root().join(format!("wp-{:x}-{nonce:x}", process::id()));
             fs::create_dir(&path).expect("test directory is created");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("test directory is private");
@@ -191,13 +187,24 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            if self.0.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .starts_with("wmux-unix-platform-test-")
-            }) {
+            if self
+                .0
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("wp-"))
+            {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_temporary_root() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn test_temporary_root() -> PathBuf {
+        std::env::temp_dir()
     }
 
     #[test]

@@ -372,7 +372,21 @@ mod tests {
         drop(guard);
 
         let restored = termios::tcgetattr(&pty.slave).expect("restored termios is readable");
-        assert_eq!(restored, saved);
+        assert_eq!(restored.input_flags, saved.input_flags);
+        assert_eq!(restored.output_flags, saved.output_flags);
+        assert_eq!(restored.control_flags, saved.control_flags);
+        assert_eq!(restored.local_flags, saved.local_flags);
+        assert_eq!(restored.control_chars, saved.control_chars);
+        #[cfg(target_os = "linux")]
+        assert_eq!(restored.line_discipline, saved.line_discipline);
+        assert_eq!(
+            termios::cfgetispeed(&restored),
+            termios::cfgetispeed(&saved)
+        );
+        assert_eq!(
+            termios::cfgetospeed(&restored),
+            termios::cfgetospeed(&saved)
+        );
     }
 
     #[test]

@@ -3,12 +3,18 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
+        ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
 };
+
+#[cfg(target_os = "linux")]
+const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
+#[cfg(not(target_os = "linux"))]
+const UNIX_SOCKET_PATH_CAPACITY: usize = 104;
 
 pub(crate) struct UnixEndpoint {
     directory: PathBuf,
@@ -22,7 +28,7 @@ impl UnixEndpoint {
         let owner_uid = unsafe { libc::geteuid() };
         let directory = runtime_directory(
             std::env::var_os("XDG_RUNTIME_DIR"),
-            std::env::temp_dir(),
+            temporary_runtime_root(),
             owner_uid,
         );
         Self::from_runtime_directory(directory)
@@ -36,6 +42,12 @@ impl UnixEndpoint {
             ));
         }
         let socket = directory.join("wmux.sock");
+        if !socket_path_fits(&socket) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix socket path exceeds the platform limit",
+            ));
+        }
         let lock = directory.join("wmux.lock");
         Ok(Self {
             directory,
@@ -177,11 +189,30 @@ fn runtime_directory(
     temporary: PathBuf,
     owner_uid: libc::uid_t,
 ) -> PathBuf {
+    let fallback = temporary.join(format!("wmux-{owner_uid}"));
     xdg_runtime
         .map(PathBuf::from)
         .filter(|path| runtime_root_is_private(path, owner_uid))
         .map(|path| path.join("wmux"))
-        .unwrap_or_else(|| temporary.join(format!("wmux-{owner_uid}")))
+        .filter(|path| socket_path_fits(&path.join("wmux.sock")))
+        .unwrap_or(fallback)
+}
+
+#[cfg(target_os = "macos")]
+fn temporary_runtime_root() -> PathBuf {
+    // Match tmux's short, owner-protected /tmp/tmux-UID socket hierarchy.
+    // Apple's sockaddr_un::sun_path has only 104 bytes, while TMPDIR is often
+    // a much longer /var/folders path.
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn temporary_runtime_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+fn socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_CAPACITY
 }
 
 fn runtime_root_is_private(path: &Path, owner_uid: libc::uid_t) -> bool {
@@ -313,13 +344,13 @@ impl OwnedPath {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_directory, UnixEndpoint};
+    use super::{runtime_directory, UnixEndpoint, UNIX_SOCKET_PATH_CAPACITY};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
     };
     use wmux_platform::PeerIdentity;
 
@@ -327,12 +358,9 @@ mod tests {
 
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("test clock is after the Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("wmux-unix-endpoint-test-{}-{nonce}", process::id()));
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = test_temporary_root().join(format!("wi-{:x}-{nonce:x}", process::id()));
             Self(path)
         }
 
@@ -343,13 +371,24 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            if self.0.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .starts_with("wmux-unix-endpoint-test-")
-            }) {
+            if self
+                .0
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("wi-"))
+            {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_temporary_root() -> PathBuf {
+        PathBuf::from("/tmp")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn test_temporary_root() -> PathBuf {
+        std::env::temp_dir()
     }
 
     #[test]
@@ -384,8 +423,29 @@ mod tests {
             runtime_directory(Some("relative".into()), temporary.clone(), owner_uid),
             temporary.join(format!("wmux-{owner_uid}"))
         );
+
+        let long_root = root.path().join("x".repeat(UNIX_SOCKET_PATH_CAPACITY));
+        fs::create_dir(&long_root).expect("long private runtime root is created");
+        fs::set_permissions(&long_root, fs::Permissions::from_mode(0o700))
+            .expect("long runtime root is private");
+        assert_eq!(
+            runtime_directory(
+                Some(long_root.into_os_string()),
+                temporary.clone(),
+                owner_uid,
+            ),
+            temporary.join(format!("wmux-{owner_uid}"))
+        );
+
         let error = match UnixEndpoint::from_runtime_directory(PathBuf::from("relative")) {
             Ok(_) => panic!("relative endpoint was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let long_endpoint = root.path().join("y".repeat(UNIX_SOCKET_PATH_CAPACITY));
+        let error = match UnixEndpoint::from_runtime_directory(long_endpoint) {
+            Ok(_) => panic!("oversized endpoint path was accepted"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);

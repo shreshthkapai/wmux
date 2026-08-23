@@ -44,7 +44,7 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
       - name: Compile fuzz harnesses on stable
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
       - name: Lint fuzz harnesses on stable
@@ -108,7 +108,7 @@ jobs:
       - name: Lint native adapter
         run: cargo clippy --locked -p ${{ matrix.package }} --all-targets -- -D warnings
       - name: Test native adapter and lifecycle
-        run: cargo test --locked -p ${{ matrix.package }} --all-targets
+        run: cargo test --locked -p ${{ matrix.package }} --all-targets -- --test-threads=1
       - name: Check native binaries
         run: cargo check --locked -p wmux --bins
 
@@ -157,7 +157,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/fuzz/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Install cargo-fuzz
-        run: cargo +nightly-2026-08-22 install cargo-fuzz --locked
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo +nightly-2026-08-22 install cargo-fuzz --locked
       - name: Prepare artifact directories
         run: mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes
       - name: Fuzz command parser

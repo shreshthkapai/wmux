@@ -456,10 +456,13 @@ mod tests {
         pane: PlatformPaneId,
     ) -> [libc::pid_t; 2] {
         let marker = format!("WMUX_PIDS_{}", pane.raw());
+        let ready_marker = format!("WMUX_CHILD_READY_{}", pane.raw());
         let script = format!(
-            "trap ':' HUP TERM; sleep 30 & child=$!; \
+            "trap 'exit 0' HUP TERM; \
+             (trap 'exit 0' HUP TERM; printf '{ready_marker}\\n'; \
+             while :; do :; done) & child=$!; \
              printf '{marker} %s %s\\n' \"$$\" \"$child\"; \
-             while kill -0 \"$child\" 2>/dev/null; do wait \"$child\" || :; done"
+             wait \"$child\""
         );
         backend
             .submit(PlatformRequest::SpawnPane(SpawnPane {
@@ -494,6 +497,10 @@ mod tests {
                 let text = String::from_utf8_lossy(&output);
                 let fields = text.split_whitespace().collect::<Vec<_>>();
                 if let Some(marker_index) = fields.iter().position(|field| *field == marker) {
+                    if !fields.iter().any(|field| *field == ready_marker) {
+                        notified.notified().await;
+                        continue;
+                    }
                     let shell = fields
                         .get(marker_index + 1)
                         .expect("shell PID follows marker")
@@ -518,7 +525,7 @@ mod tests {
         notified: &Notify,
         pane: PlatformPaneId,
     ) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 while let Some(event) = backend.try_next_event(pane).expect("event poll succeeds") {
                     match event {
@@ -532,8 +539,34 @@ mod tests {
                 notified.notified().await;
             }
         })
-        .await
-        .expect("PTY closes after termination");
+        .await;
+        if result.is_err() {
+            let state = backend
+                .panes
+                .get(&pane)
+                .expect("timed out pane still exists");
+            let process_group = state.process_group;
+            let exit_emitted = state.exit_emitted;
+            let eof = state.eof;
+            let group_alive = unsafe { libc::kill(-process_group, 0) } == 0;
+            let mut pending = Vec::new();
+            while let Some(event) = backend
+                .try_next_event(pane)
+                .expect("timeout diagnostic event poll succeeds")
+            {
+                pending.push(match event {
+                    PlatformEvent::PtyOutput { .. } => "output",
+                    PlatformEvent::PtyExited { .. } => "exit",
+                    PlatformEvent::PtyClosed { .. } => "closed",
+                    PlatformEvent::BackendError { .. } => "error",
+                });
+            }
+            panic!(
+                "PTY closes after termination: process_group={process_group} \
+                 group_alive={group_alive} exit_emitted={exit_emitted} eof={eof} \
+                 pending={pending:?}"
+            );
+        }
     }
 
     fn process_is_running(process: libc::pid_t) -> bool {

@@ -111,6 +111,18 @@ pub(crate) fn child_descriptor_limit() -> libc::c_int {
     *LIMIT.get_or_init(|| unsafe { libc::getdtablesize().max(libc::STDERR_FILENO + 1) })
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn mark_non_stdio_descriptors_close_on_exec(
+    _descriptor_limit: libc::c_int,
+) -> io::Result<()> {
+    // Darwin's descriptor table can be very large. Enumerate the descriptors
+    // that are actually open instead of issuing an fcntl call for every
+    // possible slot. Zellij uses the same close_fds strategy before exec.
+    close_fds::set_fds_cloexec(libc::STDERR_FILENO + 1, &[]);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn mark_non_stdio_descriptors_close_on_exec(
     descriptor_limit: libc::c_int,
 ) -> io::Result<()> {
