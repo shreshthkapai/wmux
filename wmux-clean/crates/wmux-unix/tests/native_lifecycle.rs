@@ -104,17 +104,29 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
 
     write_message(
         &mut attached,
-        Message::Input(b"(sleep 1; printf '\r\nWMUX_%s\r\n' BACKGROUND) &\n".to_vec()),
+        Message::Input(
+            b"sh -c 'trap \"printf \\\"WMUX_BACKGROUND\\\\n\\\"; exit 0\" USR1; printf \"WMUX_BACKGROUND_PID_%s\\n\" \"$$\"; while :; do sleep 60 & wait; done' &\n"
+                .to_vec(),
+        ),
     )
     .await;
+    let background_pid = wait_for_pid_marker(&mut attached, b"WMUX_BACKGROUND_PID_").await;
+    assert!(process_is_running(background_pid));
+
     write_message(&mut attached, Message::Detach).await;
     wait_for_command_ok(&mut attached).await;
     drop(attached);
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert_eq!(unsafe { libc::kill(background_pid, libc::SIGUSR1) }, 0);
+    wait_for_process_exit(background_pid).await;
 
     let mut reattached = connect_and_handshake(&transport).await;
-    command(&mut reattached, "attach-session -t native").await;
-    wait_for_output(&mut reattached, b"WMUX_BACKGROUND").await;
+    command_and_wait_for_output(
+        &mut reattached,
+        "attach-session -t native",
+        b"WMUX_BACKGROUND",
+    )
+    .await;
 
     write_message(
         &mut reattached,
@@ -223,6 +235,36 @@ async fn wait_for_command_ok(stream: &mut BoxedIpcStream) {
     })
     .await
     .expect("command completes");
+}
+
+async fn command_and_wait_for_output(stream: &mut BoxedIpcStream, command: &str, marker: &[u8]) {
+    write_message(stream, Message::Command(command.to_string())).await;
+    let mut command_complete = false;
+    let mut marker_received = false;
+    let mut output = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        while !command_complete || !marker_received {
+            match read_message(stream).await {
+                Some(Message::CommandOk(_)) => command_complete = true,
+                Some(Message::Output(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    marker_received = output.windows(marker.len()).any(|window| window == marker);
+                }
+                Some(Message::CommandErr(error)) => panic!("command failed: {error}"),
+                Some(Message::Clipboard(_)) => {}
+                Some(message) => panic!("unexpected command response: {message:?}"),
+                None => panic!("server closed before command output arrived"),
+            }
+        }
+    })
+    .await;
+    if outcome.is_err() {
+        panic!(
+            "command completed={command_complete}, expected pane output {:?}; received {:?}",
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&output),
+        );
+    }
 }
 
 async fn wait_for_output(stream: &mut BoxedIpcStream, marker: &[u8]) {

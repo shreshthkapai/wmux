@@ -722,12 +722,18 @@ impl Screen {
 
     pub fn move_down(&mut self, count: u16) {
         self.pending_wrap = false;
-        self.cursor_row = (self.cursor_row + count.max(1)).min(self.rows().saturating_sub(1));
+        self.cursor_row = self
+            .cursor_row
+            .saturating_add(count.max(1))
+            .min(self.rows().saturating_sub(1));
     }
 
     pub fn move_right(&mut self, count: u16) {
         self.pending_wrap = false;
-        self.cursor_col = (self.cursor_col + count.max(1)).min(self.cols().saturating_sub(1));
+        self.cursor_col = self
+            .cursor_col
+            .saturating_add(count.max(1))
+            .min(self.cols().saturating_sub(1));
     }
 
     pub fn move_left(&mut self, count: u16) {

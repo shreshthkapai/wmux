@@ -272,7 +272,7 @@ mod tests {
     use std::{
         ffi::OsString,
         fs,
-        io::Read,
+        io::{self, Read},
         os::fd::{AsRawFd, OwnedFd},
         path::{Path, PathBuf},
         process,
@@ -311,6 +311,13 @@ mod tests {
     }
 
     fn read_pty_to_end(master: OwnedFd) -> Vec<u8> {
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1, "PTY master flags are readable");
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1,
+            "PTY master can be made nonblocking"
+        );
         let mut master = fs::File::from(master);
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
@@ -319,6 +326,7 @@ mod tests {
                 Ok(0) => break,
                 Ok(read) => output.extend_from_slice(&chunk[..read]),
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("read PTY output: {error}"),
             }
         }

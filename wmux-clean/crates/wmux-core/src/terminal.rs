@@ -692,6 +692,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_large_csi_parameters_do_not_overflow() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+
+        engine.feed(&mut screen, b"x\x1b[65535C");
+        assert_eq!(screen.cursor(), (0, 19));
+
+        engine.feed(&mut screen, b"\n\x1b[65535B");
+        assert_eq!(screen.cursor(), (4, 19));
+    }
+
+    #[test]
     fn handles_cursor_clear_and_osc_title() {
         let screen = run(b"\x1b]0;ignored\x07hello\x1b[3D\x1b[K");
 

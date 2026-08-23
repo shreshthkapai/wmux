@@ -271,7 +271,7 @@ mod tests {
                     arguments: vec![
                         OsString::from("-c"),
                         OsString::from(concat!(
-                            "printf '%s %s ' \"$$\" \"$(ps -o sid= -p $$)\" > \"$1\"; ",
+                            "printf '%s ' \"$$\" > \"$1\"; ",
                             "if [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]; ",
                             "then printf detached >> \"$1\"; else printf terminal >> \"$1\"; fi; ",
                             "sleep 30"
@@ -306,14 +306,11 @@ mod tests {
             .expect("daemon PID is reported")
             .parse::<libc::pid_t>()
             .expect("daemon PID is numeric");
-        let daemon_session = fields
-            .next()
-            .expect("daemon session is reported")
-            .parse::<libc::pid_t>()
-            .expect("daemon session is numeric");
         let terminal = fields.next().expect("terminal state is reported");
         let mut cleanup = DaemonCleanup(daemon_pid);
+        let daemon_session = unsafe { libc::getsid(daemon_pid) };
 
+        assert_ne!(daemon_session, -1);
         assert_eq!(daemon_session, daemon_pid);
         assert_ne!(daemon_session, unsafe { libc::getsid(0) });
         assert_eq!(terminal, "detached");
@@ -370,7 +367,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(report) = fs::read_to_string(path) {
-                if report.split_whitespace().count() == 3 {
+                if report.split_whitespace().count() == 2 {
                     return report;
                 }
             }
