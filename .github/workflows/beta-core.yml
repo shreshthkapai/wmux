@@ -110,7 +110,7 @@ jobs:
       - name: Test native adapter and lifecycle
         run: cargo test --locked -p ${{ matrix.package }} --all-targets
       - name: Check native binaries
-        run: cargo check --locked -p wmux -p wmux-server --bins
+        run: cargo check --locked -p wmux --bins
 
   stress:
     name: Stress (${{ matrix.os }})

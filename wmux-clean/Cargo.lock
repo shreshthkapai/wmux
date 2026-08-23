@@ -445,7 +445,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wmux"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tokio",
  "wmux-cli",
@@ -453,13 +453,14 @@ dependencies = [
  "wmux-core",
  "wmux-platform",
  "wmux-protocol",
+ "wmux-server",
  "wmux-unix",
  "wmux-windows",
 ]
 
 [[package]]
 name = "wmux-bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -468,18 +469,18 @@ dependencies = [
 
 [[package]]
 name = "wmux-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "wmux-core",
 ]
 
 [[package]]
 name = "wmux-config"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "wmux-conformance"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -488,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -499,14 +500,14 @@ dependencies = [
 
 [[package]]
 name = "wmux-platform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "wmux-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -514,20 +515,18 @@ dependencies = [
 
 [[package]]
 name = "wmux-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tokio",
  "wmux-config",
  "wmux-core",
  "wmux-platform",
  "wmux-protocol",
- "wmux-unix",
- "wmux-windows",
 ]
 
 [[package]]
 name = "wmux-stress"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tokio",
  "wmux-config",
@@ -539,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-unix"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossterm",
  "libc",
@@ -553,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-windows"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossterm",
  "tokio",

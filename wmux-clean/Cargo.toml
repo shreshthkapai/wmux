@@ -16,9 +16,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.96"
 license = "MIT"
+authors = ["Shreshth Kapai"]
+description = "A persistent cross-platform terminal multiplexer"
+repository = "https://github.com/shreshthkapai/wmux"
+homepage = "https://github.com/shreshthkapai/wmux"
+publish = false
 
 [workspace.dependencies]
 crossterm = { version = "0.28", default-features = false, features = ["bracketed-paste", "events", "windows"] }
@@ -33,3 +39,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
