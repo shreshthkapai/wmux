@@ -32,6 +32,12 @@ pub struct PaneViewport {
     pub cursor: Option<(u16, u16)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientOverlay<'a> {
+    Confirmation(&'a str),
+    Editing { text: &'a str, cursor_column: u16 },
+}
+
 pub struct PaneSceneOverrides<'a> {
     pub previous_frame_panes: &'a [PaneId],
     pub retained_frames: &'a [RetainedPaneFrame],
@@ -612,9 +618,9 @@ pub fn build_window_scene_with_client_overlay(
     cols: u16,
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
-    confirmation_prompt: Option<&str>,
+    overlay: Option<ClientOverlay<'_>>,
 ) -> Option<Scene> {
-    build_window_scene_inner(state, session, cols, rows, overrides, confirmation_prompt)
+    build_window_scene_inner(state, session, cols, rows, overrides, overlay)
 }
 
 fn build_window_scene_inner(
@@ -623,7 +629,7 @@ fn build_window_scene_inner(
     cols: u16,
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
-    confirmation_prompt: Option<&str>,
+    overlay: Option<ClientOverlay<'_>>,
 ) -> Option<Scene> {
     let structure = build_window_structure(state, session, cols, rows)?;
     let mut lines = vec![Line::blank(cols); rows.max(1) as usize];
@@ -707,9 +713,22 @@ fn build_window_scene_inner(
         *last = status.clone();
     }
 
-    if let Some(prompt) = confirmation_prompt {
-        draw_confirmation_prompt(&mut lines, cols, prompt);
-        cursor_visible = false;
+    if let Some(overlay) = overlay {
+        let text = match overlay {
+            ClientOverlay::Confirmation(text) | ClientOverlay::Editing { text, .. } => text,
+        };
+        draw_confirmation_prompt(&mut lines, cols, text);
+        match overlay {
+            ClientOverlay::Confirmation(_) => cursor_visible = false,
+            ClientOverlay::Editing { cursor_column, .. } => {
+                cursor = (
+                    rows.max(1).saturating_sub(1),
+                    cursor_column.min(cols.max(1).saturating_sub(1)),
+                );
+                cursor_visible = true;
+                cursor_style = CursorStyle::Default;
+            }
+        }
     }
 
     Some(Scene {
@@ -1473,8 +1492,8 @@ mod tests {
         build_window_scene, build_window_scene_with_client_overlay,
         build_window_scene_with_retained_panes, build_window_scene_with_viewports,
         build_window_structure, draw_screen, render_damage_from_structure, render_diff,
-        render_full_scene_with_capabilities, PaneSceneOverrides, PaneViewport, RenderCapabilities,
-        RenderState, RetainedPaneFrame,
+        render_full_scene_with_capabilities, ClientOverlay, PaneSceneOverrides, PaneViewport,
+        RenderCapabilities, RenderState, RetainedPaneFrame,
     };
     use crate::{Color, Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
     use std::collections::BTreeMap;
@@ -1906,7 +1925,7 @@ mod tests {
                 viewports: &[],
                 previous: Some(&previous),
             },
-            Some("kill λ pane?"),
+            Some(ClientOverlay::Confirmation("kill λ pane?")),
         )
         .unwrap();
 

@@ -93,7 +93,8 @@ later focus change cannot redirect the rename. Enter submits the resulting
 rename through the serialized command queue; Escape or `C-c` cancels. Left,
 Right, Home, End, Backspace, Delete, and `C-u` edit the bounded input without
 forwarding any bytes to the pane. Cursor movement and deletion use grapheme
-boundaries.
+boundaries. Editing prompts publish even when the pane grid is idle and use the
+real terminal cursor rather than a painted marker.
 
 The default prefix table also exposes tmux-compatible actions already backed
 by wmux semantics: `d` detaches, `]` pastes, `r` refreshes, `C-o` rotates,

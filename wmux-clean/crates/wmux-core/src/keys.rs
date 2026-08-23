@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{parse_command_text, quote_argument, Client, ClientId, CommandList, ServerState};
 
@@ -772,12 +773,17 @@ impl PromptState {
     }
 
     pub fn display(&self) -> String {
-        let mut display = String::with_capacity(self.prompt.len() + self.input.len() + 3);
+        let mut display = String::with_capacity(self.prompt.len() + self.input.len());
         display.push_str(&self.prompt);
-        display.push_str(&self.input[..self.cursor]);
-        display.push('▏');
-        display.push_str(&self.input[self.cursor..]);
+        display.push_str(&self.input);
         display
+    }
+
+    pub fn cursor_column(&self) -> u16 {
+        self.prompt
+            .width()
+            .saturating_add(self.input[..self.cursor].width())
+            .min(usize::from(u16::MAX)) as u16
     }
 }
 

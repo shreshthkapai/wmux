@@ -60,9 +60,10 @@ heavy.
 This follows tmux's server-owned status and active-adjacent border selection,
 with zellij's focused/unfocused frame distinction, while keeping wmux's scene
 and client-baseline model. Confirmation and editing prompts temporarily
-replace the status row and hide the physical cursor. Editing prompts update
-through client-scoped scene diffs, so typing does not mutate the pane grid or
-require a full-scene repaint.
+replace the status row. Confirmations hide the physical cursor; editing prompts
+place and show the real terminal cursor at the grapheme-aware input position.
+Editing prompts update through client-scoped scene diffs, so typing does not
+mutate the pane grid or require a full-scene repaint.
 
 ## Direct pane damage
 

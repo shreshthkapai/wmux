@@ -1852,7 +1852,7 @@ impl ServerOwner {
             .state
             .clients
             .get(&client)
-            .and_then(client_prompt_text);
+            .and_then(client_prompt);
         let had_confirmation = self
             .runtime
             .state
@@ -1865,9 +1865,12 @@ impl ServerOwner {
             .state
             .clients
             .get(&client)
-            .and_then(client_prompt_text);
+            .and_then(client_prompt);
         if prompt_before != prompt_after {
             if let Some(view) = self.clients.get_mut(&client) {
+                if prompt_before.is_some() && prompt_after.is_none() {
+                    view.full_render = true;
+                }
                 if had_confirmation
                     && self
                         .runtime
@@ -2754,12 +2757,12 @@ impl ServerOwner {
                 self.clients.insert(client, view);
                 continue;
             };
-            let confirmation_active = self
+            let overlay_active = self
                 .runtime
                 .state
                 .clients
                 .get(&client)
-                .is_some_and(|client| client.confirmation.is_some());
+                .is_some_and(|client| client.confirmation.is_some() || client.prompt.is_some());
             let Some(structure) = build_window_structure(
                 &self.runtime.state,
                 session,
@@ -2788,7 +2791,7 @@ impl ServerOwner {
             if !view.full_render
                 && view.scroll_offsets.is_empty()
                 && view.copy_mode.is_none()
-                && !confirmation_active
+                && !overlay_active
                 && pane_generations.iter().all(|(pane, generation)| {
                     view.consumed_generations.get(pane) == Some(generation)
                 })
@@ -2810,7 +2813,7 @@ impl ServerOwner {
             } else if self.runtime.resize_repaint_holds.is_empty()
                 && view.scroll_offsets.is_empty()
                 && view.copy_mode.is_none()
-                && !confirmation_active
+                && !overlay_active
             {
                 render_damage_from_structure(
                     &self.runtime.state,
@@ -3242,16 +3245,40 @@ fn path_io_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
-fn client_prompt_text(client: &wmux_core::Client) -> Option<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClientPrompt {
+    Confirmation(String),
+    Editing { text: String, cursor_column: u16 },
+}
+
+impl ClientPrompt {
+    fn render_overlay(&self) -> wmux_core::ClientOverlay<'_> {
+        match self {
+            Self::Confirmation(text) => wmux_core::ClientOverlay::Confirmation(text),
+            Self::Editing {
+                text,
+                cursor_column,
+            } => wmux_core::ClientOverlay::Editing {
+                text,
+                cursor_column: *cursor_column,
+            },
+        }
+    }
+}
+
+fn client_prompt(client: &wmux_core::Client) -> Option<ClientPrompt> {
     client
         .prompt
         .as_ref()
-        .map(wmux_core::PromptState::display)
+        .map(|prompt| ClientPrompt::Editing {
+            text: prompt.display(),
+            cursor_column: prompt.cursor_column(),
+        })
         .or_else(|| {
             client
                 .confirmation
                 .as_ref()
-                .map(|confirmation| confirmation.prompt.clone())
+                .map(|confirmation| ClientPrompt::Confirmation(confirmation.prompt.clone()))
         })
 }
 
@@ -3267,11 +3294,7 @@ fn render_full_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
-    let prompt = runtime
-        .state
-        .clients
-        .get(&client)
-        .and_then(client_prompt_text);
+    let prompt = runtime.state.clients.get(&client).and_then(client_prompt);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
     let Some(scene) = build_window_scene_with_client_overlay(
@@ -3285,7 +3308,7 @@ fn render_full_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
-        prompt.as_deref(),
+        prompt.as_ref().map(ClientPrompt::render_overlay),
     ) else {
         return Vec::new();
     };
@@ -3304,11 +3327,7 @@ fn render_diff_for_client(
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
     };
-    let prompt = runtime
-        .state
-        .clients
-        .get(&client)
-        .and_then(client_prompt_text);
+    let prompt = runtime.state.clients.get(&client).and_then(client_prompt);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
     let Some(scene) = build_window_scene_with_client_overlay(
@@ -3322,7 +3341,7 @@ fn render_diff_for_client(
             viewports: &viewports,
             previous: Some(render_state),
         },
-        prompt.as_deref(),
+        prompt.as_ref().map(ClientPrompt::render_overlay),
     ) else {
         return Vec::new();
     };
@@ -3523,12 +3542,14 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, read_async_message, run_with_platform_and_config, write_async_message,
-        write_outbound_messages, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause,
-        Runtime, ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
-        COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME,
+        collect_pane_events, read_async_message, render_full_for_client,
+        run_with_platform_and_config, write_async_message, write_outbound_messages, ClientView,
+        FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime, ServerOwner, TestJobBackend,
+        TestJobHandle, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
+        PER_PANE_OUTPUT_TIME,
     };
     use std::{
+        collections::BTreeMap,
         thread,
         time::{Duration, Instant},
     };
@@ -3536,8 +3557,8 @@ mod tests {
     use wmux_config::{parse_config, WmuxConfig};
     use wmux_core::{
         parse_command_text, Command, CommandList, CommandSource, ControlNotification,
-        ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget, OptionValue, ServerEvent,
-        SplitDirection,
+        ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget, OptionValue,
+        RenderCapabilities, RenderState, ServerEvent, SplitDirection,
     };
     use wmux_platform::{
         AcceptedConnection, Endpoint, JobBackend, JobNotifier, MouseButton, MouseEvent,
@@ -4607,6 +4628,94 @@ mod tests {
 
         assert_eq!(owner.runtime.state.sessions[&created.session].name, "main");
         assert!(owner.runtime.test_inputs.is_empty());
+    }
+
+    #[test]
+    fn idle_client_publishes_command_prompt_without_pane_damage() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("idle-prompt", 80, 24);
+        owner
+            .runtime
+            .state
+            .rename_window(created.window, "shell")
+            .unwrap();
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(16);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.request_immediate_render(Instant::now());
+        owner.clients.insert(client, view);
+
+        assert!(owner.render_due_clients(Instant::now()));
+        let baseline = outbound_rx.try_recv().unwrap();
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .drained(baseline.wire_len());
+
+        owner
+            .handle_wire_key_at(
+                client,
+                wire_char('b', WireKeyModifiers::CONTROL, b"\x02"),
+                0,
+            )
+            .unwrap();
+        owner
+            .handle_wire_key_at(client, wire_char(',', WireKeyModifiers::NONE, b","), 1)
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert!(owner.render_due_clients(Instant::now()));
+        let Outbound::Message(Message::Output(bytes)) = outbound_rx.try_recv().unwrap() else {
+            panic!("expected editing prompt frame");
+        };
+        let frame = String::from_utf8_lossy(&bytes);
+        assert!(frame.contains("rename-window:"));
+        assert!(frame.contains("shell"));
+    }
+
+    #[test]
+    fn editing_prompt_uses_the_physical_cursor_at_the_input_position() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("cursor-prompt", 80, 24);
+        runtime
+            .state
+            .rename_window(created.window, "shell")
+            .unwrap();
+        let client = runtime.state.add_client();
+        runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        runtime.state.clients.get_mut(&client).unwrap().prompt = Some(wmux_core::PromptState::new(
+            "rename-window: ".to_string(),
+            "shell".to_string(),
+            "rename-window -- %%".to_string(),
+        ));
+        let mut render_state = RenderState::new(80, 24);
+        let mut scroll_offsets = BTreeMap::new();
+
+        let frame = render_full_for_client(
+            &mut runtime,
+            client,
+            TerminalSize::new(80, 24),
+            &mut render_state,
+            RenderCapabilities::default(),
+            &mut scroll_offsets,
+            None,
+        );
+        let frame = String::from_utf8(frame).unwrap();
+
+        assert!(frame.contains("rename-window: shell"));
+        assert!(!frame.contains('▏'));
+        assert!(frame.contains("\x1b[24;21H"));
+        assert!(frame.ends_with("\x1b[?25h"));
     }
 
     #[test]
