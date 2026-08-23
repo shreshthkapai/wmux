@@ -38,8 +38,10 @@ It shows the session, ordered window list, current window, active pane index,
 and authoritative OSC pane title with the window name as fallback. Side
 sections are bounded to one third of the client width; when the window list no
 longer fits, the current window wins. Control characters from names or titles
-are replaced before cell composition. There is no clock, animation, or timer
-that can create idle redraw work.
+are replaced before cell composition. The window list stays centered against
+the client width while pane focus changes; it only moves when a side section
+would otherwise overlap it. There is no clock, animation, or timer that can
+create idle redraw work.
 
 Decoration never selects a font or fixed color. Border and status cells keep
 `Color::Default` for both foreground and background, allowing the host

@@ -531,7 +531,9 @@ fn build_status_line(
         .map(|(text, _)| status_text_width(text))
         .fold(0_u16, u16::saturating_add)
         .min(available);
-    let mut column = center_start.saturating_add(available.saturating_sub(windows_width) / 2);
+    let preferred_start = cols.saturating_sub(windows_width) / 2;
+    let latest_start = center_end.saturating_sub(windows_width).max(center_start);
+    let mut column = preferred_start.clamp(center_start, latest_start);
     for (text, active) in windows {
         column = write_status_text(
             &mut line,
@@ -1748,6 +1750,36 @@ mod tests {
             .cells()
             .iter()
             .any(|cell| cell.style().bold && !cell.style().reverse));
+    }
+
+    #[test]
+    fn pane_focus_does_not_move_window_labels_in_status() {
+        let mut server = ServerState::new();
+        let created = server.create_session("demo", 80, 5);
+        server.rename_window(created.window, "shell").unwrap();
+        let second = server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                80,
+                4,
+            )
+            .unwrap();
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"\x1b]2;short\x1b\\");
+        let pane = server.pane_mut(second).unwrap();
+        pane.terminal
+            .feed(&mut pane.screen, b"\x1b]2;a much longer pane title\x1b\\");
+
+        let second_active = build_window_scene(&server, created.session, 80, 5).unwrap();
+        let second_position = second_active.lines[4].text().find("[0:shell]").unwrap();
+
+        server.select_pane(created.window, created.pane).unwrap();
+        let first_active = build_window_scene(&server, created.session, 80, 5).unwrap();
+        let first_position = first_active.lines[4].text().find("[0:shell]").unwrap();
+
+        assert_eq!(first_position, second_position);
     }
 
     #[test]
