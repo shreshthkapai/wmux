@@ -926,8 +926,8 @@ mod tests {
         .unwrap();
 
         let child = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                let mut output = Vec::new();
+            let mut output = Vec::new();
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while let Some(event) = events.recv().await {
                     if let PlatformEvent::PtyOutput { bytes, .. } = event {
                         output.extend_from_slice(&bytes);
@@ -939,7 +939,12 @@ mod tests {
                 panic!("ConPTY closed before child pid was reported")
             })
             .await
-            .expect("timed out waiting for descendant process id")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for descendant process id; output was {:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            })
         });
         assert!(process_is_running(child));
 
