@@ -1,4 +1,4 @@
-# Beta Release and Distribution Design
+# v1.0.0 Release and Distribution Design
 
 **Date:** 2026-08-23
 
@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Prepare wmux for an open-source `0.1.0-beta.1` release with reproducible
+Prepare wmux for an open-source `1.0.0` release with reproducible
 artifacts, straightforward installation on Windows, Linux, and macOS, and a
 low-maintenance update path for later releases.
 
@@ -17,10 +17,16 @@ that legacy workspace.
 
 ## Release Contract
 
-The initial public beta version is `0.1.0-beta.1` and its Git tag is
-`v0.1.0-beta.1`. A matching version tag triggers the release workflow. The
-workflow publishes a GitHub prerelease only after its release build jobs
-succeed.
+The initial public version is `1.0.0` and its Git tag is `v1.0.0`. A matching
+version tag triggers the release workflow. The workflow publishes a normal
+GitHub release only after its release build jobs succeed. It does not use
+GitHub's prerelease flag, so the standard latest-release URLs and updater work
+without a separate release channel.
+
+The CLI, configuration, installer, and update contracts presented as stable in
+the public documentation follow SemVer from v1 onward. Breaking those public
+contracts requires a new major version. Internal implementation details and
+explicitly documented platform differences are not compatibility promises.
 
 The supported binary targets are:
 
@@ -33,8 +39,8 @@ The supported binary targets are:
 | macOS Apple Silicon | `aarch64-apple-darwin` | tarball |
 
 Windows ARM64 and package-manager repositories such as Winget and a Homebrew
-tap are outside the first beta. They may be added after native validation and
-after stable GitHub release URLs exist.
+tap are outside the initial release. They may be added after native validation
+and after stable GitHub release URLs exist.
 
 ## Atomic Application Package
 
@@ -103,7 +109,7 @@ wmux attach -t demo
 wmux ls
 ```
 
-Installation documentation must state the beta's supported OS/architecture
+Installation documentation must state the release's supported OS/architecture
 matrix and link to the known-differences and compatibility documents.
 
 ## Update Experience
@@ -120,7 +126,7 @@ terminate active sessions before updating. If update command integration is
 implemented, it must refuse while sessions exist and must never imply that a
 detached session is safe to discard.
 
-The first beta does not promise live server migration across versions. A
+The initial release does not promise live server migration across versions. A
 session-preserving rolling update requires a separately designed state-transfer
 or versioned-install mechanism.
 
@@ -128,11 +134,11 @@ or versioned-install mechanism.
 
 The repository root will contain:
 
-- `README.md` with product scope, beta status, installation, quick start,
+- `README.md` with product scope, release status, installation, quick start,
   keybindings, configuration pointers, platform support, and links to project
   policies;
 - `LICENSE` containing the MIT license and the project copyright notice;
-- `CHANGELOG.md` with an Unreleased section and `0.1.0-beta.1` release notes;
+- `CHANGELOG.md` with an Unreleased section and `1.0.0` release notes;
 - `CONTRIBUTING.md` with canonical-workspace commands, architecture rules,
   testing expectations, and pull-request guidance;
 - `CODE_OF_CONDUCT.md` using the Contributor Covenant;
@@ -145,9 +151,9 @@ The repository root will contain:
 
 All Cargo packages inherit accurate version, license, repository, authorship,
 Rust-version, and homepage metadata where applicable. Internal libraries and
-test/benchmark tools are explicitly non-publishable. The first beta is hosted
-as GitHub release artifacts; publishing the workspace to crates.io is outside
-scope.
+test/benchmark tools are explicitly non-publishable. The initial release is
+hosted as GitHub release artifacts; publishing the workspace to crates.io is
+outside scope.
 
 The README must clearly identify `wmux-clean/` as the temporary canonical
 workspace and the root `crates/` tree as legacy, preventing contributors from
@@ -155,7 +161,7 @@ editing the wrong implementation. No legacy source is removed in this work.
 
 ## Supply-Chain and Platform Trust
 
-The beta is unsigned. Open-source licensing does not require Windows or Apple
+The release is unsigned. Open-source licensing does not require Windows or Apple
 developer certificates. Native Windows signing and Apple Developer ID
 notarization are deferred without changing artifact names or end-user install
 commands.
@@ -189,16 +195,16 @@ The maintainer flow is:
 3. Confirm the current `main` commit has green Windows, Linux, and macOS CI.
 4. Run the dist plan for the intended version tag and inspect artifact contents.
 5. Create and push the signed or annotated version tag.
-6. Let GitHub Actions build and publish the prerelease and its attestations.
+6. Let GitHub Actions build and publish the release and its attestations.
 7. Install from the public PowerShell and shell installers on clean hosts.
 8. Verify both binaries report the released version and complete a native
    create/detach/reattach/kill smoke test.
 9. Enable immutable releases after all expected assets are present.
 
 Release tags must point to `main` commits that passed required checks. A failed
-release build must not be presented as a supported beta. Tags and published
+release build must not be presented as supported. Tags and published
 immutable release assets are never moved or replaced; fixes receive a new
-SemVer prerelease or patch version.
+SemVer patch version.
 
 ## Existing GitHub Repository Cutover
 
@@ -226,14 +232,14 @@ Implementation acceptance requires:
 - macOS Intel and Apple Silicon compilation, followed by native GitHub runner
   evidence before publishing;
 - dependency advisory/license/source policy checks;
-- a successful dist plan for `v0.1.0-beta.1`;
+- a successful dist plan for `v1.0.0`;
 - a local Windows release archive containing matching `wmux.exe` and
   `wmux-server.exe` binaries plus README, LICENSE, and changelog;
 - version checks from both extracted executables;
 - no tracked build outputs, credentials, local agent files, or runtime state.
 
 The repository is release-candidate ready when all local checks pass. It is
-public-beta released only after the GitHub cutover, green hosted CI, published
+publicly released only after the GitHub cutover, green hosted CI, published
 artifacts, and clean-host installer smoke tests.
 
 ## Out of Scope
@@ -245,7 +251,6 @@ artifacts, and clean-host installer smoke tests.
 - Windows ARM64 release artifacts.
 - Windows Authenticode signing, Apple Developer ID signing, and notarization.
 - Session-preserving live upgrades between server versions.
-- Stable `1.0` compatibility guarantees.
 
 ## Reference Model
 
