@@ -20,13 +20,13 @@ use tokio::{
 };
 use wmux_config::{config_path, WmuxConfig};
 use wmux_core::{
-    build_window_scene_with_client_overlay, build_window_structure, execute, parse_command_text,
-    render_damage_from_structure, render_diff_scene_with_capabilities, route_key, BareKey,
-    ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue, CommandSource,
-    ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode, InputRoute,
-    JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId, PaneSceneOverrides,
-    PaneViewport, QueuedCommand, RenderCapabilities, RenderState, RetainedPaneFrame, ServerEvent,
-    ServerState, StructuralScene, Style,
+    build_window_scene_with_client_overlay, build_window_structure, execute, pane_area_rows,
+    parse_command_text, render_damage_from_structure, render_diff_scene_with_capabilities,
+    route_key, BareKey, ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue,
+    CommandSource, ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode,
+    InputRoute, JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
+    PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
+    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
 };
 use wmux_platform::{
     AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
@@ -813,7 +813,8 @@ impl Runtime {
         let Some((_, window, _)) = self.state.active_window_and_pane_for_client(client) else {
             return;
         };
-        self.state.resize_window(window, size.cols, size.rows);
+        self.state
+            .resize_window(window, size.cols, pane_area_rows(size.rows));
     }
 
     fn resize_platform_pane(&mut self, pane_id: PaneId, size: TerminalSize) -> io::Result<bool> {
@@ -4153,7 +4154,7 @@ mod tests {
         .unwrap();
         wait_until(|| {
             pty.requests().iter().any(|request| {
-                matches!(request, PlatformRequest::ResizePane { size, .. } if size.rows == 30)
+                matches!(request, PlatformRequest::ResizePane { size, .. } if size.rows == 29)
             })
         })
         .await;
@@ -5298,6 +5299,23 @@ mod tests {
         assert!(!runtime.resize_repaint_holds.contains_key(&created.pane));
         assert!(!runtime.resize_repaint_holds.contains_key(&second));
         assert!(runtime.resize_repaint_holds.contains_key(&third));
+    }
+
+    #[test]
+    fn attached_window_reserves_one_terminal_row_for_server_ui() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let client = runtime.state.add_client();
+        let created = runtime.state.create_session("status", 80, 25);
+        runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+
+        runtime.resize_client_window(client, TerminalSize::new(80, 25));
+
+        let pane = runtime.state.pane(created.pane).unwrap();
+        assert_eq!(pane.rect, wmux_core::Rect::new(0, 0, 80, 24));
+        assert_eq!(pane.screen.rows(), 24);
     }
 
     #[test]

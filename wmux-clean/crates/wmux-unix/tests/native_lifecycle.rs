@@ -87,9 +87,9 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
         Message::Input(b"set -- $(stty size); printf 'WMUX_SIZE_%sx%s' \"$1\" \"$2\"\n".to_vec()),
     )
     .await;
-    // The default top/bottom split gives the active (second) pane the
-    // remainder after the one-row separator: (30 - 1) / 2 rounded up.
-    wait_for_output(&mut attached, b"WMUX_SIZE_15x100").await;
+    // Reserve one client row for status, then divide the remaining pane area
+    // around the one-row separator: (30 - 1 - 1) / 2.
+    wait_for_output(&mut attached, b"WMUX_SIZE_14x100").await;
 
     write_message(
         &mut attached,

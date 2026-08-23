@@ -86,11 +86,14 @@ their deadline. Client input state is independent, while tables are shared by
 the server. Paste and existing mouse-mode precedence remain outside ordinary
 key-table routing.
 
-The default `C-b x` and `C-b &` bindings use `confirm-before` for pane and
-window destruction. A confirmation is stored per client and rendered as a
-temporary one-line overlay with the cursor hidden. Accepting enqueues the
-already-parsed command list; rejecting clears it. Neither path writes prompt
-text into the authoritative pane grid.
+The default `C-b x`, `C-b &`, and `C-b X` bindings use `confirm-before` for
+pane, window, and current-session destruction respectively. Lowercase `x`
+therefore keeps tmux's pane behavior, while uppercase `X` is wmux's explicit
+quality-of-life escalation for ending the entire attached session. A
+confirmation is stored per client and rendered over the normal status row with
+the cursor hidden. Accepting enqueues the already-parsed command list;
+rejecting clears it. Neither path writes prompt text into the authoritative
+pane grid.
 
 ## Queue and command effects
 

@@ -44,6 +44,7 @@ struct BorderSpan {
     row: u16,
     col: u16,
     cells: Vec<char>,
+    active: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +55,7 @@ pub struct StructuralScene {
     active_pane: PaneId,
     panes: Vec<PaneSpan>,
     borders: Vec<BorderSpan>,
+    status: Option<Line>,
 }
 
 impl StructuralScene {
@@ -211,7 +213,9 @@ pub fn build_window_structure(
 ) -> Option<StructuralScene> {
     let window_id = state.active_window_for_session(session)?;
     let window = state.window(window_id)?;
-    let full = Rect::new(0, 0, cols.max(1), rows.max(1));
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let full = Rect::new(0, 0, cols, pane_area_rows(rows));
     let panes = if let Some(zoomed) = window.zoomed {
         vec![PaneSpan {
             pane: zoomed,
@@ -226,26 +230,114 @@ pub fn build_window_structure(
             .collect()
     };
     let borders = if window.zoomed.is_none() && panes.len() > 1 {
-        border_spans(window.layout.borders(full))
+        border_spans(
+            window.layout.borders(full),
+            full,
+            &panes,
+            window.active_pane,
+        )
     } else {
         Vec::new()
     };
+    let status = build_status_line(state, session, window_id, window.active_pane, cols, rows);
     Some(StructuralScene {
         window: window_id,
-        cols: cols.max(1),
-        rows: rows.max(1),
+        cols,
+        rows,
         active_pane: window.active_pane,
         panes,
         borders,
+        status,
     })
 }
 
-fn border_spans(mut cells: Vec<(u16, u16, char)>) -> Vec<BorderSpan> {
-    cells.sort_unstable_by_key(|(x, y, _)| (*y, *x));
-    let mut spans: Vec<BorderSpan> = Vec::new();
+pub const fn pane_area_rows(terminal_rows: u16) -> u16 {
+    if terminal_rows > 1 {
+        terminal_rows - 1
+    } else {
+        1
+    }
+}
+
+fn border_spans(
+    cells: Vec<(u16, u16, char)>,
+    bounds: Rect,
+    panes: &[PaneSpan],
+    active_pane: PaneId,
+) -> Vec<BorderSpan> {
+    const UP: u8 = 1;
+    const RIGHT: u8 = 2;
+    const DOWN: u8 = 4;
+    const LEFT: u8 = 8;
+
+    let mut topology = vec![0_u8; usize::from(bounds.cols) * usize::from(bounds.rows)];
+    let mut positions = Vec::with_capacity(cells.len());
     for (x, y, ch) in cells {
+        let Some(index) = border_topology_index(bounds, x, y) else {
+            continue;
+        };
+        let directions = match ch {
+            '|' => UP | DOWN,
+            '-' => LEFT | RIGHT,
+            _ => UP | RIGHT | DOWN | LEFT,
+        };
+        if topology[index] == 0 {
+            positions.push((x, y));
+        }
+        topology[index] |= directions;
+    }
+    positions.sort_unstable_by_key(|(x, y)| (*y, *x));
+
+    let active_rect = panes
+        .iter()
+        .find(|span| span.pane == active_pane)
+        .map(|span| span.rect);
+
+    let mut spans: Vec<BorderSpan> = Vec::new();
+    for (x, y) in positions {
+        let index = border_topology_index(bounds, x, y).expect("position came from bounds");
+        let mut directions = topology[index];
+        if border_topology_has(&topology, bounds, x, y.checked_sub(1)) {
+            directions |= UP;
+        }
+        if x.checked_add(1)
+            .is_some_and(|x| border_topology_has(&topology, bounds, x, Some(y)))
+        {
+            directions |= RIGHT;
+        }
+        if border_topology_has(&topology, bounds, x, y.checked_add(1)) {
+            directions |= DOWN;
+        }
+        if x.checked_sub(1)
+            .is_some_and(|x| border_topology_has(&topology, bounds, x, Some(y)))
+        {
+            directions |= LEFT;
+        }
+        let active = active_rect.is_some_and(|rect| {
+            border_touches_rect(x, y, rect)
+                || y.checked_sub(1).is_some_and(|y| {
+                    border_topology_has(&topology, bounds, x, Some(y))
+                        && border_touches_rect(x, y, rect)
+                })
+                || x.checked_add(1).is_some_and(|x| {
+                    border_topology_has(&topology, bounds, x, Some(y))
+                        && border_touches_rect(x, y, rect)
+                })
+                || y.checked_add(1).is_some_and(|y| {
+                    border_topology_has(&topology, bounds, x, Some(y))
+                        && border_touches_rect(x, y, rect)
+                })
+                || x.checked_sub(1).is_some_and(|x| {
+                    border_topology_has(&topology, bounds, x, Some(y))
+                        && border_touches_rect(x, y, rect)
+                })
+        });
+        let ch = border_glyph(directions, active);
         if let Some(last) = spans.last_mut() {
-            if last.row == y && last.col.saturating_add(last.cells.len() as u16) == x {
+            if last.row == y
+                && last.active == active
+                && last.col.saturating_add(last.cells.len() as u16) == x
+            {
                 last.cells.push(ch);
                 continue;
             }
@@ -254,9 +346,190 @@ fn border_spans(mut cells: Vec<(u16, u16, char)>) -> Vec<BorderSpan> {
             row: y,
             col: x,
             cells: vec![ch],
+            active,
         });
     }
     spans
+}
+
+fn border_topology_index(bounds: Rect, x: u16, y: u16) -> Option<usize> {
+    let column = x.checked_sub(bounds.x)?;
+    let row = y.checked_sub(bounds.y)?;
+    if column >= bounds.cols || row >= bounds.rows {
+        return None;
+    }
+    Some(usize::from(row) * usize::from(bounds.cols) + usize::from(column))
+}
+
+fn border_topology_has(topology: &[u8], bounds: Rect, x: u16, y: Option<u16>) -> bool {
+    y.and_then(|y| border_topology_index(bounds, x, y))
+        .and_then(|index| topology.get(index))
+        .is_some_and(|directions| *directions != 0)
+}
+
+fn border_touches_rect(x: u16, y: u16, rect: Rect) -> bool {
+    let right = rect.x.saturating_add(rect.cols);
+    let bottom = rect.y.saturating_add(rect.rows);
+    (y >= rect.y && y < bottom && (x.saturating_add(1) == rect.x || x == right))
+        || (x >= rect.x && x < right && (y.saturating_add(1) == rect.y || y == bottom))
+}
+
+fn border_glyph(directions: u8, heavy: bool) -> char {
+    let light = match directions & 0b1111 {
+        0b0101 => '│',
+        0b1010 => '─',
+        0b0110 => '┌',
+        0b1100 => '┐',
+        0b0011 => '└',
+        0b1001 => '┘',
+        0b1110 => '┬',
+        0b1011 => '┴',
+        0b0111 => '├',
+        0b1101 => '┤',
+        0b1111 => '┼',
+        mask if mask & 0b0101 != 0 => '│',
+        _ => '─',
+    };
+    if !heavy {
+        return light;
+    }
+    match light {
+        '│' => '┃',
+        '─' => '━',
+        '┌' => '┏',
+        '┐' => '┓',
+        '└' => '┗',
+        '┘' => '┛',
+        '┬' => '┳',
+        '┴' => '┻',
+        '├' => '┣',
+        '┤' => '┫',
+        '┼' => '╋',
+        _ => light,
+    }
+}
+
+fn build_status_line(
+    state: &ServerState,
+    session_id: SessionId,
+    window_id: WindowId,
+    active_pane: PaneId,
+    cols: u16,
+    rows: u16,
+) -> Option<Line> {
+    if rows <= 1 {
+        return None;
+    }
+    let session = state.sessions.get(&session_id)?;
+    let window = state.windows.get(&window_id)?;
+    let base_style = Style {
+        reverse: true,
+        ..Style::default()
+    };
+    let current_style = Style {
+        bold: true,
+        ..Style::default()
+    };
+    let mut line = Line::blank(cols);
+    line.clear_all_with_style(base_style);
+
+    let left = format!(" wmux · {} ", clean_status_text(&session.name));
+    let pane_index = window
+        .panes
+        .iter()
+        .position(|pane| *pane == active_pane)
+        .unwrap_or(0);
+    let pane_title = state
+        .panes
+        .get(&active_pane)
+        .map(|pane| clean_status_text(pane.screen.title()))
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| clean_status_text(&window.name));
+    let right = format!(" pane {pane_index} · {pane_title} ");
+    let side_limit = (cols / 3).max(1);
+    let left_width = status_text_width(&left).min(side_limit);
+    let right_width = status_text_width(&right).min(side_limit);
+    write_status_text(&mut line, 0, left_width, &left, base_style);
+    let right_start = cols.saturating_sub(right_width);
+    write_status_text(&mut line, right_start, cols, &right, base_style);
+
+    let center_start = left_width.saturating_add(1).min(cols);
+    let center_end = right_start.saturating_sub(1).max(center_start);
+    let available = center_end.saturating_sub(center_start);
+    let mut windows = session
+        .winlinks
+        .iter()
+        .filter_map(|winlink_id| {
+            let winlink = state.winlinks.get(winlink_id)?;
+            let linked_window = state.windows.get(&winlink.window)?;
+            let active = *winlink_id == session.active_winlink;
+            let name = clean_status_text(&linked_window.name);
+            let text = if active {
+                format!(" [{}:{}] ", winlink.index, name)
+            } else {
+                format!(" {}:{} ", winlink.index, name)
+            };
+            Some((text, active))
+        })
+        .collect::<Vec<_>>();
+    let all_width = windows
+        .iter()
+        .map(|(text, _)| status_text_width(text))
+        .fold(0_u16, u16::saturating_add);
+    if all_width > available {
+        windows.retain(|(_, active)| *active);
+    }
+    let windows_width = windows
+        .iter()
+        .map(|(text, _)| status_text_width(text))
+        .fold(0_u16, u16::saturating_add)
+        .min(available);
+    let mut column = center_start.saturating_add(available.saturating_sub(windows_width) / 2);
+    for (text, active) in windows {
+        column = write_status_text(
+            &mut line,
+            column,
+            center_end,
+            &text,
+            if active { current_style } else { base_style },
+        );
+    }
+    Some(line)
+}
+
+fn clean_status_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn status_text_width(text: &str) -> u16 {
+    text.chars().fold(0_u16, |width, character| {
+        width.saturating_add(u16::from(crate::scalar_width(character).min(2)))
+    })
+}
+
+fn write_status_text(line: &mut Line, start: u16, end: u16, text: &str, style: Style) -> u16 {
+    let mut column = start;
+    for character in text.chars() {
+        let width = crate::scalar_width(character).min(2);
+        if width == 0 {
+            continue;
+        }
+        let width = u16::from(width);
+        if column.saturating_add(width) > end {
+            break;
+        }
+        line.set(column, character, width as u8, style);
+        column = column.saturating_add(width);
+    }
+    column
 }
 
 pub fn build_window_scene_with_retained_panes(
@@ -375,14 +648,22 @@ fn build_window_scene_inner(
     }
 
     for span in &structure.borders {
+        let style = Style {
+            bold: span.active,
+            ..Style::default()
+        };
         for (offset, ch) in span.cells.iter().copied().enumerate() {
             put_scene_cell(
                 &mut lines,
                 span.col.saturating_add(offset as u16),
                 span.row,
-                Cell::printable(ch, 1, Style::default()),
+                Cell::printable(ch, 1, style),
             );
         }
+    }
+
+    if let (Some(status), Some(last)) = (structure.status.as_ref(), lines.last_mut()) {
+        *last = status.clone();
     }
 
     if let Some(prompt) = confirmation_prompt {
@@ -1154,7 +1435,7 @@ mod tests {
         render_full_scene_with_capabilities, PaneSceneOverrides, PaneViewport, RenderCapabilities,
         RenderState, RetainedPaneFrame,
     };
-    use crate::{Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
+    use crate::{Color, Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
     use std::collections::BTreeMap;
 
     fn assert_host_matches_screen(host: &Screen, source: &Screen) {
@@ -1367,6 +1648,114 @@ mod tests {
         assert_eq!(structure.pane_at(1, 1).map(|hit| hit.0), Some(created.pane));
         assert_eq!(structure.pane_at(5, 1), None);
         assert!(structure.pane_at(8, 1).is_some());
+    }
+
+    #[test]
+    fn default_scene_reserves_a_theme_native_status_row() {
+        let mut server = ServerState::new();
+        let created = server.create_session("demo", 64, 5);
+        server.rename_window(created.window, "shell").unwrap();
+        let second = server
+            .create_window(created.session, Some("server".to_string()), 64, 5)
+            .unwrap();
+        let pane = server.pane_mut(second.pane).unwrap();
+        pane.terminal
+            .feed(&mut pane.screen, b"\x1b]2;npm dev\x1b\\");
+
+        let structure = build_window_structure(&server, created.session, 64, 5).unwrap();
+        let scene = build_window_scene(&server, created.session, 64, 5).unwrap();
+        let status = &scene.lines[4];
+
+        assert_eq!(structure.pane_at(0, 4), None);
+        assert_eq!(
+            structure
+                .panes
+                .iter()
+                .find(|span| span.pane == second.pane)
+                .map(|span| span.rect.rows),
+            Some(4)
+        );
+        assert!(status.text().starts_with(" wmux · demo "));
+        assert!(status.text().contains(" 0:shell "));
+        assert!(status.text().contains("[1:server]"));
+        assert!(status.text().ends_with(" pane 0 · npm dev"));
+        assert!(status.cells().iter().all(|cell| {
+            let style = cell.style();
+            style.fg == Color::Default && style.bg == Color::Default
+        }));
+        assert!(status.cells().iter().any(|cell| cell.style().reverse));
+        assert!(status
+            .cells()
+            .iter()
+            .any(|cell| cell.style().bold && !cell.style().reverse));
+    }
+
+    #[test]
+    fn pane_borders_are_solid_and_emphasize_only_the_active_edge() {
+        let mut server = ServerState::new();
+        let created = server.create_session("borders", 17, 5);
+        let second = server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                17,
+                4,
+            )
+            .unwrap();
+        let active = server
+            .split_pane(
+                created.window,
+                Some(second),
+                SplitDirection::LeftRight,
+                17,
+                4,
+            )
+            .unwrap();
+
+        let scene = build_window_scene(&server, created.session, 17, 5).unwrap();
+        let inactive_border = scene.lines[0].cell(5).unwrap();
+        let active_border = scene.lines[0].cell(11).unwrap();
+
+        assert_eq!(server.window(created.window).unwrap().active_pane, active);
+        assert_eq!(inactive_border.ch(), '│');
+        assert!(!inactive_border.style().bold);
+        assert_eq!(active_border.ch(), '┃');
+        assert!(active_border.style().bold);
+        for border in [inactive_border, active_border] {
+            assert_eq!(border.style().fg, Color::Default);
+            assert_eq!(border.style().bg, Color::Default);
+        }
+    }
+
+    #[test]
+    fn nested_splits_draw_connected_box_junctions() {
+        let mut server = ServerState::new();
+        let created = server.create_session("junctions", 12, 6);
+        server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                12,
+                5,
+            )
+            .unwrap();
+        server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::TopBottom,
+                12,
+                5,
+            )
+            .unwrap();
+
+        let scene = build_window_scene(&server, created.session, 12, 6).unwrap();
+
+        assert_eq!(scene.lines[2].cell(5).map(|cell| cell.ch()), Some('┫'));
+        assert_eq!(scene.lines[2].cell(4).map(|cell| cell.ch()), Some('━'));
+        assert_eq!(scene.lines[1].cell(5).map(|cell| cell.ch()), Some('│'));
     }
 
     #[test]
@@ -1651,9 +2040,9 @@ mod tests {
         let first = scene.lines[0].text();
         let second = scene.lines[1].text();
 
-        assert!(first.starts_with("abcde|"));
-        assert!(second.starts_with("fghij|"));
-        assert_eq!(scene.lines[0].cell(5).map(|cell| cell.ch()), Some('|'));
+        assert!(first.starts_with("abcde┃"));
+        assert!(second.starts_with("fghij┃"));
+        assert_eq!(scene.lines[0].cell(5).map(|cell| cell.ch()), Some('┃'));
     }
 
     #[test]

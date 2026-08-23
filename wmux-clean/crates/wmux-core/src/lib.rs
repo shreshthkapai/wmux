@@ -49,8 +49,8 @@ pub use paste::{PasteBuffer, PasteBufferError, PasteBufferStore};
 pub use render::{
     build_window_scene, build_window_scene_with_client_overlay,
     build_window_scene_with_retained_panes, build_window_scene_with_viewports,
-    build_window_structure, render_damage_from_structure, render_diff, render_diff_scene,
-    render_diff_scene_with_capabilities, render_full, render_full_scene,
+    build_window_structure, pane_area_rows, render_damage_from_structure, render_diff,
+    render_diff_scene, render_diff_scene_with_capabilities, render_full, render_full_scene,
     render_full_scene_with_capabilities, PaneSceneOverrides, PaneSpan, PaneViewport,
     RenderCapabilities, RenderState, RetainedPaneFrame, StructuralScene,
 };

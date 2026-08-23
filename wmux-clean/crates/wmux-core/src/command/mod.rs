@@ -4326,7 +4326,7 @@ mod tests {
 
         assert!(output.contains("left"));
         assert!(output.contains("right"));
-        assert!(output.contains("|"));
+        assert!(output.contains("┃"));
     }
 
     #[test]

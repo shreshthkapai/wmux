@@ -680,6 +680,7 @@ fn build_tmux_defaults() -> KeyTables {
         ("z", "resize-pane -Z"),
         ("[", "copy-mode"),
         ("x", "confirm-before -p 'kill-pane? (y/n)' kill-pane"),
+        ("X", "confirm-before -p 'kill-session? (y/n)' kill-session"),
         ("&", "confirm-before -p 'kill-window? (y/n)' kill-window"),
         ("o", "select-pane -D"),
         (";", "last-pane"),
@@ -1022,7 +1023,11 @@ mod tests {
     #[test]
     fn destructive_defaults_are_parsed_confirmation_commands() {
         let tables = KeyTables::tmux_defaults();
-        for key in ["x", "&"] {
+        for (key, expected) in [
+            ("x", Command::KillPane),
+            ("&", Command::KillWindow),
+            ("X", Command::KillSession { target: None }),
+        ] {
             let binding = tables
                 .table(KeyTableName::PREFIX)
                 .unwrap()
@@ -1031,7 +1036,7 @@ mod tests {
             assert!(matches!(
                 &binding.commands[0],
                 Command::ConfirmBefore { commands, .. }
-                    if matches!(&commands[0], Command::KillPane | Command::KillWindow)
+                    if commands[0] == expected
             ));
         }
     }

@@ -28,6 +28,17 @@ config, shared server library, shared client library, and conformance crates on
 all three operating systems. This prevents native types or host-dependent
 behavior from entering the shared semantic path.
 
+### Default UI evidence
+
+The accepted 16-case aggregate is `9468acb074c0244a` after adding the
+server-owned status row, connected box-drawing borders, and active-pane
+emphasis to the multiple-client scene fixture. Source audit confirms that this
+is the only portable case that composes renderer output; the remaining 15 case
+fingerprints retain their previous semantic inputs. Windows and Linux both
+produce the new aggregate and `EXPECTED_DIFFERENCES` remains empty. The
+conformance executable and shared runtime compile for both Apple targets, but
+the aggregate still requires a native macOS runner.
+
 ### Phase 7 shared-semantics evidence
 
 Phase 7 extends the portable suite to 16 cases. The added

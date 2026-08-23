@@ -12,7 +12,7 @@ use tokio::{
     sync::mpsc,
 };
 use wmux_config::WmuxConfig;
-use wmux_core::{Screen, TerminalEngine};
+use wmux_core::{pane_area_rows, Screen, TerminalEngine};
 use wmux_platform::{
     AcceptedConnection, Endpoint, JobBackend, JobEvent, JobNotifier, JobRequest, PeerIdentity,
     PlatformError, PlatformErrorKind, PlatformEvent, PlatformFuture, PlatformJobId,
@@ -214,6 +214,7 @@ async fn event_pressure_scenario(limits: Limits) -> Result<StressCase, StressErr
         .await?;
     }
     let final_size = TerminalSize::new(119, 39);
+    let final_pane_size = TerminalSize::new(final_size.cols, pane_area_rows(final_size.rows));
     write_message(
         &mut client,
         Message::Resize {
@@ -223,7 +224,7 @@ async fn event_pressure_scenario(limits: Limits) -> Result<StressCase, StressErr
     )
     .await?;
     wait_until("final resize request", || {
-        harness.pty.latest_resize(pane) == Some(final_size)
+        harness.pty.latest_resize(pane) == Some(final_pane_size)
     })
     .await?;
 

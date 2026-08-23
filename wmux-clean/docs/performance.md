@@ -180,6 +180,27 @@ The hybrid path is the production server path. It avoids rebuilding dense
 window scenes for ordinary output. `hybrid-rendering.md` documents its
 baseline, capability, backpressure, and adaptive scheduling rules.
 
+## Default UI Chrome Baseline
+
+The theme-native status row and connected box borders remain part of the
+server-owned structural scene. Ordinary pane output continues through the
+cached-structure direct-damage path, and the status has no clock or other
+periodic invalidator. Border topology uses a dense byte grid and status fill
+uses a shared styled line rather than one allocation per cell.
+
+The full Windows release gate on 2026-08-23 passed with:
+
+| Scenario | p95 |
+| --- | ---: |
+| `hybrid-frame-codex` | 120.4 us |
+| `idle-input-render` | 4.3 us |
+| `scene-frame-codex` | 372.0 us |
+| `split-storm` | 67.1 us |
+
+The complete-scene number includes status and border composition. The hybrid
+and idle numbers represent the production hot path for ordinary terminal
+output and input.
+
 ## Client Backpressure And IPC Baseline
 
 The step 11/14 full release `large-paste` workload on 2026-07-11 encoded eight
