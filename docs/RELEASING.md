@@ -75,11 +75,18 @@ both binaries in every target archive.
 dist build --tag=v1.0.0 --target=x86_64-pc-windows-msvc
 ```
 
-Locate the generated ZIP and its `.sha256` sidecar. Run the repository archive
-verifier against an artifact directory containing all planned target archives:
+Locate the generated ZIP and its `.sha256` sidecar. First run the verifier's
+portable good/bad fixture cycle:
 
 ```powershell
-pwsh -NoProfile -File scripts/verify-release-archives.ps1 -ArtifactsDirectory artifacts
+powershell -NoProfile -File scripts/test-verify-release-archives.ps1
+```
+
+Then run the verifier against an artifact directory containing all five
+planned target archives and their checksum sidecars:
+
+```powershell
+powershell -NoProfile -File scripts/verify-release-archives.ps1 -ArtifactsDirectory artifacts
 ```
 
 Extract the Windows ZIP and verify the paired versions:
@@ -102,6 +109,10 @@ The release commit on `main` must have green results for:
 - deterministic stress on all three OS families;
 - the Windows release performance gate;
 - dependency policy and dist plan checks.
+
+After publication, the read-only `release-assets` workflow must also pass. It
+downloads the exact tag's public assets, validates all five checksums and
+archive contents, and executes both x86_64 Linux musl binaries.
 
 Do not tag a commit while any required hosted job is pending or failing.
 

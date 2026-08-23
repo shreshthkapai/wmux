@@ -1,0 +1,47 @@
+name: wmux release assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release-assets:
+    name: Verify release assets
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Download release assets
+        shell: bash
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir artifacts
+      - name: Verify archives and checksums
+        shell: pwsh
+        run: ./scripts/verify-release-archives.ps1 -ArtifactsDirectory artifacts
+      - name: Execute Linux x64 binaries
+        shell: bash
+        run: |
+          expected_version="${RELEASE_TAG#v}"
+          archive="artifacts/wmux-x86_64-unknown-linux-musl.tar.gz"
+          mkdir extracted
+          tar -xzf "$archive" -C extracted
+          wmux_path="$(find extracted -type f -name wmux -print -quit)"
+          server_path="$(find extracted -type f -name wmux-server -print -quit)"
+          test -n "$wmux_path"
+          test -n "$server_path"
+          chmod +x "$wmux_path" "$server_path"
+          test "$("$wmux_path" --version)" = "wmux $expected_version"
+          test "$("$server_path" --version)" = "wmux-server $expected_version"
