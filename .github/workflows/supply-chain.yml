@@ -5,11 +5,14 @@ on:
     paths:
       - .github/workflows/supply-chain.yml
       - .github/workflows/release.yml
+      - .github/workflows/release-assets.yml
       - deny.toml
       - dist-workspace.toml
       - CHANGELOG.md
       - LICENSE
       - README.md
+      - scripts/test-verify-release-archives.ps1
+      - scripts/verify-release-archives.ps1
       - wmux-clean/Cargo.lock
       - wmux-clean/Cargo.toml
       - wmux-clean/crates/**/Cargo.toml
@@ -17,11 +20,14 @@ on:
     paths:
       - .github/workflows/supply-chain.yml
       - .github/workflows/release.yml
+      - .github/workflows/release-assets.yml
       - deny.toml
       - dist-workspace.toml
       - CHANGELOG.md
       - LICENSE
       - README.md
+      - scripts/test-verify-release-archives.ps1
+      - scripts/verify-release-archives.ps1
       - wmux-clean/Cargo.lock
       - wmux-clean/Cargo.toml
       - wmux-clean/crates/**/Cargo.toml
@@ -52,6 +58,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Test release archive verifier
+        shell: pwsh
+        run: ./scripts/test-verify-release-archives.ps1
       - name: Install dist 0.32.0
         shell: bash
         run: |
