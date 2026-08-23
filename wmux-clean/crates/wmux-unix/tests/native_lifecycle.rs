@@ -102,10 +102,13 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
     // around the one-row separator: (30 - 1 - 1) / 2.
     wait_for_output(&mut attached, b"WMUX_SIZE_14x100").await;
 
+    // Assemble PID markers in the shell so they exist only in command output.
+    // A literal marker in echoed input can share cells with the rendered result,
+    // allowing a correct client diff to omit an unchanged marker prefix.
     write_message(
         &mut attached,
         Message::Input(
-            b"sh -c 'trap \"printf \\\"WMUX_BACKGROUND\\\\n\\\"; exit 0\" USR1; printf \"WMUX_BACKGROUND_PID_%s\\n\" \"$$\"; while :; do sleep 60 & wait; done' &\n"
+            b"sh -c 'trap \"printf \\\"WMUX_BACKGROUND\\\\n\\\"; exit 0\" USR1; printf \"WMUX_%s_PID_%s\\n\" BACKGROUND \"$$\"; while :; do sleep 60 & wait; done' &\n"
                 .to_vec(),
         ),
     )
@@ -131,7 +134,7 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
     write_message(
         &mut reattached,
         Message::Input(
-            b"sh -c '(sleep 60) & child=$!; printf \"WMUX_CHILD_PID_%s\\n\" \"$child\"; wait \"$child\"'\n"
+            b"sh -c '(sleep 60) & child=$!; printf \"WMUX_%s_PID_%s\\n\" CHILD \"$child\"; wait \"$child\"'\n"
                 .to_vec(),
         ),
     )
@@ -352,10 +355,22 @@ fn process_has_live_kernel_state(pid: libc::pid_t) -> bool {
     // A minimal Docker container may not reap orphaned children from PID 1.
     // `kill(pid, 0)` still succeeds for those dead zombies, so consult the
     // kernel state before calling one a live process leak.
-    process_debug_state(pid)
-        .rsplit_once(") ")
-        .and_then(|(_, fields)| fields.as_bytes().first().copied())
-        != Some(b'Z')
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(state) => {
+            state
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.as_bytes().first().copied())
+                != Some(b'Z')
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_missing_proc_entry_is_not_a_live_process() {
+    assert!(!process_has_live_kernel_state(libc::pid_t::MAX));
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -365,14 +380,18 @@ fn process_has_live_kernel_state(_pid: libc::pid_t) -> bool {
 
 async fn wait_for_process_exit(pid: libc::pid_t) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while process_is_running(pid) && Instant::now() < deadline {
+    loop {
+        if !process_is_running(pid) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "descendant process {pid} leaked; kernel state: {}",
+                process_debug_state(pid)
+            );
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        !process_is_running(pid),
-        "descendant process {pid} leaked; kernel state: {}",
-        process_debug_state(pid)
-    );
 }
 
 #[cfg(target_os = "linux")]

@@ -96,11 +96,13 @@ async fn run_lifecycle(instance: &str) {
         wait_for_output(&mut reattached, b"WMUX_BACKGROUND").await;
     }
 
+    // Keep the complete marker out of echoed input: renderer diffs may omit
+    // cells that are unchanged between the command and its output.
     let child_command = concat!(
         "powershell -NoLogo -NoProfile -Command \"",
         "$p=Start-Process powershell -ArgumentList ",
         "'-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; ",
-        "Write-Output ('WMUX_CHILD_PID_' + $p.Id); Wait-Process -Id $p.Id\"\r"
+        "Write-Output ('WMUX_' + 'CHILD_PID_' + $p.Id); Wait-Process -Id $p.Id\"\r"
     );
     write_message(
         &mut reattached,
@@ -305,10 +307,15 @@ fn process_is_running(pid: u32) -> bool {
 
 async fn wait_for_process_exit(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while process_is_running(pid) && Instant::now() < deadline {
+    loop {
+        if !process_is_running(pid) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("descendant process {pid} leaked");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!process_is_running(pid), "descendant process {pid} leaked");
 }
 
 async fn read_message(stream: &mut BoxedIpcStream) -> Option<Message> {
