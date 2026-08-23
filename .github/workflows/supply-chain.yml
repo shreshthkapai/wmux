@@ -4,14 +4,24 @@ on:
   push:
     paths:
       - .github/workflows/supply-chain.yml
+      - .github/workflows/release.yml
       - deny.toml
+      - dist-workspace.toml
+      - CHANGELOG.md
+      - LICENSE
+      - README.md
       - wmux-clean/Cargo.lock
       - wmux-clean/Cargo.toml
       - wmux-clean/crates/**/Cargo.toml
   pull_request:
     paths:
       - .github/workflows/supply-chain.yml
+      - .github/workflows/release.yml
       - deny.toml
+      - dist-workspace.toml
+      - CHANGELOG.md
+      - LICENSE
+      - README.md
       - wmux-clean/Cargo.lock
       - wmux-clean/Cargo.toml
       - wmux-clean/crates/**/Cargo.toml
@@ -36,3 +46,17 @@ jobs:
           manifest-path: ./wmux-clean/Cargo.toml
           command: check
           arguments: --all-features
+
+  release-plan:
+    name: Release plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dist 0.32.0
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      - name: Check generated release workflow
+        run: dist generate --check
+      - name: Validate v1 release plan
+        run: dist plan --tag=v1.0.0

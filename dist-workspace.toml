@@ -1,0 +1,23 @@
+[workspace]
+members = ["cargo:wmux-clean/"]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+pr-run-mode = "plan"
+hosting = ["github"]
+packages = ["wmux"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+installers = ["shell", "powershell"]
+install-path = "CARGO_HOME"
+install-updater = true
+checksum = "sha256"
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+github-attestations = true
