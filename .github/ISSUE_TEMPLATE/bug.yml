@@ -1,0 +1,88 @@
+name: Bug report
+description: Report a reproducible wmux defect
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve wmux. Do not include passwords, tokens,
+        private terminal output, or security vulnerabilities here. Report
+        vulnerabilities privately through the Security tab.
+  - type: input
+    id: version
+    attributes:
+      label: wmux version
+      description: Paste the complete output of `wmux --version`.
+      placeholder: wmux 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other or unsupported
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture
+      placeholder: x86_64 or aarch64
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal host
+      description: For example Windows Terminal, iTerm2, GNOME Terminal, or VS Code.
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: Include the shell version when known.
+      placeholder: PowerShell 7.6, bash 5.3, zsh 5.9
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest exact command and key sequence that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or terminal output
+      description: Remove secrets, personal data, and unrelated terminal content.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: This report does not disclose a security vulnerability.
+          required: true

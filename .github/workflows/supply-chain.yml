@@ -1,0 +1,38 @@
+name: wmux supply chain
+
+on:
+  push:
+    paths:
+      - .github/workflows/supply-chain.yml
+      - deny.toml
+      - wmux-clean/Cargo.lock
+      - wmux-clean/Cargo.toml
+      - wmux-clean/crates/**/Cargo.toml
+  pull_request:
+    paths:
+      - .github/workflows/supply-chain.yml
+      - deny.toml
+      - wmux-clean/Cargo.lock
+      - wmux-clean/Cargo.toml
+      - wmux-clean/crates/**/Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wmux-supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          rust-version: "1.96.0"
+          manifest-path: ./wmux-clean/Cargo.toml
+          command: check
+          arguments: --all-features

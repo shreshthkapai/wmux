@@ -1,0 +1,56 @@
+name: Feature proposal
+description: Propose a focused wmux capability or behavior
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        wmux follows tmux semantics where they are OS-independent and native
+        platform semantics where they are not. Please describe the user
+        problem before prescribing an implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What workflow is blocked or unnecessarily difficult?
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the observable command, key, state, or rendering behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: precedent
+    attributes:
+      label: tmux or Zellij precedent
+      description: Link or name the closest existing behavior and explain any intended difference.
+    validations:
+      required: true
+  - type: textarea
+    id: cross-os
+    attributes:
+      label: Cross-OS semantics
+      description: Explain the expected Windows, Linux, and macOS behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing commands, configuration, or workflows that nearly solve it.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
+        - label: The proposal preserves persistent server-owned terminal state.
+          required: true

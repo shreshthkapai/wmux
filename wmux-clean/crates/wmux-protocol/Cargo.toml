@@ -15,8 +15,8 @@ name = "wmux_protocol"
 path = "src/lib.rs"
 
 [dependencies]
-wmux-core = { path = "../wmux-core" }
-wmux-platform = { path = "../wmux-platform" }
+wmux-core = { path = "../wmux-core", version = "=1.0.0" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.0" }
 
 [lints]
 workspace = true
