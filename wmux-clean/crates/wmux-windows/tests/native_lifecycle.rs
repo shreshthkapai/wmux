@@ -109,7 +109,8 @@ async fn run_lifecycle(instance: &str) {
         Message::Input(child_command.as_bytes().to_vec()),
     )
     .await;
-    let child_pid = wait_for_pid_marker(&mut reattached, b"WMUX_CHILD_PID_").await;
+    // Renderer output is a diff; the unchanged `WMUX_` prefix can be omitted.
+    let child_pid = wait_for_pid_marker(&mut reattached, b"CHILD_PID_").await;
     assert!(process_is_running(child_pid));
 
     let mut controller = connect_and_handshake(&transport).await;

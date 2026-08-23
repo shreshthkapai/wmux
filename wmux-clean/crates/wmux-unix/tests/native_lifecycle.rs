@@ -139,7 +139,10 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
         ),
     )
     .await;
-    let child_pid = wait_for_pid_marker(&mut reattached, b"WMUX_CHILD_PID_").await;
+    // Client output is a screen diff, so an unchanged `WMUX_` prefix need not
+    // be resent. The suffix is assembled only by command output and remains a
+    // unique, contiguous changed run.
+    let child_pid = wait_for_pid_marker(&mut reattached, b"CHILD_PID_").await;
     assert!(process_is_running(child_pid));
 
     let mut controller = connect_and_handshake(&transport).await;
@@ -341,6 +344,16 @@ fn parse_pid_marker(output: &[u8], marker: &[u8]) -> Option<libc::pid_t> {
                 .then(|| std::str::from_utf8(&digits).ok()?.parse().ok())
                 .flatten()
         })
+}
+
+#[test]
+fn pid_marker_is_resolved_from_a_partial_render_suffix() {
+    let echoed_command = br#"printf "WMUX_%s_PID_%s\n" CHILD "$child""#;
+    assert_eq!(parse_pid_marker(echoed_command, b"CHILD_PID_"), None);
+    assert_eq!(
+        parse_pid_marker(b"\x1b[22;6HCHILD_PID_3580\x1b[0m", b"CHILD_PID_"),
+        Some(3580)
+    );
 }
 
 fn process_is_running(pid: libc::pid_t) -> bool {
