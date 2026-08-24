@@ -69,5 +69,15 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
       - name: Check generated release workflow
         run: dist generate --check
-      - name: Validate v1 release plan
-        run: dist plan --tag=v1.0.0
+      - name: Validate current release plan
+        shell: bash
+        run: |
+          version="$(
+            cargo metadata \
+              --locked \
+              --no-deps \
+              --format-version 1 \
+              --manifest-path wmux-clean/Cargo.toml \
+              | jq -er '.packages[] | select(.name == "wmux") | .version'
+          )"
+          dist plan --tag="v${version}"
