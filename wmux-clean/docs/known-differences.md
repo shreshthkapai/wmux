@@ -45,7 +45,7 @@ not attempt to compile Windows APIs.
 
 No unsupported capability is known inside the negotiated beta-core VT and
 input model. Interactive host/shell combinations are `manual-pending`, not
-classified as unsupported. Byte-for-byte Unix tmux behavior for signals,
-process groups, shell job control, or descriptor passing on native Windows is
-outside the product promise and is classified above as an intentional platform
+classified as unsupported. Byte-for-byte Unix behavior for signals, process
+groups, shell job control, or descriptor passing on native Windows is outside
+the product promise and is classified above as an intentional platform
 difference.

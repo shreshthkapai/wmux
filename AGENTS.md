@@ -1,15 +1,14 @@
 # AGENTS.md
 
-This repository is building `wmux`: a cross-OS terminal multiplexer with a
-Windows-first implementation path and heavy architectural inspiration from
-tmux and zellij.
+This repository builds `wmux`: a cross-OS terminal multiplexer with a
+Windows-first implementation path and an OS-neutral core.
 
-tmux and zellij are first-class reference implementations for this project. It
-is acceptable, and often preferred, to directly copy their proven architecture
-and behavior when it fits wmux's goals and license constraints.
+Architecture and behavior are defined by wmux's product requirements, tests,
+documented contracts, relevant standards, and official platform documentation.
+Prior art may inform research, but another product must not define wmux's
+identity or compatibility contract.
 
-The goal is not to make a terminal UI that resembles tmux. The goal is to build
-a persistent terminal virtualization server:
+The goal is to build a persistent terminal virtualization server:
 
 ```text
 persistent server
@@ -31,14 +30,14 @@ agents, and project workspaces alive across terminal restarts.
 The product promise is:
 
 ```text
-tmux semantics where OS-independent.
-Windows-native equivalents where Unix mechanisms do not exist.
+Consistent multiplexer semantics across supported operating systems.
+Native platform integration for terminals, processes, and IPC.
 No POSIX emulation dependency.
 Core designed for cross-OS support from day one.
 ```
 
-The wrong promise is byte-for-byte Unix tmux behavior for PTYs, signals,
-process groups, shell job control, or file descriptor passing on native Windows.
+The wrong promise is byte-for-byte equivalence between Unix and Windows PTYs,
+signals, process groups, shell job control, or file descriptor passing.
 
 ## Non-Negotiable Architecture Rules
 
@@ -162,8 +161,9 @@ struct ServerState {
 }
 ```
 
-Avoid cyclic Rust ownership graphs. Do not mirror tmux's raw pointer graph.
-Indexes are display metadata only; they are not ownership identity.
+Avoid cyclic Rust ownership graphs. Keep ownership in centralized stores and
+resolve relationships through stable IDs. Indexes are display metadata only;
+they are not ownership identity.
 
 ## Event And Command Discipline
 
@@ -323,25 +323,24 @@ determinism in command execution and server state mutation.
 
 When changing architecture, update the docs and tests in the same change.
 
-## Research And Copy Discipline For Fixes And Additions
+## Research Discipline For Fixes And Additions
 
 Before making any feature, fix, or improvement, especially in terminal input,
 rendering, ConPTY/PTY handling, key bindings, paste, resize, detach/attach,
 sessions/windows/panes, layouts, command parsing, or server lifecycle behavior,
-research tmux and zellij first.
+research the relevant wmux contracts and external standards first.
 
 Required references:
 
 ```text
-local mux/zellij code for Rust architecture, terminal/input handling, panes,
-  rendering, and client/server structure
-local mux/tmux code for multiplexer semantics, command behavior, key tables,
-  sessions/windows/panes, paste buffers, and compatibility expectations
+existing wmux code, tests, architecture documents, and invariants
+official terminal, protocol, language, and library documentation
 official platform documentation where OS mechanics matter
-the architecture and execution-plan docs in this repository
+current product and architecture documentation in this repository
 ```
 
-Default to copying the tmux/zellij model instead of inventing a wmux-specific
-one. Do not guess through hotfixes. State the researched model, then make
-whatever scope of change is required to follow that model correctly, even if
-that means replacing large parts of the current implementation.
+Start from the user problem and wmux's architecture rather than assuming another
+product's behavior is required. Study prior art when useful, validate license
+constraints, and record the chosen model without competitor branding. Do not
+guess through hotfixes. Make whatever scoped change is required to preserve the
+server-owned state model and cross-OS contract.

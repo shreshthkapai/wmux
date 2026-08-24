@@ -5,30 +5,14 @@ into the core. The server remains the sole state owner; this document defines
 how Windows discovers that server, authenticates clients, starts it outside a
 terminal tab's lifetime, and shuts it down without bypassing the owner loop.
 
-## Reference model
+## Lifecycle constraints
 
-tmux establishes four useful rules:
+Command metadata determines whether a missing server may be started. Startup
+is serialized with an owner lock and stale endpoint state is removed before
+launch. The server is independent from the launching client, and shutdown stops
+new work before draining client output and leaving the owner loop.
 
-- `client.c:248-299` parses enough command metadata to decide whether a missing
-  server may be started. Commands without `CMD_STARTSERVER` report that no
-  server is running instead of silently creating one.
-- `client.c:103-180` serializes startup with a lock, retries after taking the
-  lock, removes stale endpoint state, and only then starts the server.
-- `server.c:174-260` makes the server independent from the launching client;
-  the client is not the lifetime owner.
-- `server.c:262-305` and `server-client.c:2150-2185` stop accepting work, flush
-  client output, wait for clients and jobs, and then leave the server loop.
-
-Zellij provides the Rust boundary model:
-
-- `zellij-utils/src/cli.rs` owns declarative CLI parsing separately from
-  terminal attachment code.
-- `zellij-client/src/lib.rs:349-393` gives Windows a dedicated background
-  server spawn path.
-- `zellij-client/src/os_input_output.rs:138-142,284-300` keeps server spawning
-  and IPC connection behind client OS interfaces.
-
-wmux follows these models with one deliberate Windows-specific extension. A
+wmux adds one deliberate Windows-specific mechanism. A
 Windows Terminal tab may be placed in a kill-on-close Job Object that does not
 permit breakaway. Microsoft's Job Object rules mean that
 `CREATE_BREAKAWAY_FROM_JOB` cannot guarantee survival in that case. The client
@@ -68,8 +52,8 @@ server command as one of:
 - `RequireExisting`: read-only inspection commands, destructive commands such
   as `kill-server`, and every other command unless explicitly classified.
 
-This copies tmux's conservative startup discipline. The client attempts a
-connection first. `StartIfMissing` commands serialize a daemon launch and retry
+The client attempts a connection first. `StartIfMissing` commands serialize a
+daemon launch and retry
 the authenticated handshake. `RequireExisting` commands return one stable,
 human-readable no-server diagnostic without starting anything.
 

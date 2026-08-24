@@ -3591,7 +3591,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_commands_parse_tmux_compatible_flags_and_aliases() {
+    fn buffer_commands_parse_supported_flags_and_aliases() {
         assert!(matches!(
             &parse_command_text("setb -b named -w 'hello world'").unwrap()[0],
             Command::SetBuffer { name: Some(name), data, clipboard: true }
@@ -4578,7 +4578,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tmux_style_surface_commands() {
+    fn parses_wmux_surface_commands() {
         assert_eq!(
             parse_command(&["new".to_string(), "-s".to_string(), "test".to_string()]).unwrap(),
             Command::NewSession {
@@ -4715,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_tmux_aliases_and_unique_command_prefixes() {
+    fn resolves_aliases_and_unique_command_prefixes() {
         assert_eq!(
             super::resolve_command_name("attach").unwrap(),
             "attach-session"
@@ -4729,7 +4729,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_tmux_style_ambiguous_and_unknown_commands() {
+    fn reports_ambiguous_and_unknown_commands() {
         assert_eq!(
             super::resolve_command_name("kill-s").unwrap_err().message,
             "ambiguous command: kill-s, could be: kill-server, kill-session"
@@ -4767,7 +4767,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_kill_session_is_silent_like_tmux() {
+    fn successful_kill_session_is_silent() {
         let mut state = ServerState::new();
         let client = state.add_client();
         state.create_session("test".to_string(), 80, 24);

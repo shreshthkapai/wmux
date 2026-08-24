@@ -31,9 +31,9 @@ A width resize does not walk completed history. It reflows only:
 
 The old viewport top and cursor are converted to logical offsets before this
 bounded reflow and mapped back afterward. Rows preceding the mapped viewport
-top return to canonical history. This follows zellij's canonical
-`lines_above`/viewport boundary model while retaining tmux-compatible wrapped
-line and cursor semantics.
+top return to canonical history. The canonical history/viewport boundary
+retains wrapped-line and cursor semantics without reprocessing completed
+history.
 
 Alternate-screen resize remains absolute and does not reflow, as before.
 
@@ -47,14 +47,10 @@ rendering, split, and resize paths never materialize old history.
 Any history mutation invalidates width caches. Cache state is derived and is
 excluded from grid equality; cloned cache rows share immutable line storage.
 
-## Reference Model
-
-- tmux's grid keeps wrap metadata authoritative and maps cursor positions
-  through reflow rather than replaying terminal output.
-- zellij stores `lines_above` canonically and combines only the logical line
-  crossing the viewport boundary when its viewport width changes.
-- wmux combines these rules with its compact copy-on-write `Line` storage and
-  client-scoped renderer baselines.
+The grid keeps wrap metadata authoritative and maps cursor positions through
+reflow rather than replaying terminal output. It combines canonical logical
+history with compact copy-on-write `Line` storage and client-scoped renderer
+baselines.
 
 ## Verification
 

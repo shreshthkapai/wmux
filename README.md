@@ -13,9 +13,9 @@ persistent server
   -> server-owned virtual terminal state
 ```
 
-wmux follows tmux semantics where they are OS-independent and uses native
-Windows equivalents where Unix mechanisms do not exist. It does not require a
-POSIX emulation layer on Windows.
+wmux provides consistent multiplexer semantics across supported operating
+systems and uses native platform mechanisms for process, terminal, and IPC
+integration. It does not require a POSIX emulation layer on Windows.
 
 > [!IMPORTANT]
 > `wmux-clean/` is temporarily the canonical Rust workspace. The repository
@@ -75,7 +75,7 @@ List persistent sessions:
 wmux ls
 ```
 
-Long tmux-style commands remain available, but the short forms above are the
+Long-form commands remain available, but the short forms above are the
 recommended everyday interface.
 
 ## Default keys
@@ -171,7 +171,7 @@ Platform crates own only PTY/process, IPC, terminal-mode, and credential
 mechanics. Rendering uses chunked IO, server-owned terminal grids, dirty-region
 tracking, coalesced redraws, and batched terminal writes.
 
-- [Architecture audit](docs/tmux-windows-rust-architecture-audit.md)
+- [Platform contract](wmux-clean/docs/platform-contract.md)
 - [Cross-OS conformance](wmux-clean/docs/cross-os-conformance.md)
 - [Compatibility evidence](wmux-clean/docs/compatibility-matrix.md)
 - [Rendering model](wmux-clean/docs/hybrid-rendering.md)

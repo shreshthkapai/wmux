@@ -1,8 +1,7 @@
 # Hybrid Rendering And Frame Scheduling
 
-wmux follows tmux's cached redraw-scene model and zellij's client-output
-buffering model. Structural composition and ordinary pane output are separate
-render paths.
+wmux separates structural composition from ordinary pane output and maintains
+an independent output baseline for each attached client.
 
 ## Structural scenes
 
@@ -51,19 +50,19 @@ single box-drawing glyphs; the edge adjacent to the active pane uses the
 matching heavy glyph and bold attribute. Nested layouts are reduced to proper
 corners, tees, and crossings before compact row spans are cached.
 
-For an exact two-pane layout, wmux follows tmux's shared-border ownership
-rule: a vertical separator belongs to the first pane on its top half and the
+For an exact two-pane layout, a vertical separator belongs to the first pane on
+its top half and the
 second pane on its bottom half; a horizontal separator belongs to the first
 pane on its left half and the second pane on its right half. Only the active
 pane's owned half uses the heavy glyph. Moving focus therefore moves the thick
 half of the same separator instead of making the entire divider permanently
 heavy.
 
-This follows tmux's server-owned status and active-adjacent border selection,
-with zellij's focused/unfocused frame distinction, while keeping wmux's scene
-and client-baseline model. Confirmation and editing prompts temporarily
-replace the status row. Confirmations hide the physical cursor; editing prompts
-place and show the real terminal cursor at the grapheme-aware input position.
+The server-owned status and active-adjacent border selection remain part of
+wmux's scene and client-baseline model. Confirmation and editing prompts
+temporarily replace the status row. Confirmations hide the physical cursor;
+editing prompts place and show the real terminal cursor at the grapheme-aware
+input position.
 Editing prompts update through client-scoped scene diffs, so typing does not
 mutate the pane grid or require a full-scene repaint.
 
@@ -80,8 +79,7 @@ exclude the server UI row, so direct damage cannot overwrite the status bar.
 Full-width pane rows share the authoritative immutable `Line` backing with the
 candidate client baseline. Partial-width panes still compose only their owned
 rectangle. Numeric cursor, erase, color, and style parameters are serialized
-directly into the frame buffer, matching tmux's buffered capability-write model
-without temporary formatting allocations.
+directly into the frame buffer without temporary formatting allocations.
 
 Rendering is transactional. A candidate baseline is committed only after the
 client's bounded outbound queue accepts the frame. A blocked client therefore
@@ -90,8 +88,7 @@ coalesces. Other clients continue independently.
 
 Cursor state is also transactional. Pane painting and destructive erases run
 with the physical cursor hidden. Position, DECSCUSR shape, and final visibility
-are emitted together as post-render state, matching tmux's final mode update
-and zellij's post-VTE cursor instructions. An application visibility change is
+are emitted together as post-render state. An application visibility change is
 never published before the content update it accompanies.
 
 ## Adaptive scheduling
@@ -101,8 +98,8 @@ There is no fixed repaint tick.
 - The first update after 12 ms of inactivity is immediately eligible.
 - Sustained output coalesces for 4-8 ms.
 - Input gives the originating client a 50 ms priority window. Output in that
-  window is published after a 1 ms redraw-cycle deferral, matching tmux's
-  event-loop redraw timer and coalescing split PTY reads from one TUI action.
+  window is published after a 1 ms redraw-cycle deferral, coalescing split PTY
+  reads from one TUI action.
 - Structural changes and synchronized-output commits are immediate.
 - Blocked clients do not create expired-deadline spin loops; accumulated
   damage is rendered when `ClientWritable` arrives.
@@ -121,23 +118,8 @@ whole `Screen` and prevents transient clear frames from reaching clients.
 IPC protocol version 6 carries terminal capability bits in `Hello` and
 `HelloOk`. The server emits complete unframed render transactions. The client
 owns the physical host terminal and wraps each accepted transaction in one
-locked synchronized-output write when support was advertised, following
-zellij's client-output boundary. Specialized scroll operations remain
+locked synchronized-output write when support was advertised. Specialized
+scroll operations remain
 server-selected per client. The Windows client recognizes Windows Terminal and
 known `TERM_PROGRAM` hosts; `WMUX_SYNCHRONIZED_OUTPUT=1` or `0` provides an
 explicit override for terminals whose environment is not identifiable.
-
-## References
-
-- tmux `screen-redraw.c`: cached structural scenes, generation invalidation,
-  and pane-targeted redraws.
-- tmux `window-border.c` and `options-table.c`: connected single-line pane
-  borders, active-adjacent styling, and server-owned status composition.
-- tmux `tty.c` and `input.c`: capability-gated terminal operations and
-  synchronized output.
-- zellij `zellij-server/src/screen.rs` and `zellij-server/src/output/mod.rs`:
-  debounced rendering, per-client output, and output buffers.
-- zellij `zellij-server/src/ui/pane_contents_and_ui.rs`: focused and
-  unfocused pane-frame selection.
-- zellij `zellij-client/src/stdin_ansi_parser.rs`: synchronized-output
-  capability handling.

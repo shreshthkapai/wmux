@@ -1,9 +1,7 @@
 # Cross-OS Conformance
 
-Step 15 follows the same separation used by tmux's portable regression tests
-and zellij's mock-backed grid and layout snapshots: multiplexer semantics run
-without native handles, while each platform backend owns additional lifecycle
-tests.
+Portable multiplexer semantics run without native handles, while each platform
+backend owns additional lifecycle tests.
 
 ## Portable Suite
 
@@ -110,8 +108,7 @@ protocol-v6 semantic-key decoder. The `command_text` fuzz target compiles on
 stable Windows; sanitizer-backed fuzz execution remains a nightly Unix CI or
 developer task. The full release performance rejection gate, including the
 four Phase 4 routing/parser workloads, passed without weakening an earlier
-threshold. See `command-key-model.md` for the model, exact measurements, and
-reference comparison limits.
+threshold. See `command-key-model.md` for the model and exact measurements.
 
 ## Native Coverage
 

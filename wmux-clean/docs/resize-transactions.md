@@ -30,11 +30,9 @@ Primary-screen width changes use the lazy scrollback contract documented in
 resize transaction; only active viewport content and an unfinished logical
 line at its upper boundary are reflowed.
 
-The model follows tmux's `layout_resize` -> `layout_fix_panes` ->
-`window_pane_resize` flow: layout is resolved first and pane resize immediately
-returns when dimensions are unchanged. Zellij likewise separates pane geometry
-layout from PTY resize dispatch, although wmux retains the explicit delta so it
-does not need an all-pane PTY resize pass.
+Layout is resolved first and pane resize immediately returns when dimensions
+are unchanged. Pane geometry remains separate from PTY resize dispatch, and
+the explicit delta avoids an all-pane PTY resize pass.
 
 The transaction contains stable pane IDs and core rectangles only. ConPTY/PTY
 handles and platform-specific size APIs remain in the platform coordination

@@ -1,8 +1,8 @@
 # Contributing to wmux
 
 Thanks for helping build wmux. The project aims to be a serious persistent
-terminal multiplexer, with tmux semantics where they are OS-independent and
-native platform behavior where they are not.
+terminal multiplexer with consistent semantics and native platform integration
+across Windows, Linux, and macOS.
 
 By participating, you agree to follow the
 [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -39,18 +39,18 @@ tests.
 
 ## Research before changing behavior
 
-tmux and Zellij are first-class reference implementations. Before a feature,
-fix, or improvement involving input, rendering, PTYs, keybindings, paste,
-resize, detach/attach, sessions/windows/panes, layouts, commands, targets, or
-server lifecycle:
+Start with the user problem and wmux's documented contracts. Before changing
+input, rendering, PTYs, keybindings, paste, resize, detach/attach,
+sessions/windows/panes, layouts, commands, targets, or server lifecycle:
 
-1. inspect the local `../tmux` implementation for semantics;
-2. inspect the local `../zellij` implementation for Rust architecture and
-   terminal handling;
-3. consult official platform documentation for OS mechanics;
-4. read the relevant wmux architecture and execution-plan documents.
+1. inspect the relevant wmux implementation, tests, and architecture docs;
+2. consult official terminal, protocol, language, and platform documentation;
+3. identify the cross-OS behavior and failure cases explicitly;
+4. study prior art when useful, without treating another product as wmux's
+   compatibility contract.
 
-Record the adopted model in the change when the choice is not obvious.
+Record non-obvious decisions in the change and keep wmux terminology in public
+documentation, tests, comments, and APIs.
 
 ## Development workflow
 
@@ -85,7 +85,7 @@ useful evidence but must not be described as native runtime verification.
 Explain:
 
 - the user-visible problem and intended behavior;
-- the tmux/Zellij or official-platform precedent;
+- the relevant wmux contract, standard, or official platform documentation;
 - architecture and data-flow impact;
 - tests and commands run;
 - Windows, Linux, and macOS impact;

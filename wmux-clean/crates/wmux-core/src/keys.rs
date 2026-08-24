@@ -596,9 +596,9 @@ pub struct KeyTables {
 }
 
 impl KeyTables {
-    pub fn tmux_defaults() -> Self {
+    pub fn wmux_defaults() -> Self {
         static DEFAULTS: OnceLock<KeyTables> = OnceLock::new();
-        DEFAULTS.get_or_init(build_tmux_defaults).clone()
+        DEFAULTS.get_or_init(build_wmux_defaults).clone()
     }
 
     pub fn table(&self, name: KeyTableName) -> Option<&KeyTable> {
@@ -658,7 +658,7 @@ fn validate_table_name(name: &str) -> Result<(), KeyParseError> {
     Ok(())
 }
 
-fn build_tmux_defaults() -> KeyTables {
+fn build_wmux_defaults() -> KeyTables {
     let mut tables = KeyTables {
         names: BTreeMap::from([
             ("root".to_string(), KeyTableName::ROOT),
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_printable_symbols_route_to_tmux_default_split_bindings() {
+    fn shifted_printable_symbols_route_to_default_split_bindings() {
         for (symbol, direction) in [
             ('%', SplitDirection::LeftRight),
             ('"', SplitDirection::TopBottom),
@@ -1174,7 +1174,7 @@ mod tests {
         table.clear();
         assert!(table.bindings().is_empty());
 
-        let mut tables = KeyTables::tmux_defaults();
+        let mut tables = KeyTables::wmux_defaults();
         let custom = tables.ensure_named("custom").unwrap();
         assert_eq!(tables.ensure_named("custom").unwrap(), custom);
         assert_eq!(tables.table(custom).unwrap().name(), custom);
@@ -1189,7 +1189,7 @@ mod tests {
         assert!(KeyTableTarget::parse("").is_err());
         assert!(KeyTableTarget::parse("x".repeat(MAX_KEY_TABLE_NAME_BYTES + 1)).is_err());
 
-        let mut tables = KeyTables::tmux_defaults();
+        let mut tables = KeyTables::wmux_defaults();
         let custom = tables.ensure_named("custom").unwrap();
         assert_eq!(tables.name(custom), Some("custom"));
         assert_eq!(tables.tables().last().unwrap().name(), custom);
@@ -1217,7 +1217,7 @@ mod tests {
 
     #[test]
     fn destructive_defaults_are_parsed_confirmation_commands() {
-        let tables = KeyTables::tmux_defaults();
+        let tables = KeyTables::wmux_defaults();
         for (key, expected) in [
             ("x", Command::KillPane),
             ("&", Command::KillWindow),
@@ -1237,8 +1237,8 @@ mod tests {
     }
 
     #[test]
-    fn everyday_tmux_defaults_are_bound_to_existing_server_commands() {
-        let tables = KeyTables::tmux_defaults();
+    fn everyday_defaults_are_bound_to_existing_server_commands() {
+        let tables = KeyTables::wmux_defaults();
         let prefix = tables.table(KeyTableName::PREFIX).unwrap();
 
         for (key, expected) in [

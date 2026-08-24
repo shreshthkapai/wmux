@@ -1,6 +1,6 @@
 //! OS-neutral multiplexer core.
 //!
-//! This crate owns tmux-like semantics: sessions, windows, panes, layouts,
+//! This crate owns wmux semantics: sessions, windows, panes, layouts,
 //! screens, command queues, options, key tables, paste buffers, and hooks.
 //! It must not import platform APIs.
 

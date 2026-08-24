@@ -42,7 +42,7 @@ impl ConsoleGuard {
         let input_mode = get_mode(input)?;
         let output_mode = get_mode(output)?;
 
-        // Match zellij's native Windows path: request window and mouse input
+        // Request window and mouse input through the native Windows console
         // while explicitly clearing Quick Edit, line input, echo, and
         // processed input. Quick Edit otherwise intercepts mouse records.
         set_mode(

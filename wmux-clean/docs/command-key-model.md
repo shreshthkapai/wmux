@@ -53,8 +53,8 @@ their session-specific winlink identity.
 
 `KeyCode` contains a `BareKey` and compact Shift, Alt, Control, and Super bits.
 It covers Unicode characters, navigation and editing keys, Enter, Tab,
-Backspace, Escape, Space, and F1 through F24. Names use tmux-shaped forms such
-as `C-b`, `M-Left`, `S-Tab`, `Enter`, and `F12`. ASCII uppercase normalizes to
+Backspace, Escape, Space, and F1 through F24. Names use compact forms such as
+`C-b`, `M-Left`, `S-Tab`, `Enter`, and `F12`. ASCII uppercase normalizes to
 lowercase plus Shift.
 
 IPC version 6 (`WMX6`) carries a fixed semantic key header followed by the
@@ -66,17 +66,16 @@ For a character event whose raw payload is exactly one printable ASCII glyph,
 the server uses that produced glyph as the binding identity and discards
 redundant Shift and Control state. Alt, Super, multibyte characters, control
 bytes, and escape sequences retain their semantic identity. The original raw
-payload is never rewritten, so unbound passthrough remains byte-exact. This
-matches tmux's legacy printable-key behavior while tolerating layout-dependent
-Windows console modifier reporting.
+payload is never rewritten, so unbound passthrough remains byte-exact while
+tolerating layout-dependent Windows console modifier reporting.
 
 ## Tables, routing, prompts, and confirmation
 
 The server owns sorted compact binding tables with binary-search lookup.
 Phase 4 provides `root`, `prefix`, and `copy-mode` tables, a `C-b` prefix, and
-a 500 ms repeat window. Like tmux with its default `prefix-timeout` of zero,
-the prefix table waits indefinitely for the next key; the repeat window applies
-only after a repeatable binding. `bind-key`, `unbind-key`, and `list-keys`
+a 500 ms repeat window. The prefix table waits indefinitely for the next key;
+the repeat window applies only after a repeatable binding. `bind-key`,
+`unbind-key`, and `list-keys`
 mutate or inspect those server-owned tables. Binding command lists are shared
 by `Arc`, so dispatch does not reparse command text.
 
@@ -86,9 +85,9 @@ prefix state until their deadline. Client input state is independent, while
 tables are shared by the server. Paste and existing mouse-mode precedence
 remain outside ordinary key-table routing.
 
-`C-b ,` and `C-b $` follow tmux's window- and session-rename model. Each opens
-a server-owned `command-prompt` over the status row, prefilled with the current
-name. The prompt expands and captures a stable target ID when it opens, so a
+`C-b ,` and `C-b $` open a server-owned `command-prompt` over the status row,
+prefilled with the current window or session name. The prompt expands and
+captures a stable target ID when it opens, so a
 later focus change cannot redirect the rename. Enter submits the resulting
 rename through the serialized command queue; Escape or `C-c` cancels. Left,
 Right, Home, End, Backspace, Delete, and `C-u` edit the bounded input without
@@ -96,15 +95,15 @@ forwarding any bytes to the pane. Cursor movement and deletion use grapheme
 boundaries. Editing prompts publish even when the pane grid is idle and use the
 real terminal cursor rather than a painted marker.
 
-The default prefix table also exposes tmux-compatible actions already backed
-by wmux semantics: `d` detaches, `]` pastes, `r` refreshes, `C-o` rotates,
+The default prefix table also exposes actions backed by wmux semantics: `d`
+detaches, `]` pastes, `r` refreshes, `C-o` rotates,
 `{`/`}` swap panes, Control-arrows resize by one cell, and Alt-arrows resize by
 five cells. The resize bindings are repeatable; the others reset prefix state.
 
 The default `C-b x`, `C-b &`, and `C-b X` bindings use `confirm-before` for
 pane, window, and current-session destruction respectively. Lowercase `x`
-therefore keeps tmux's pane behavior, while uppercase `X` is wmux's explicit
-quality-of-life escalation for ending the entire attached session. A
+targets the current pane, while uppercase `X` is the explicit escalation for
+ending the entire attached session. A
 confirmation is stored per client and rendered over the normal status row with
 the cursor hidden. Accepting enqueues the already-parsed command list;
 rejecting clears it. Neither path writes prompt text into the authoritative
@@ -145,14 +144,8 @@ The full release gate also retains every earlier parser, renderer, resize,
 backpressure, and memory threshold. Workloads checksum their semantic result
 and final queue state so the optimizer cannot remove the measured work.
 
-No equivalent standalone command-parser or normalized key-routing
-microbenchmark was exposed by either local reference tree, so no synthetic
-cross-project speed ratio is claimed. The inspected reference revisions were
-tmux `7b833d07d9f1b58343fc88d7de3c2e0bd9f9aa8c` and zellij
-`82c4a24d701ecf9a48aa01bcc5c0bb3882747fe7`. The comparison is architectural:
-wmux follows tmux's server-owned key/command semantics and zellij's normalized
-key plus raw-byte transport, while the throughput table above measures wmux
-only.
+The throughput table measures wmux only. It does not claim a synthetic
+cross-project speed ratio.
 
 ## Malformed-input and conformance evidence
 

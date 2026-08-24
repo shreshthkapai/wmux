@@ -95,7 +95,7 @@ fn child_terminal_setup(
     if master_fd > libc::STDERR_FILENO {
         unsafe { libc::close(master_fd) };
     }
-    // Match zellij's proven Unix PTY setup: login_tty creates a session,
+    // Use the standard Unix PTY setup: login_tty creates a session,
     // acquires the slave as the controlling terminal, makes this process the
     // foreground process group, duplicates it onto stdio, and closes the
     // original descriptor.
@@ -117,7 +117,7 @@ pub(crate) fn mark_non_stdio_descriptors_close_on_exec(
 ) -> io::Result<()> {
     // Darwin's descriptor table can be very large. Enumerate the descriptors
     // that are actually open instead of issuing an fcntl call for every
-    // possible slot. Zellij uses the same close_fds strategy before exec.
+    // possible slot. Close unrelated descriptors before exec.
     close_fds::set_fds_cloexec(libc::STDERR_FILENO + 1, &[]);
     Ok(())
 }

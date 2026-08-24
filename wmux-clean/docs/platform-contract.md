@@ -12,12 +12,10 @@ transport   authenticated listener/client byte streams and daemon launch
 terminal    normalized input, rendering, clipboard, size, restoration guard
 ```
 
-The model follows tmux revision
-`7b833d07d9f1b58343fc88d7de3c2e0bd9f9aa8c`: native connection, credential,
-PTY, and terminal-mode mechanics remain at process edges while one server loop
-owns mux state. It follows zellij revision
-`82c4a24d701ecf9a48aa01bcc5c0bb3882747fe7` for injected server/client OS APIs
-and fake-backed lifecycle tests, while keeping wmux's interface smaller.
+Native connection, credential, PTY, and terminal-mode mechanics remain at
+process edges while one server loop owns multiplexer state. Injected client and
+server platform interfaces allow lifecycle tests to run against deterministic
+backends without widening the production contract.
 
 ## Pane ordering and ownership
 
@@ -84,9 +82,8 @@ reactor is visible across the platform boundary.
 Before every pane, shell-job, or daemon `exec`, the Unix adapter marks every
 descriptor above standard error close-on-exec. Linux uses one
 `close_range(..., CLOSE_RANGE_CLOEXEC)` syscall; other Unix targets use a
-bounded descriptor-table walk. This matches tmux's `closefrom` and zellij's
-`close_open_fds` child discipline and prevents a concurrent launch from
-holding another pane's PTY, pipe, or socket open.
+bounded descriptor-table walk. This prevents a concurrent launch from holding
+another pane's PTY, pipe, or socket open.
 
 The reader and direct-child waiter report independently. The adapter coalesces
 their results into the same portable ordering used by ConPTY: all queued output,
@@ -151,11 +148,9 @@ The final Windows verification on 2026-08-21 produced:
   completing 10,000,000 operations in 68.906 ms at 145,124,611
   operations/second, zero allocations, and zero violations.
 
-The researched reference revisions were tmux
-`7b833d07d9f1b58343fc88d7de3c2e0bd9f9aa8c` and zellij
-`82c4a24d701ecf9a48aa01bcc5c0bb3882747fe7`. Extra in-scope work was limited
-to making benchmark allocation measurement per-thread and refreshing the fuzz
-lockfile after `wmux-platform` gained its OS-neutral Tokio stream dependency.
+Extra in-scope work was limited to making benchmark allocation measurement
+per-thread and refreshing the fuzz lockfile after `wmux-platform` gained its
+OS-neutral Tokio stream dependency.
 
 ## Phase 6 verification evidence
 
@@ -184,12 +179,10 @@ The Linux/macOS `native-unix` CI matrix is configured, but no remote runner was
 available during this local pass. Native macOS execution therefore remains
 CI-gated rather than reported as verified.
 
-Phase 6 retained the tmux and zellij revisions recorded above. Narrow extra
-work was limited to entering the configured Tokio runtime when a state-owner
-thread registers a PTY and marking both freshly allocated PTY descriptors
-close-on-exec. The latter follows tmux's and zellij's inherited-descriptor
-discipline and prevents concurrent child launches from holding another pane's
-PTY open past process-group termination.
+Narrow extra work was limited to entering the configured Tokio runtime when a
+state-owner thread registers a PTY and marking both freshly allocated PTY
+descriptors close-on-exec. This prevents concurrent child launches from holding
+another pane's PTY open past process-group termination.
 
 ## Phase 7 verification evidence
 

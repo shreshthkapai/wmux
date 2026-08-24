@@ -1,8 +1,8 @@
 # Client Backpressure And Low-Copy IPC
 
 wmux isolates every attached client from the state-owner runtime and from all
-other clients. The model follows tmux's deferred redraw behavior and zellij's
-dedicated per-client sender, with byte accounting added at the server boundary.
+other clients. Each client has an independent sender and redraw baseline, with
+byte accounting enforced at the server boundary.
 
 ## Per-client outbox
 
@@ -18,9 +18,8 @@ accumulated damage is rendered as one current frame. Other clients continue
 against their own baselines and generation cursors.
 
 Control replies are allowed into the same byte-accounted outbox. A client that
-cannot accept a critical reply within the bound is disconnected, matching
-zellij's bounded-sender failure policy. Pane processes and sessions remain
-alive.
+cannot accept a critical reply within the bound is disconnected. Pane processes
+and sessions remain alive.
 
 The named-pipe read and write halves run as separate async futures. A stalled
 write therefore cannot block input dispatch from that client, the state owner,
@@ -43,13 +42,3 @@ frames.
 
 Disabled terminal tracing performs no hex or escaped-text construction in hot
 key and paste paths.
-
-## References
-
-- tmux `server-client.c:server_client_check_redraw`: defer redraw while tty
-  output remains pending.
-- tmux `tty.c`: nonblocking output buffer, high-water blocking, and write
-  completion accounting.
-- tmux `compat/imsg-buffer.c`: queued `writev` transport.
-- zellij `zellij-server/src/os_input_output.rs:ClientSender`: a dedicated
-  bounded sender per client so a full socket cannot block the router.

@@ -76,10 +76,6 @@ impl WmuxConfig {
         let mut env = self.pane_env.clone();
         env.insert("WMUX".to_string(), "1".to_string());
         env.insert("WMUX_PANE".to_string(), pane_id.to_string());
-        if self.agent_compat {
-            env.entry("TMUX_PANE".to_string())
-                .or_insert_with(|| format!("%{pane_id}"));
-        }
         env.into_iter().collect()
     }
 
@@ -108,20 +104,19 @@ pub fn default_config_text() -> &'static str {
     r#"# wmux config
 # This file is read by the wmux server when it starts.
 #
-# agent_compat mirrors the tmux child-process environment enough for terminal
-# coding agents to detect that they are running inside a multiplexer.
+# agent_compat provides predictable terminal capabilities and color settings
+# for terminal coding agents running inside wmux.
 agent_compat = true
 
 # agent_ui:
-#   plain  - screen/tmux compatible, asks CLIs to avoid rich color/box UI
-#   rich   - tmux-256color + truecolor
+#   plain  - conservative 256-color profile without rich color or box UI
+#   rich   - 256-color profile with truecolor enabled
 #   custom - only use pane.env.* entries below
 agent_ui = plain
 
-pane.env.TERM = screen-256color
-pane.env.TERM_PROGRAM = tmux
+pane.env.TERM = xterm-256color
+pane.env.TERM_PROGRAM = wmux
 pane.env.TERM_PROGRAM_VERSION = wmux
-pane.env.TMUX = wmux,0,0
 pane.env.NO_COLOR = 1
 pane.env.CLICOLOR = 0
 pane.env.CLICOLOR_FORCE = 0
@@ -183,6 +178,8 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
     let mut pane_env = BTreeMap::new();
     pane_env.extend(explicit_env);
     if agent_compat && agent_ui != AgentUi::Custom {
+        pane_env
+            .retain(|key, value| !(key.ends_with("MUX") && key != "WMUX" && value == "wmux,0,0"));
         apply_agent_env(&mut pane_env, agent_ui);
     }
 
@@ -200,10 +197,9 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
 fn agent_env(agent_ui: AgentUi) -> BTreeMap<String, String> {
     match agent_ui {
         AgentUi::Plain => BTreeMap::from([
-            ("TERM".to_string(), "screen-256color".to_string()),
-            ("TERM_PROGRAM".to_string(), "tmux".to_string()),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("TERM_PROGRAM".to_string(), "wmux".to_string()),
             ("TERM_PROGRAM_VERSION".to_string(), "wmux".to_string()),
-            ("TMUX".to_string(), "wmux,0,0".to_string()),
             ("COLORTERM".to_string(), String::new()),
             ("NO_COLOR".to_string(), "1".to_string()),
             ("FORCE_COLOR".to_string(), "0".to_string()),
@@ -211,11 +207,10 @@ fn agent_env(agent_ui: AgentUi) -> BTreeMap<String, String> {
             ("CLICOLOR_FORCE".to_string(), "0".to_string()),
         ]),
         AgentUi::Rich => BTreeMap::from([
-            ("TERM".to_string(), "tmux-256color".to_string()),
-            ("TERM_PROGRAM".to_string(), "tmux".to_string()),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("TERM_PROGRAM".to_string(), "wmux".to_string()),
             ("TERM_PROGRAM_VERSION".to_string(), "wmux".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
-            ("TMUX".to_string(), "wmux,0,0".to_string()),
         ]),
         AgentUi::Custom => BTreeMap::new(),
     }
@@ -227,7 +222,6 @@ fn apply_agent_env(pane_env: &mut BTreeMap<String, String>, agent_ui: AgentUi) {
         "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION",
         "COLORTERM",
-        "TMUX",
         "NO_COLOR",
         "FORCE_COLOR",
         "CLICOLOR",
@@ -283,20 +277,36 @@ mod tests {
     use super::{parse_config, AgentUi, WmuxConfig};
 
     #[test]
-    fn defaults_enable_plain_tmux_style_agent_compatibility() {
+    fn defaults_identify_wmux_without_legacy_aliases() {
         let config = WmuxConfig::default();
 
         assert_eq!(
             config.pane_env.get("TERM"),
-            Some(&"screen-256color".to_string())
+            Some(&"xterm-256color".to_string())
         );
         assert_eq!(config.agent_ui, AgentUi::Plain);
         assert_eq!(
             config.pane_env.get("TERM_PROGRAM"),
-            Some(&"tmux".to_string())
+            Some(&"wmux".to_string())
         );
         assert_eq!(config.pane_env.get("NO_COLOR"), Some(&"1".to_string()));
-        assert_eq!(config.pane_env.get("TMUX"), Some(&"wmux,0,0".to_string()));
+        assert_eq!(
+            config
+                .pane_env
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "CLICOLOR",
+                "CLICOLOR_FORCE",
+                "COLORTERM",
+                "FORCE_COLOR",
+                "NO_COLOR",
+                "TERM",
+                "TERM_PROGRAM",
+                "TERM_PROGRAM_VERSION",
+            ]
+        );
     }
 
     #[test]
@@ -319,7 +329,7 @@ mod tests {
         let config = parse_config(
             r#"
             agent_compat = true
-            pane.env.TERM = tmux-256color
+            pane.env.TERM = legacy-256color
             pane.env.COLORTERM = truecolor
             "#,
         )
@@ -328,20 +338,37 @@ mod tests {
         assert_eq!(config.agent_ui, AgentUi::Plain);
         assert_eq!(
             config.pane_env.get("TERM"),
-            Some(&"screen-256color".to_string())
+            Some(&"xterm-256color".to_string())
         );
         assert_eq!(config.pane_env.get("COLORTERM"), Some(&String::new()));
         assert_eq!(config.pane_env.get("NO_COLOR"), Some(&"1".to_string()));
     }
 
     #[test]
-    fn rich_agent_ui_uses_tmux_256color_and_truecolor() {
+    fn generated_legacy_multiplexer_alias_is_removed() {
+        let config = parse_config(
+            r#"
+            agent_compat = true
+            pane.env.OLDMUX = wmux,0,0
+            "#,
+        )
+        .expect("config parses");
+
+        assert!(!config.pane_env.contains_key("OLDMUX"));
+    }
+
+    #[test]
+    fn rich_agent_ui_uses_wmux_identity_and_truecolor() {
         let config = parse_config("agent_ui = rich").expect("config parses");
 
         assert_eq!(config.agent_ui, AgentUi::Rich);
         assert_eq!(
             config.pane_env.get("TERM"),
-            Some(&"tmux-256color".to_string())
+            Some(&"xterm-256color".to_string())
+        );
+        assert_eq!(
+            config.pane_env.get("TERM_PROGRAM"),
+            Some(&"wmux".to_string())
         );
         assert_eq!(
             config.pane_env.get("COLORTERM"),
@@ -356,7 +383,22 @@ mod tests {
         assert!(env.iter().any(|(key, value)| key == "WMUX" && value == "1"));
         assert!(env
             .iter()
-            .any(|(key, value)| key == "TMUX_PANE" && value == "%7"));
+            .any(|(key, value)| key == "WMUX_PANE" && value == "7"));
+        assert_eq!(
+            env.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            vec![
+                "CLICOLOR",
+                "CLICOLOR_FORCE",
+                "COLORTERM",
+                "FORCE_COLOR",
+                "NO_COLOR",
+                "TERM",
+                "TERM_PROGRAM",
+                "TERM_PROGRAM_VERSION",
+                "WMUX",
+                "WMUX_PANE",
+            ]
+        );
     }
 
     #[test]

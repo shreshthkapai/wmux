@@ -2,10 +2,10 @@
 
 Describe the user-visible problem and the resulting behavior.
 
-## Reference model
+## Supporting model
 
-Describe the tmux, Zellij, or official platform documentation inspected and
-the model adopted by this change.
+Describe the wmux contract, standard, or official platform documentation used
+to guide this change.
 
 ## Verification
 

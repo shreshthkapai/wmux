@@ -1,19 +1,19 @@
 # Copy Mode
 
-wmux copy mode follows tmux's ownership model: pane history remains in the
-server-owned terminal grid, while each attached client owns an independent
+Pane history remains in the server-owned terminal grid, while each attached
+client owns an independent
 cursor, viewport, selection, rectangle flag, and search state. Entering copy
 mode never pauses pane output and never copies terminal pixels back from the
 client.
 
 ## Input Routing
 
-`Ctrl-b [` sends the tmux `copy-mode` command. While a client is in copy mode,
+`Ctrl-b [` sends the `copy-mode` command. While a client is in copy mode,
 its key and mouse events are consumed by the server key table before PTY input.
 Other clients attached to the same session continue to control and render the
 pane independently.
 
-The implemented tmux-compatible bindings include:
+The default bindings include:
 
 ```text
 q, Escape, Ctrl-c       cancel
@@ -43,11 +43,3 @@ client asks its platform backend to claim the system clipboard. On Windows this
 uses `CF_UNICODETEXT`; the server and core contain no Windows handles or
 clipboard APIs. Future Unix and macOS clients implement the same semantic
 message with their native clipboard integration.
-
-## Reference Model
-
-- tmux `window-copy.c` for per-client mode cursor, selection, search, and
-  history navigation semantics.
-- tmux `key-bindings.c` for the `copy-mode` and `copy-mode-vi` tables.
-- zellij server selection/search actions for keeping copy state beside the
-  authoritative terminal pane rather than in the terminal frontend.

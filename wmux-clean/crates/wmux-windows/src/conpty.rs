@@ -834,12 +834,12 @@ mod tests {
     #[test]
     fn environment_block_applies_overrides_and_ends_with_double_nul() {
         let block = environment_block(&[
-            ("TERM".to_string(), "tmux-256color".to_string()),
+            ("TERM".to_string(), "xterm-256color".to_string()),
             ("WMUX_PANE".to_string(), "7".to_string()),
         ]);
         let rendered = String::from_utf16_lossy(&block);
 
-        assert!(rendered.contains("TERM=tmux-256color\0"));
+        assert!(rendered.contains("TERM=xterm-256color\0"));
         assert!(rendered.contains("WMUX_PANE=7\0"));
         assert_eq!(block.last(), Some(&0));
         assert_eq!(block.get(block.len() - 2), Some(&0));

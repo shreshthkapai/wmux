@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// tmux's `UTF8_SIZE` is 32 bytes, including joined and combining scalars.
+/// Maximum UTF-8 storage for joined and combining scalars in one grid cell.
 pub const MAX_CELL_TEXT_BYTES: usize = 32;
 
 /// Text stored in one terminal grid cell.
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_text_rejects_extensions_past_tmux_compatible_limit_atomically() {
+    fn cell_text_rejects_extensions_past_limit_atomically() {
         let mut text = CellText::from('a');
         for _ in 0..15 {
             assert!(text.try_append('\u{301}'));

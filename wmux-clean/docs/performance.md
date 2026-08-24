@@ -19,8 +19,8 @@ The full suite includes the 100,000-line history resize and sustained workloads:
 cargo run -p wmux-bench --release -- --suite full --json
 ```
 
-Record debug and release separately. Never compare a debug wmux result with a
-release tmux or zellij result:
+Record debug and release separately. Never compare debug measurements with
+release measurements:
 
 ```powershell
 cargo run -p wmux-bench -- --suite full --json > wmux-debug-baseline.jsonl

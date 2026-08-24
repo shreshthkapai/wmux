@@ -7,7 +7,7 @@ generation. Parsing and client rendering do not share mutable dirty flags.
 ## Parser Model
 
 The parser uses the Alacritty `vte` 0.14 state machine, the same mature parser
-family used by zellij. Its slice API searches ground-state input for escapes,
+family. Its slice API searches ground-state input for escapes,
 decodes UTF-8 incrementally across calls, bounds CSI parameters to 32 fixed
 slots, and bounds OSC storage. Unknown CSI, OSC, DCS, and escape sequences are
 parsed to a valid terminal boundary and ignored when wmux has no semantic
@@ -26,8 +26,8 @@ sustained TUI output does not allocate a new parser workspace for every read.
 Parser state remains incremental across batches, including fragmented UTF-8
 and control sequences.
 
-This follows tmux's separation between input parsing and collected
-`screen-write` items while using zellij's proven Rust VT parser instead of a
+This separates input parsing from collected screen-write operations while using
+a maintained Rust VT parser instead of a
 wmux-specific escape state machine.
 
 ## Generations And Journal
@@ -75,9 +75,6 @@ tests cover split UTF-8, malformed and oversized CSI, wide cells, alternate
 screens, synchronized output, journal rollover, and generation assignment.
 Server tests verify independent generation consumption by two clients.
 
-## References
+## Parser dependency
 
-- tmux `input.c`, `screen-write.c`, `grid.c`, and `tty.c`
-- zellij `zellij-server/src/panes/terminal_pane.rs` and
-  `zellij-server/src/panes/grid.rs`
 - Alacritty `vte` 0.14 parser (`Apache-2.0 OR MIT`)

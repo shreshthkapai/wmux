@@ -6,22 +6,12 @@ grapheme, its display width, its application style, and (for width-two text) a
 separate continuation cell in the following grid column whenever that column
 exists.
 
-## Researched Compatibility Model
+## Storage and segmentation model
 
-The local tmux reference uses `struct utf8_data` in `tmux.h` with a 32-byte
-`UTF8_SIZE`, stores that complete value in a `grid_cell`, and keeps wide-cell
-padding explicit. `screen-write.c::screen_write_combine` attaches combining
-characters, variation selectors, zero-width joiners, emoji components, and
-composable Hangul Jamo to the preceding cell. `utf8-combined.c` defines the
-special sequence decisions. The sparse/extended-cell split in `grid.c` keeps
-the common ASCII case compact.
-
-The local Zellij reference uses `TerminalCharacter { character: char, width,
-styles }` in `zellij-server/src/panes/terminal_character.rs`. Its
-`Grid::add_character` in `zellij-server/src/panes/grid.rs` explicitly drops
-width-zero input and links that behavior to the known grapheme segmentation
-issue. wmux retains Zellij's useful shared-style and variable-row ideas, but
-does not copy that lossy text behavior.
+Each cell stores up to 32 UTF-8 bytes and keeps wide-cell continuation state
+explicit. Combining characters, variation selectors, zero-width joiners, emoji
+components, and composable Hangul Jamo attach to the preceding base cell. The
+common single-scalar case remains inline and allocation-free.
 
 ## wmux Representation
 
@@ -37,21 +27,20 @@ The canonical style ID occupies 57 bits. Cell width and continuation state use
 three of its seven otherwise-unused high bits, keeping the complete `Cell`
 within the existing 16-byte memory budget even after grapheme support.
 
-One cell accepts at most 32 UTF-8 bytes, matching tmux. An extension beyond the
-limit is ignored atomically: the previous text, width, continuation state, and
-cursor remain unchanged.
+One cell accepts at most 32 UTF-8 bytes. An extension beyond the limit is
+ignored atomically: the previous text, width, continuation state, and cursor
+remain unchanged.
 
 When a width-two cell is temporarily wider than a one-column row, wmux retains
-the logical base cell without an in-bounds continuation. This follows tmux's
-edge-cell preservation and Zellij's reflow rule that the first logical
-character may exceed the current row width. Reflow or non-reflow growth restores
-the continuation cell, so resize never destroys terminal text.
+the logical base cell without an in-bounds continuation. The first logical
+character may exceed the current row width. Reflow or non-reflow growth
+restores the continuation cell, so resize never destroys terminal text.
 
 Grapheme boundaries come from `unicode-segmentation` 1.13.3 extended UAX #29
 rules. Widths come from non-CJK `unicode-width` 0.2.2 rules for complete strings,
 including emoji ZWJ, modifier, and presentation sequences. Stored terminal
 widths are limited to zero, one, or two columns. A width-zero scalar at column
-zero has no base cell and is discarded, matching tmux's left-edge behavior.
+zero has no base cell and is discarded.
 
 ## Style and Rendering Rules
 

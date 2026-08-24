@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn right_can_reach_tmux_emacs_one_past_end_before_wrapping() {
+    fn emacs_right_can_reach_one_past_end_before_wrapping() {
         let lines = vec![line("abc"), line("next")];
         let mut mode = CopyMode::new(PaneId::new(1), 0, 1, lines.len(), 2);
 

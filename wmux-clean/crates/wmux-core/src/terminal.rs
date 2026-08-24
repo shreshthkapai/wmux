@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_width_scalar_at_column_zero_is_ignored_like_tmux() {
+    fn zero_width_scalar_at_column_zero_is_ignored() {
         let screen = run("\u{301}a".as_bytes());
 
         assert_eq!(screen.grid().line(0).unwrap().text(), "a");

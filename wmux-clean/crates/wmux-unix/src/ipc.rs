@@ -200,7 +200,7 @@ fn runtime_directory(
 
 #[cfg(target_os = "macos")]
 fn temporary_runtime_root() -> PathBuf {
-    // Match tmux's short, owner-protected /tmp/tmux-UID socket hierarchy.
+    // Use a short, owner-protected /tmp/wmux-UID socket hierarchy.
     // Apple's sockaddr_un::sun_path has only 104 bytes, while TMPDIR is often
     // a much longer /var/folders path.
     PathBuf::from("/tmp")

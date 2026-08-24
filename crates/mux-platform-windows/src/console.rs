@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_modified_special_keys_like_zellij() {
+    fn encodes_modified_special_keys() {
         assert_eq!(
             encode_crossterm_key(key(KeyCode::Left, KeyModifiers::empty())),
             Some(b"\x1b[D".to_vec())

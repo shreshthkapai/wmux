@@ -7,9 +7,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        wmux follows tmux semantics where they are OS-independent and native
-        platform semantics where they are not. Please describe the user
-        problem before prescribing an implementation.
+        wmux provides consistent behavior through native platform integration.
+        Please describe the user problem before prescribing an implementation.
   - type: textarea
     id: problem
     attributes:
@@ -25,10 +24,10 @@ body:
     validations:
       required: true
   - type: textarea
-    id: precedent
+    id: supporting-model
     attributes:
-      label: tmux or Zellij precedent
-      description: Link or name the closest existing behavior and explain any intended difference.
+      label: Supporting model
+      description: Link relevant wmux behavior, standards, or official platform documentation.
     validations:
       required: true
   - type: textarea

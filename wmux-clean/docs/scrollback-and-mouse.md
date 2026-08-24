@@ -1,7 +1,7 @@
 # Scrollback And Mouse Routing
 
-wmux follows tmux's ownership and routing model and zellij's Windows native
-input boundary.
+wmux keeps scrollback ownership in the server and native input decoding in the
+platform client.
 
 ## Ownership
 
@@ -41,7 +41,7 @@ The state owner hit-tests the event against the current structural scene:
 1. If the target pane has requested DEC mouse tracking, wmux translates the
    event to pane-relative coordinates and sends it to that pane.
 2. Otherwise, wheel-up moves that client's target-pane viewport five rows into
-   history, matching tmux's default wheel binding.
+   history.
 3. Wheel-down moves five rows toward the live bottom and leaves history view at
    offset zero.
 4. In copy mode, wheel and left-drag events are consumed by the client's
@@ -62,11 +62,5 @@ all other wheel input is multiplexer history navigation.
 Copy-mode navigation, selection, search, and clipboard transfer are documented
 in `docs/copy-mode.md`.
 
-## Reference Model
-
-- tmux: `server_client_check_mouse`, `input_key_get_mouse`,
-  `input_key_mouse`, and the `WheelUpPane`/`WheelDownPane` default bindings.
-- zellij: `stdin_handler_windows.rs` native console mode setup and normalized
-  crossterm mouse events.
-- Existing wmux lazy history, structural scene, damage journal, and independent
-  client baseline contracts remain authoritative.
+Existing wmux lazy history, structural scene, damage journal, and independent
+client baseline contracts remain authoritative.

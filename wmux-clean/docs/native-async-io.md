@@ -27,14 +27,14 @@ path. Both paths use the same versioned wire framing.
 
 Once attached, `CommandOk` and `CommandErr` are in-band completions for prefix
 commands and do not change client lifecycle state. Only explicit shutdown,
-detach, or transport EOF ends the attach loop. This matches tmux's separation
-of command completion from `MSG_EXIT` and zellij's dedicated
-`ServerToClientMsg::Exit` lifecycle message.
+detach, or transport EOF ends the attach loop. Command completion and client
+lifecycle remain separate protocol concerns.
 
 ## ConPTY Channels
 
 `CreatePseudoConsole` requires the handles passed as `hInput` and `hOutput` to
-use synchronous I/O. wmux follows zellij's split-handle model for output:
+use synchronous I/O. wmux bridges that synchronous output into an overlapped
+reader:
 
 ```text
 ConPTY synchronous output handle
@@ -101,10 +101,8 @@ coordination. Unix descriptors, termios, credentials, process groups, and
 signals remain inside `wmux-unix`. Core events and platform IDs remain OS
 neutral; both adapters implement the same ordering and backpressure contract.
 
-## References
+## Platform references
 
-- zellij `zellij-server/src/os_input_output_windows.rs`
-- tmux `tty.c`, `server-client.c`, and libevent buffer readiness handling
 - Microsoft `CreatePseudoConsole` documentation
 - Microsoft synchronous and overlapped named-pipe I/O documentation
 - Microsoft I/O completion port documentation

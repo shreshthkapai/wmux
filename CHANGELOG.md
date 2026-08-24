@@ -5,7 +5,12 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+- Pane processes now receive wmux-native identity variables and advertise
+  `TERM_PROGRAM=wmux` without legacy multiplexer aliases.
+- Project documentation and contribution guidance now define behavior from
+  wmux requirements, standards, and native platform contracts.
 
 ## [1.0.0] - 2026-08-23
 
@@ -21,7 +26,7 @@ No changes yet.
   input handling.
 - Server-owned VT parsing, Unicode-aware screen grids, scrollback, alternate
   screens, terminal modes, dirty tracking, and client-scoped render baselines.
-- tmux-style sessions, windows, panes, splits, targets, command queue, key
+- Server-owned sessions, windows, panes, splits, targets, command queue, key
   tables, prefix handling, prompts, confirmations, copy mode, and paste buffers.
 - Configuration, inherited options, formats, hooks, async shell jobs,
   notifications, and structured control mode.

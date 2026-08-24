@@ -124,7 +124,7 @@ impl ServerState {
             winlinks: BTreeMap::new(),
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
-            key_tables: KeyTables::tmux_defaults(),
+            key_tables: KeyTables::wmux_defaults(),
             options: OptionStore::new(),
             hooks: HookStore::new(),
             jobs: JobStore::default(),

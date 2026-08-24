@@ -11,19 +11,11 @@ pane, render scene, or client baseline shares immutable line backing. The first
 mutation to a shared line copies only that line. Client snapshots never share
 mutable state with the authoritative server grid.
 
-Styles use canonical 64-bit intern IDs, applying the same deduplication goal as
-zellij's pointer-sized `RcCharacterStyles` without a lookup table. The complete
+Styles use canonical 64-bit intern IDs without a lookup table. The complete
 wmux style domain fits in 57 bits, so equal styles map bijectively to the same
 ID and resolve without allocation, hashing, locking, or process-global state.
 Long runs and scrollback therefore do not repeat full style structs in every
 cell, and snapshots remain `Send` across the OS-neutral server boundary.
-
-This combines two reference designs:
-
-- tmux `grid_line.cellsize` and default-cell fallback for unallocated trailing
-  columns (`tmux.h`, `grid.c`)
-- zellij's variable-length `Row` and pointer-sized shared character styles
-  (`zellij-server/src/panes/grid.rs`, `terminal_character.rs`)
 
 The public terminal behavior is unchanged. Wide-character continuation cells,
 styled erases, wrapped-line reflow, alternate screens, damage generations, and
