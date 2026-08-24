@@ -405,10 +405,15 @@ mod tests {
         let (status, output) = reap_while_draining_pty(pane);
 
         assert!(status.success());
+        let output = String::from_utf8(output).expect("shell output is UTF-8");
+        let (reported_cwd, reported_environment) = output
+            .split_once('|')
+            .expect("shell reports its cwd and environment");
         assert_eq!(
-            String::from_utf8(output).expect("shell output is UTF-8"),
-            format!("{}|native", directory.path().display())
+            fs::canonicalize(reported_cwd).expect("reported cwd is canonicalized"),
+            fs::canonicalize(directory.path()).expect("requested cwd is canonicalized")
         );
+        assert_eq!(reported_environment, "native");
     }
 
     #[test]
