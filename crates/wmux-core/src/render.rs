@@ -8,12 +8,14 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderCapabilities {
     pub scroll_region: bool,
+    pub synchronized_output: bool,
 }
 
 impl Default for RenderCapabilities {
     fn default() -> Self {
         Self {
             scroll_region: true,
+            synchronized_output: false,
         }
     }
 }
@@ -915,7 +917,10 @@ pub fn render_damage_from_structure(
                 continue;
             }
             if !touched {
-                out.extend_from_slice(b"\x1b[?25l\x1b[0m");
+                if !capabilities.synchronized_output {
+                    out.extend_from_slice(b"\x1b[?25l");
+                }
+                out.extend_from_slice(b"\x1b[0m");
                 touched = true;
             }
             render_changed_span(target_row, &previous, &wanted, &mut out, &mut erase);
@@ -929,7 +934,7 @@ pub fn render_damage_from_structure(
         if !out.is_empty() {
             push_scene_cursor(
                 render_state.cursor,
-                Some(render_state.cursor_visible),
+                (!capabilities.synchronized_output).then_some(render_state.cursor_visible),
                 None,
                 &mut out,
             );
@@ -966,7 +971,8 @@ pub fn render_damage_from_structure(
     if !out.is_empty() || render_state.cursor != cursor || visibility_changed || style_changed {
         push_scene_cursor(
             cursor,
-            (touched || visibility_changed).then_some(visible),
+            (visibility_changed || (touched && !capabilities.synchronized_output))
+                .then_some(visible),
             style_changed.then_some(cursor_style),
             &mut out,
         );
@@ -1065,10 +1071,13 @@ pub fn render_full_scene(scene: &Scene, state: &mut RenderState) -> Vec<u8> {
 pub fn render_full_scene_with_capabilities(
     scene: &Scene,
     state: &mut RenderState,
-    _capabilities: RenderCapabilities,
+    capabilities: RenderCapabilities,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[?25l\x1b[0m");
+    if !capabilities.synchronized_output {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    out.extend_from_slice(b"\x1b[0m");
     out.extend_from_slice(paste_mode(scene.bracketed_paste));
     for row in 0..scene.rows {
         out.extend_from_slice(b"\x1b[0m\x1b[");
@@ -1123,7 +1132,10 @@ pub fn render_diff_scene_with_capabilities(
             continue;
         }
         if !touched {
-            out.extend_from_slice(b"\x1b[?25l\x1b[0m");
+            if !capabilities.synchronized_output {
+                out.extend_from_slice(b"\x1b[?25l");
+            }
+            out.extend_from_slice(b"\x1b[0m");
             touched = true;
         }
         render_changed_span(row, previous, wanted, &mut out, &mut erase);
@@ -1136,7 +1148,8 @@ pub fn render_diff_scene_with_capabilities(
     if touched || state.cursor != scene.cursor || visibility_changed || style_changed {
         push_scene_cursor(
             scene.cursor,
-            (touched || visibility_changed).then_some(scene.cursor_visible),
+            (visibility_changed || (touched && !capabilities.synchronized_output))
+                .then_some(scene.cursor_visible),
             style_changed.then_some(scene.cursor_style),
             &mut out,
         );
@@ -1764,6 +1777,7 @@ mod tests {
         let mut render_state = RenderState::new(12, 3);
         let capabilities = RenderCapabilities {
             scroll_region: true,
+            synchronized_output: false,
         };
         let _ = render_full_scene_with_capabilities(&scene, &mut render_state, capabilities);
 
@@ -2330,6 +2344,7 @@ mod tests {
         let mut render_state = RenderState::new(20, 3);
         let capabilities = RenderCapabilities {
             scroll_region: true,
+            synchronized_output: false,
         };
         let _ = render_full_scene_with_capabilities(&scene, &mut render_state, capabilities);
         let consumed = server.pane(created.pane).unwrap().generation();
@@ -2355,6 +2370,34 @@ mod tests {
         assert!(frame.starts_with("\x1b[?25l"));
         assert!(erase < shape);
         assert!(shape < show);
+    }
+
+    #[test]
+    fn synchronized_damage_does_not_toggle_unchanged_cursor_visibility() {
+        let mut server = ServerState::new();
+        let created = server.create_session("atomic-cursor", 20, 3);
+        let structure = build_window_structure(&server, created.session, 20, 3).unwrap();
+        let scene = build_window_scene(&server, created.session, 20, 3).unwrap();
+        let mut render_state = RenderState::new(20, 3);
+        let capabilities = RenderCapabilities {
+            scroll_region: true,
+            synchronized_output: true,
+        };
+        let _ = render_full_scene_with_capabilities(&scene, &mut render_state, capabilities);
+
+        let consumed = server.pane(created.pane).unwrap().generation();
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"stable cursor");
+        let frame = render_damage_from_structure(
+            &server,
+            &structure,
+            &BTreeMap::from([(created.pane, consumed)]),
+            &mut render_state,
+            capabilities,
+        )
+        .unwrap();
+
+        assert!(!frame.windows(5).any(|bytes| bytes == b"\x1b[?25"));
     }
 
     #[test]

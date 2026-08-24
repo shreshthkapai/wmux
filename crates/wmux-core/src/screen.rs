@@ -163,6 +163,7 @@ pub struct Screen {
     generation: u64,
     damage_journal: VecDeque<DamageBatch>,
     bracketed_paste: bool,
+    win32_input_mode: bool,
     mouse_modes: MouseModes,
     synchronized_output: bool,
     synchronized_output_epoch: u64,
@@ -193,6 +194,7 @@ impl Screen {
             generation: 0,
             damage_journal: VecDeque::with_capacity(DAMAGE_JOURNAL_CAPACITY),
             bracketed_paste: false,
+            win32_input_mode: false,
             mouse_modes: MouseModes::default(),
             synchronized_output: false,
             synchronized_output_epoch: 0,
@@ -271,6 +273,14 @@ impl Screen {
 
     pub fn application_mouse_enabled(&self) -> bool {
         self.mouse_tracking() != MouseTrackingMode::Off
+    }
+
+    pub const fn win32_input_mode(&self) -> bool {
+        self.win32_input_mode
+    }
+
+    pub(crate) fn set_win32_input_mode(&mut self, enabled: bool) {
+        self.win32_input_mode = enabled;
     }
 
     pub fn set_mouse_mode(&mut self, mode: u16, enabled: bool) {

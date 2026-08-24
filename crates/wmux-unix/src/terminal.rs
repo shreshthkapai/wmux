@@ -450,6 +450,24 @@ mod tests {
     fn fixed_and_modified_keys_encode_expected_application_bytes() {
         let cases = [
             (
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                TerminalKeyCode::Char('j'),
+                TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
+                vec![b'\n'],
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::ALT),
+                b"\x1b\r".to_vec(),
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT),
+                vec![b'\r'],
+            ),
+            (
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
                 TerminalKeyCode::Up,
                 TerminalKeyModifiers::default(),

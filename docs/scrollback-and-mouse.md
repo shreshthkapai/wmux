@@ -30,9 +30,11 @@ that event as a fixed-size frame. No platform console records or pre-encoded
 mouse escape strings cross the boundary.
 
 The Windows client requests native mouse and resize input while explicitly
-clearing Quick Edit, line input, echo, and processed input. It enables xterm
-any-event plus SGR reporting on the outer terminal for the duration of an
-attachment and restores both output and console input modes on exit.
+clearing Quick Edit, line input, echo, and processed input. Attached clients
+enable xterm button-event plus SGR reporting on the outer terminal for the
+duration of an attachment and restore both output and console input modes on
+exit. Button-event tracking retains wheel, click, release, and drag input
+without flooding IPC with unpressed pointer motion.
 
 ## Routing
 
@@ -46,7 +48,10 @@ The state owner hit-tests the event against the current structural scene:
    offset zero.
 4. In copy mode, wheel and left-drag events are consumed by the client's
    server-owned copy state before application routing.
-5. Non-wheel events without application mouse mode or copy mode remain
+5. When the application has not requested mouse tracking, a left press enters
+   server-owned copy selection at the clicked cell; drag extends the selection
+   and release copies it.
+6. Other non-wheel events without application mouse mode or copy mode remain
    available for later UI routing.
 
 Supported application modes are X10 (`9`), normal (`1000`), button-event

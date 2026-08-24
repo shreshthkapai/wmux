@@ -358,12 +358,13 @@ async fn attached_command(
 ) -> io::Result<()> {
     let _mode = terminal.enter().map_err(PlatformError::into_io)?;
     terminal
-        .write_output(b"\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25h\x1b[H\x1b[2J")
+        .write_output(b"\x1b[?1049h\x1b[?2004h\x1b[>1u\x1b[?1002h\x1b[?1006h\x1b[?25h\x1b[H\x1b[2J")
         .map_err(PlatformError::into_io)?;
 
     let result = attached_inner(pipe, command, capabilities, Arc::clone(&terminal)).await;
 
-    let _ = terminal.write_output(b"\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?25h\x1b[?1049l");
+    let _ = terminal
+        .write_output(b"\x1b[0m\x1b[?1006l\x1b[?1002l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l");
     result
 }
 
@@ -1007,7 +1008,7 @@ mod tests {
         io,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
     };
     use wmux_cli::StartupPolicy;
@@ -1092,6 +1093,41 @@ mod tests {
 
     struct FailingOutputTerminal {
         guard_drops: Arc<AtomicUsize>,
+    }
+
+    struct RecordingTerminal {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl TerminalBackend for RecordingTerminal {
+        fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
+            Ok(Box::new(()))
+        }
+
+        fn read_input(&self) -> PlatformResult<Option<TerminalInput>> {
+            Ok(None)
+        }
+
+        fn write_output(&self, bytes: &[u8]) -> PlatformResult<()> {
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn write_render_transaction(
+            &self,
+            _bytes: &[u8],
+            _synchronized_output: bool,
+        ) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_clipboard_text(&self, _text: &str) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> PlatformResult<TerminalSize> {
+            Ok(TerminalSize::new(80, 24))
+        }
     }
 
     impl TerminalBackend for FailingOutputTerminal {
@@ -1325,6 +1361,40 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(guard_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn attached_terminal_preserves_modified_keys_and_avoids_pointer_motion_floods() {
+        let (client, mut server) = tokio::io::duplex(256);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Arc::new(RecordingTerminal {
+            writes: Arc::clone(&writes),
+        });
+        let server_task = tokio::spawn(async move {
+            assert!(matches!(
+                read_async_message(&mut server).await.unwrap(),
+                Some(Message::Command(_))
+            ));
+            write_async_message(&mut server, Message::CommandErr("stop".to_string()))
+                .await
+                .unwrap();
+        });
+
+        let _ = attached_command(
+            Box::new(client),
+            "attach-session".to_string(),
+            TerminalCapabilities::default(),
+            terminal,
+        )
+        .await;
+        server_task.await.unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert!(writes[0].windows(5).any(|bytes| bytes == b"\x1b[>1u"));
+        assert!(writes[0].windows(8).any(|bytes| bytes == b"\x1b[?1002h"));
+        assert!(!writes[0].windows(8).any(|bytes| bytes == b"\x1b[?1003h"));
+        assert!(writes[1].windows(4).any(|bytes| bytes == b"\x1b[<u"));
+        assert!(writes[1].windows(8).any(|bytes| bytes == b"\x1b[?1002l"));
     }
 
     #[test]

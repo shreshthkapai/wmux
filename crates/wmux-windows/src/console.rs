@@ -574,6 +574,24 @@ mod tests {
     fn normalizes_control_and_fixed_keys() {
         let cases = [
             (
+                key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                TerminalKeyCode::Char('j'),
+                TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
+                vec![b'\n'],
+            ),
+            (
+                key(KeyCode::Enter, KeyModifiers::ALT),
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::ALT),
+                b"\x1b\r".to_vec(),
+            ),
+            (
+                key(KeyCode::Enter, KeyModifiers::SHIFT),
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT),
+                vec![b'\r'],
+            ),
+            (
                 key(KeyCode::Char(' '), KeyModifiers::CONTROL),
                 TerminalKeyCode::Char(' '),
                 TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),

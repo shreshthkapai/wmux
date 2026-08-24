@@ -26,6 +26,20 @@ authoritative bracketed-paste mode. It then emits either the payload or
 keeps terminal input decoding in the client while pane mode and PTY translation
 remain server concerns.
 
+During attachment, wmux requests the terminal keyboard disambiguation mode and
+restores the previous mode on exit. Plain Enter remains carriage return,
+Alt+Enter remains the legacy escape-plus-return sequence, Ctrl+J remains line
+feed, and other modified Enter events retain their identity through CSI-u
+encoding. This prevents terminal hosts from collapsing distinct modified keys
+before the server routes them to the pane.
+
+The pane screen also tracks private input mode `9001` as authoritative terminal
+state. When a pane enables that mode, the server translates each routed
+semantic key into bounded `Vk;Sc;Uc;Kd;Cs;Rc` records, including paired key-down
+and key-up records. This preserves control, Alt, Shift, navigation, and function
+key identity for Windows-native applications launched through Unix interop
+without moving platform handles or console records into the core.
+
 An input-reader failure is sent to the attach loop as an error. Channel closure
 is also an error. Neither condition is treated as a user detach, preventing an
 unread tail of console input from being silently consumed by the parent shell.

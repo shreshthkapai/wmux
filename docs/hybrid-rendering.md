@@ -103,10 +103,12 @@ client's bounded outbound queue accepts the frame. A blocked client therefore
 keeps its last known baseline and consumed generations while later pane damage
 coalesces. Other clients continue independently.
 
-Cursor state is also transactional. Pane painting and destructive erases run
-with the physical cursor hidden. Position, DECSCUSR shape, and final visibility
-are emitted together as post-render state. An application visibility change is
-never published before the content update it accompanies.
+Cursor state is also transactional. On hosts without synchronized output, pane
+painting and destructive erases run with the physical cursor hidden. On hosts
+that commit a frame atomically, wmux avoids redundant hide/show transitions and
+emits only a real visibility change. Position, DECSCUSR shape, and final
+visibility remain post-render state. An application visibility change is never
+published before the content update it accompanies.
 
 ## Adaptive scheduling
 

@@ -7,6 +7,28 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.4] - 2026-08-24
+
+### Changed
+
+- Attached terminals now preserve modified Enter identities, use button-event
+  mouse tracking instead of unpressed pointer-motion tracking, and support
+  server-owned left-drag text selection when an application has not requested
+  mouse input.
+- Atomic render transactions avoid redundant physical cursor hide/show
+  transitions, reducing cursor flicker and terminal state churn during rapid
+  full-screen updates.
+
+### Fixed
+
+- Linux and macOS clients now treat a refused stale Unix socket as an absent
+  server, allowing the existing safe startup path to replace a terminated
+  server instead of failing with `Connection refused`.
+- Ctrl+J, Alt+Enter, and distinct modified Enter events now retain the expected
+  application identity across both platform input adapters and in panes that
+  request private Win32 input records, including Windows-native applications
+  launched through Unix interop.
+
 ## [1.0.3] - 2026-08-24
 
 ### Changed
@@ -86,7 +108,8 @@ No changes yet.
   live server state migration is not implemented.
 - Windows ARM64 and package-manager repositories are not included in v1.0.0.
 
-[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/shreshthkapai/wmux/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/shreshthkapai/wmux/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/shreshthkapai/wmux/compare/v1.0.0...v1.0.1

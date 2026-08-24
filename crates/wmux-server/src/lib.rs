@@ -1370,6 +1370,8 @@ impl ClientView {
             structure: None,
             capabilities: RenderCapabilities {
                 scroll_region: capabilities.contains(TerminalCapabilities::SCROLL_REGION),
+                synchronized_output: capabilities
+                    .contains(TerminalCapabilities::SYNCHRONIZED_OUTPUT),
             },
             scroll_offsets: BTreeMap::new(),
             copy_mode: None,
@@ -2083,6 +2085,7 @@ impl ServerOwner {
             .clients
             .get(&client)
             .is_some_and(|client| client.confirmation.is_some());
+        let pane_event = event.clone();
         let route = route_key(&mut self.runtime.state, client, mode, event, now_ms);
         let prompt_after = self
             .runtime
@@ -2110,8 +2113,18 @@ impl ServerOwner {
             }
         }
         match route {
-            InputRoute::PaneBytes(bytes) => {
+            InputRoute::PaneBytes(mut bytes) => {
                 if let Some(pane) = self.active_pane_for_client(client) {
+                    if self
+                        .runtime
+                        .state
+                        .pane(pane)
+                        .is_some_and(|pane| pane.screen.win32_input_mode())
+                    {
+                        if let Some(encoded) = pane_event.win32_input_bytes() {
+                            bytes = encoded;
+                        }
+                    }
                     self.runtime
                         .write_pane_input(pane, ClientInput::Bytes(bytes))?;
                 }
@@ -3039,6 +3052,11 @@ impl ServerOwner {
             return self
                 .runtime
                 .write_pane_input(pane, ClientInput::Bytes(bytes));
+        }
+
+        if event.kind == MouseEventKind::Down && event.button == MouseButton::Left {
+            self.enter_copy_mode(client).map_err(io::Error::other)?;
+            return self.handle_client_mouse(client, event);
         }
 
         let delta = match event.kind {
@@ -5696,6 +5714,35 @@ mod tests {
     }
 
     #[test]
+    fn pane_private_input_mode_preserves_control_and_alt_enter_identity() {
+        let (mut owner, client, pane) = attached_owner();
+        owner.runtime.apply_pty_output(pane, b"\x1b[?9001h");
+
+        owner
+            .handle_wire_key_at(client, wire_char('j', WireKeyModifiers::CONTROL, b"\n"), 0)
+            .unwrap();
+        owner
+            .handle_wire_key_at(
+                client,
+                WireKeyEvent {
+                    code: WireKeyCode::Enter,
+                    modifiers: WireKeyModifiers::ALT,
+                    raw: b"\x1b\r".to_vec(),
+                },
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(
+            owner.runtime.test_inputs,
+            [
+                (pane, b"\x1b[74;0;10;1;8;1_\x1b[74;0;10;0;8;1_".to_vec(),),
+                (pane, b"\x1b[13;28;13;1;2;1_\x1b[13;28;13;0;2;1_".to_vec(),),
+            ]
+        );
+    }
+
+    #[test]
     fn server_owned_key_prefix_copy_repeat_and_expiry_are_client_scoped() {
         let (mut owner, first, pane) = attached_owner();
         let second = owner.runtime.state.add_client();
@@ -6103,6 +6150,46 @@ mod tests {
             .unwrap()
             .screen
             .application_mouse_enabled());
+    }
+
+    #[test]
+    fn default_left_drag_starts_server_owned_text_selection() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("mouse-copy", 20, 3);
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"alpha\r\nbeta\r\ngamma");
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 1,
+                    row: 1,
+                },
+            })
+            .unwrap();
+
+        let selection = owner.clients[&client]
+            .copy_mode
+            .as_ref()
+            .expect("left drag enters copy selection");
+        assert!(selection.anchor().is_some());
+        assert_eq!(selection.cursor().column, 1);
     }
 
     #[test]

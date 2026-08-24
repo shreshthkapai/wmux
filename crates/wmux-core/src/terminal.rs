@@ -585,6 +585,7 @@ fn set_private_modes(screen: &mut Screen, params: &[u16], enabled: bool) {
             9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 => screen.set_mouse_mode(*mode, enabled),
             2004 => screen.set_bracketed_paste(enabled),
             2026 => screen.set_synchronized_output(enabled),
+            9001 => screen.set_win32_input_mode(enabled),
             _ => {}
         }
     }
@@ -1257,6 +1258,17 @@ mod tests {
         assert!(screen.encode_mouse(release, 2, 3).is_none());
         engine.feed(&mut screen, b"\x1b[?9l\x1b[?1000h");
         assert_eq!(screen.encode_mouse(release, 2, 3).unwrap(), b"\x1b[M##$");
+    }
+
+    #[test]
+    fn private_win32_input_mode_tracks_set_and_reset() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(80, 24);
+
+        engine.feed(&mut screen, b"\x1b[?9001h");
+        assert!(screen.win32_input_mode());
+        engine.feed(&mut screen, b"\x1b[?9001l");
+        assert!(!screen.win32_input_mode());
     }
 
     #[test]

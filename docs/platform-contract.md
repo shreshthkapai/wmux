@@ -238,3 +238,8 @@ Actual native macOS execution remains pending. The authoritative evidence and
 status vocabulary are recorded in [beta-core-gate.md](beta-core-gate.md),
 [compatibility-matrix.md](compatibility-matrix.md), and
 [known-differences.md](known-differences.md).
+
+On Unix, a socket path that remains after its listener exits is semantically an
+absent server, not a terminal client error. The client startup policy may start
+one replacement daemon, while the endpoint binder retains authority for owner
+validation and stale socket/lock cleanup.

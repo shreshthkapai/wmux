@@ -487,6 +487,162 @@ impl KeyEvent {
     pub fn new(code: KeyCode, raw: Vec<u8>) -> Self {
         Self { code, raw }
     }
+
+    pub fn win32_input_bytes(&self) -> Option<Vec<u8>> {
+        let modifiers = self.code.modifiers();
+        let (virtual_key, scan_code, unicode, enhanced) = match self.code.bare_key() {
+            BareKey::Char(character) => {
+                let virtual_key = win32_character_virtual_key(character);
+                let unicode = if modifiers.contains(KeyModifiers::CONTROL) {
+                    self.raw
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|byte| *byte != 0x1b)
+                        .map(u16::from)
+                        .unwrap_or(0)
+                } else {
+                    let character = if modifiers.contains(KeyModifiers::SHIFT)
+                        && character.is_ascii_lowercase()
+                    {
+                        character.to_ascii_uppercase()
+                    } else {
+                        character
+                    };
+                    u16::try_from(character as u32).ok()?
+                };
+                (virtual_key, 0, unicode, false)
+            }
+            BareKey::Space => (
+                0x20,
+                0x39,
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    0
+                } else {
+                    0x20
+                },
+                false,
+            ),
+            BareKey::Backspace => (0x08, 0x0e, 0x08, false),
+            BareKey::Enter => (
+                0x0d,
+                0x1c,
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    0x0a
+                } else {
+                    0x0d
+                },
+                false,
+            ),
+            BareKey::Tab | BareKey::BackTab => (0x09, 0x0f, 0x09, false),
+            BareKey::Escape => (0x1b, 0x01, 0x1b, false),
+            BareKey::Left => (0x25, 0x4b, 0, true),
+            BareKey::Up => (0x26, 0x48, 0, true),
+            BareKey::Right => (0x27, 0x4d, 0, true),
+            BareKey::Down => (0x28, 0x50, 0, true),
+            BareKey::Home => (0x24, 0x47, 0, true),
+            BareKey::End => (0x23, 0x4f, 0, true),
+            BareKey::PageUp => (0x21, 0x49, 0, true),
+            BareKey::PageDown => (0x22, 0x51, 0, true),
+            BareKey::Insert => (0x2d, 0x52, 0, true),
+            BareKey::Delete => (0x2e, 0x53, 0, true),
+            BareKey::Function(number) => {
+                let scan_code = match number {
+                    1..=10 => 0x3a + u16::from(number),
+                    11 => 0x57,
+                    12 => 0x58,
+                    _ => 0,
+                };
+                (0x6f + u16::from(number), scan_code, 0, false)
+            }
+        };
+        let mut control_state = 0_u16;
+        if modifiers.contains(KeyModifiers::ALT) {
+            control_state |= 0x0002;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            control_state |= 0x0008;
+        }
+        if modifiers.contains(KeyModifiers::SHIFT) {
+            control_state |= 0x0010;
+        }
+        if enhanced {
+            control_state |= 0x0100;
+        }
+
+        let mut bytes = Vec::with_capacity(48);
+        push_win32_key_record(
+            &mut bytes,
+            virtual_key,
+            scan_code,
+            unicode,
+            true,
+            control_state,
+        );
+        push_win32_key_record(
+            &mut bytes,
+            virtual_key,
+            scan_code,
+            unicode,
+            false,
+            control_state,
+        );
+        Some(bytes)
+    }
+}
+
+fn win32_character_virtual_key(character: char) -> u16 {
+    if character.is_ascii_alphabetic() {
+        return character.to_ascii_uppercase() as u16;
+    }
+    if character.is_ascii_digit() {
+        return character as u16;
+    }
+    match character {
+        ';' | ':' => 0xba,
+        '=' | '+' => 0xbb,
+        ',' | '<' => 0xbc,
+        '-' | '_' => 0xbd,
+        '.' | '>' => 0xbe,
+        '/' | '?' => 0xbf,
+        '`' | '~' => 0xc0,
+        '[' | '{' => 0xdb,
+        '\\' | '|' => 0xdc,
+        ']' | '}' => 0xdd,
+        '\'' | '"' => 0xde,
+        _ => 0xe7,
+    }
+}
+
+fn push_win32_key_record(
+    output: &mut Vec<u8>,
+    virtual_key: u16,
+    scan_code: u16,
+    unicode: u16,
+    key_down: bool,
+    control_state: u16,
+) {
+    output.extend_from_slice(b"\x1b[");
+    push_u16_decimal(output, virtual_key);
+    output.push(b';');
+    push_u16_decimal(output, scan_code);
+    output.push(b';');
+    push_u16_decimal(output, unicode);
+    output.extend_from_slice(if key_down { b";1;" } else { b";0;" });
+    push_u16_decimal(output, control_state);
+    output.extend_from_slice(b";1_");
+}
+
+fn push_u16_decimal(output: &mut Vec<u8>, mut value: u16) {
+    let start = output.len();
+    loop {
+        output.push(b'0' + (value % 10) as u8);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    output[start..].reverse();
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

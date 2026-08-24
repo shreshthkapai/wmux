@@ -135,7 +135,7 @@ impl ClientTransport for UnixClientTransport {
             tokio::net::UnixStream::connect(self.endpoint.socket_path())
                 .await
                 .map(|stream| Box::new(stream) as BoxedIpcStream)
-                .map_err(|error| PlatformError::from_io("connect Unix IPC client", error))
+                .map_err(unix_client_connect_error)
         })
     }
 
@@ -143,6 +143,17 @@ impl ClientTransport for UnixClientTransport {
         spawn_daemon(spec)
             .map_err(|error| PlatformError::from_io("start Unix server daemon", error))
     }
+}
+
+fn unix_client_connect_error(error: std::io::Error) -> PlatformError {
+    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        return PlatformError::new(
+            PlatformErrorKind::NotFound,
+            "connect Unix IPC client",
+            "endpoint exists without a listening server",
+        );
+    }
+    PlatformError::from_io("connect Unix IPC client", error)
 }
 
 #[cfg(test)]
@@ -161,7 +172,8 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wmux_platform::{
-        ClientTransport, DaemonSpec, PeerIdentity, ServerListener, ServerPlatform,
+        ClientTransport, DaemonSpec, PeerIdentity, PlatformErrorKind, ServerListener,
+        ServerPlatform,
     };
 
     const DAEMON_HELPER_ENV: &str = "WMUX_UNIX_DAEMON_TEST_HELPER";
@@ -253,6 +265,25 @@ mod tests {
             error.kind(),
             wmux_platform::PlatformErrorKind::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn stale_socket_is_reported_as_an_absent_server() {
+        let root = TestDirectory::new("stale-client");
+        let endpoint = UnixEndpoint::from_runtime_directory(root.path().to_path_buf())
+            .expect("endpoint is valid");
+        let listener = std::os::unix::net::UnixListener::bind(endpoint.socket_path())
+            .expect("temporary endpoint binds");
+        drop(listener);
+        let transport = UnixClientTransport::from_runtime_directory(root.path().to_path_buf())
+            .expect("client transport is constructed");
+
+        let error = match transport.connect().await {
+            Ok(_) => panic!("stale socket unexpectedly accepted a client"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), PlatformErrorKind::NotFound);
     }
 
     #[test]
