@@ -11,6 +11,7 @@ on:
       - CHANGELOG.md
       - LICENSE
       - README.md
+      - rust-toolchain.toml
       - scripts/test-verify-release-archives.ps1
       - scripts/verify-release-archives.ps1
       - wmux-clean/Cargo.lock
@@ -26,6 +27,7 @@ on:
       - CHANGELOG.md
       - LICENSE
       - README.md
+      - rust-toolchain.toml
       - scripts/test-verify-release-archives.ps1
       - scripts/verify-release-archives.ps1
       - wmux-clean/Cargo.lock

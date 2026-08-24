@@ -5,6 +5,7 @@ members = ["cargo:wmux-clean/"]
 cargo-dist-version = "0.32.0"
 ci = "github"
 pr-run-mode = "plan"
+dispatch-releases = true
 hosting = ["github"]
 packages = ["wmux"]
 targets = [

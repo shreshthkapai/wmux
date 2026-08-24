@@ -2,8 +2,8 @@
 
 This runbook prepares and validates immutable GitHub releases. It does not
 authorize rewriting the existing public repository history, changing GitHub
-settings, pushing a tag, or publishing a release. Those actions require an
-explicit maintainer decision.
+settings, dispatching a release, or publishing a release. Those actions require
+an explicit maintainer decision.
 
 ## Release contract
 
@@ -151,16 +151,17 @@ binaries remain unsigned.
 ## 7. Tag and publish
 
 Only after the history cutover is approved, the remote is configured, and the
-release commit is present on `main`, create an annotated tag:
+release commit is present on `main`, dispatch the generated release workflow:
 
 ```powershell
-git tag -a v1.0.0 -m "wmux v1.0.0"
-git push origin v1.0.0
+gh workflow run release.yml --ref main -f tag=v1.0.0
 ```
 
-The generated release workflow builds all targets, creates checksums and
-installers, emits attestations, and publishes a normal GitHub release only
-after required build jobs succeed.
+The generated release workflow builds the exact `main` commit selected by the
+dispatch, builds all targets, creates checksums and installers, emits
+attestations, and publishes a normal GitHub release and its tag only after all
+required build jobs succeed. `dispatch-releases = true` also permits a failed
+pre-publication run to be retried without moving or replacing a tag.
 
 Never move a pushed release tag or replace a published immutable asset. Fixes
 receive a new patch version such as `1.0.1`.
