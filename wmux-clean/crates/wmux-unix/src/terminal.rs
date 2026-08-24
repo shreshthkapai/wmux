@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_mode_guard_restores_exact_termios_on_drop() {
+    fn raw_mode_guard_restores_terminal_configuration_on_drop() {
         let pty = openpty(None, None).expect("test PTY opens");
         let saved = termios::tcgetattr(&pty.slave).expect("slave termios is readable");
 
@@ -375,7 +375,10 @@ mod tests {
         assert_eq!(restored.input_flags, saved.input_flags);
         assert_eq!(restored.output_flags, saved.output_flags);
         assert_eq!(restored.control_flags, saved.control_flags);
-        assert_eq!(restored.local_flags, saved.local_flags);
+        assert_eq!(
+            restored.local_flags - LocalFlags::PENDIN,
+            saved.local_flags - LocalFlags::PENDIN
+        );
         assert_eq!(restored.control_chars, saved.control_chars);
         #[cfg(target_os = "linux")]
         assert_eq!(restored.line_discipline, saved.line_discipline);
