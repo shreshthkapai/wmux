@@ -268,14 +268,15 @@ fn nix_error(error: nix::errno::Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_pty, reset_signal_state, spawn_pane};
+    use super::{open_pty, reset_signal_state, spawn_pane, SpawnedPane};
     use std::{
         ffi::OsString,
         fs,
-        io::{self, Read},
+        io::Read,
         os::fd::{AsRawFd, OwnedFd},
         path::{Path, PathBuf},
-        process,
+        process::{self, ExitStatus},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
     use wmux_platform::{CommandSpec, PlatformPaneId, SpawnPane, TerminalSize};
@@ -311,13 +312,6 @@ mod tests {
     }
 
     fn read_pty_to_end(master: OwnedFd) -> Vec<u8> {
-        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-        assert_ne!(flags, -1, "PTY master flags are readable");
-        assert_ne!(
-            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            -1,
-            "PTY master can be made nonblocking"
-        );
         let mut master = fs::File::from(master);
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
@@ -326,11 +320,20 @@ mod tests {
                 Ok(0) => break,
                 Ok(read) => output.extend_from_slice(&chunk[..read]),
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("read PTY output: {error}"),
             }
         }
         output
+    }
+
+    fn reap_while_draining_pty(pane: SpawnedPane) -> (ExitStatus, Vec<u8>) {
+        let SpawnedPane {
+            master, mut child, ..
+        } = pane;
+        let output_reader = thread::spawn(move || read_pty_to_end(master));
+        let status = child.wait().expect("PTY child is reaped");
+        let output = output_reader.join().expect("PTY output reader completes");
+        (status, output)
     }
 
     #[test]
@@ -372,9 +375,8 @@ mod tests {
             environment: Vec::new(),
         };
 
-        let mut pane = spawn_pane(&request).expect("PTY child spawns");
-        let _ = pane.child.wait().expect("PTY child is reaped");
-        let output = read_pty_to_end(pane.master);
+        let pane = spawn_pane(&request).expect("PTY child spawns");
+        let (_, output) = reap_while_draining_pty(pane);
 
         assert!(
             !String::from_utf8_lossy(&output).contains(marker_path.to_string_lossy().as_ref()),
@@ -399,9 +401,8 @@ mod tests {
             environment: vec![(OsString::from("WMUX_TEST"), OsString::from("native"))],
         };
 
-        let mut pane = spawn_pane(&request).expect("PTY child spawns");
-        let status = pane.child.wait().expect("PTY child is reaped");
-        let output = read_pty_to_end(pane.master);
+        let pane = spawn_pane(&request).expect("PTY child spawns");
+        let (status, output) = reap_while_draining_pty(pane);
 
         assert!(status.success());
         assert_eq!(
