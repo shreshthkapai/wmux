@@ -7,18 +7,13 @@ across Windows, Linux, and macOS.
 By participating, you agree to follow the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Start in the canonical workspace
-
-The product currently lives in `wmux-clean/`. The root `crates/` tree is a
-historical implementation and must not receive product changes. This temporary
-layout will be removed only through a separately reviewed repository move.
+## Build from the repository root
 
 ```powershell
-Set-Location wmux-clean
 cargo build --locked
 ```
 
-Rust 1.96.0 is pinned in `wmux-clean/rust-toolchain.toml`.
+Rust 1.96.0 is pinned in `rust-toolchain.toml`.
 
 ## Architecture rules
 
@@ -59,7 +54,7 @@ risk, with test-first regression coverage for bugs. Preserve existing user
 changes in a dirty worktree and never commit local build output, runtime state,
 credentials, keys, or `.agents/` content.
 
-Minimum local checks from `wmux-clean/`:
+Minimum local checks from the repository root:
 
 ```powershell
 cargo fmt --all -- --check

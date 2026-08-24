@@ -120,29 +120,35 @@ ConPTY object
 Preserve the crate boundaries:
 
 ```text
-crates/mux-core
+crates/wmux-core
   OS-neutral server state, panes, sessions, layouts, parser, grid, commands.
 
-crates/mux-protocol
+crates/wmux-protocol
   Versioned framed IPC messages and codec.
 
-crates/mux-platform
+crates/wmux-platform
   OS-neutral platform traits and semantic event types.
 
-crates/mux-platform-windows
+crates/wmux-windows
   Windows ConPTY, CreateProcessW, Job Objects, named pipes, console modes.
 
-crates/mux-platform-unix
-  Later Unix PTY, fork/exec, signals, Unix sockets, termios.
+crates/wmux-unix
+  Unix PTY, process groups, signals, Unix sockets, and termios.
 
-crates/mux-server
+crates/wmux-server
   Persistent daemon/server runtime.
 
-crates/mux-client
+crates/wmux-client
   Disposable CLI/attach client.
 
-crates/mux-cli
+crates/wmux-cli
   Shared CLI parsing.
+
+crates/wmux-config
+  Configuration loading, defaults, and validation.
+
+crates/wmux-bench, crates/wmux-conformance, crates/wmux-stress
+  Performance, semantic-conformance, and deterministic stress harnesses.
 ```
 
 ## Server State Model

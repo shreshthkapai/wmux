@@ -14,9 +14,9 @@ on:
       - rust-toolchain.toml
       - scripts/test-verify-release-archives.ps1
       - scripts/verify-release-archives.ps1
-      - wmux-clean/Cargo.lock
-      - wmux-clean/Cargo.toml
-      - wmux-clean/crates/**/Cargo.toml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**/Cargo.toml
   pull_request:
     paths:
       - .github/workflows/supply-chain.yml
@@ -30,9 +30,9 @@ on:
       - rust-toolchain.toml
       - scripts/test-verify-release-archives.ps1
       - scripts/verify-release-archives.ps1
-      - wmux-clean/Cargo.lock
-      - wmux-clean/Cargo.toml
-      - wmux-clean/crates/**/Cargo.toml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**/Cargo.toml
   workflow_dispatch:
 
 permissions:
@@ -51,7 +51,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           rust-version: "1.96.0"
-          manifest-path: ./wmux-clean/Cargo.toml
+          manifest-path: ./Cargo.toml
           command: check
           arguments: --all-features
 
@@ -77,7 +77,7 @@ jobs:
               --locked \
               --no-deps \
               --format-version 1 \
-              --manifest-path wmux-clean/Cargo.toml \
+              --manifest-path Cargo.toml \
               | jq -er '.packages[] | select(.name == "wmux") | .version'
           )"
           dist plan --tag="v${version}"

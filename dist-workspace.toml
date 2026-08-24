@@ -1,5 +1,5 @@
 [workspace]
-members = ["cargo:wmux-clean/"]
+members = ["cargo:./"]
 
 [dist]
 cargo-dist-version = "0.32.0"

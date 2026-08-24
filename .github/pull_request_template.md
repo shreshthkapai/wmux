@@ -13,7 +13,7 @@ List the exact commands and manual checks run.
 
 ## Checklist
 
-- [ ] Product changes are in the canonical `wmux-clean/` workspace.
+- [ ] Product changes are in the root Cargo workspace.
 - [ ] Core code remains free of Windows and Unix APIs.
 - [ ] Server-owned state is mutated only through serialized commands/events.
 - [ ] The change preserves disposable clients and persistent pane processes.

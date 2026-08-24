@@ -17,12 +17,6 @@ wmux provides consistent multiplexer semantics across supported operating
 systems and uses native platform mechanisms for process, terminal, and IPC
 integration. It does not require a POSIX emulation layer on Windows.
 
-> [!IMPORTANT]
-> `wmux-clean/` is temporarily the canonical Rust workspace. The repository
-> root `crates/` tree is the older implementation and must not be used for
-> product changes. A separately reviewed repository move will remove this
-> temporary layout.
-
 ## Install
 
 ### Windows
@@ -102,7 +96,7 @@ Press `Ctrl-b`, release it, then press the action key.
 | `X` | Confirm and kill the entire current session |
 
 Run `wmux list-keys` for the authoritative table. See the
-[command and key model](wmux-clean/docs/command-key-model.md) for command,
+[command and key model](docs/command-key-model.md) for command,
 target, repeat, prompt, and confirmation behavior.
 
 ## Configuration
@@ -115,8 +109,8 @@ wmux config effective
 
 wmux creates a default configuration file on first use. Configuration is
 server-owned and uses the same command parser as interactive commands. See the
-[command and key model](wmux-clean/docs/command-key-model.md) and
-[known platform differences](wmux-clean/docs/known-differences.md).
+[command and key model](docs/command-key-model.md) and
+[known platform differences](docs/known-differences.md).
 
 ## Update
 
@@ -171,11 +165,11 @@ Platform crates own only PTY/process, IPC, terminal-mode, and credential
 mechanics. Rendering uses chunked IO, server-owned terminal grids, dirty-region
 tracking, coalesced redraws, and batched terminal writes.
 
-- [Platform contract](wmux-clean/docs/platform-contract.md)
-- [Cross-OS conformance](wmux-clean/docs/cross-os-conformance.md)
-- [Compatibility evidence](wmux-clean/docs/compatibility-matrix.md)
-- [Rendering model](wmux-clean/docs/hybrid-rendering.md)
-- [Performance gates](wmux-clean/docs/performance.md)
+- [Platform contract](docs/platform-contract.md)
+- [Cross-OS conformance](docs/cross-os-conformance.md)
+- [Compatibility evidence](docs/compatibility-matrix.md)
+- [Rendering model](docs/hybrid-rendering.md)
+- [Performance gates](docs/performance.md)
 
 ## Contributing and security
 

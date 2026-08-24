@@ -5,7 +5,10 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+- Promoted the production Cargo workspace to the repository root and removed
+  the obsolete duplicate workspace and temporary nested directory.
 
 ## [1.0.1] - 2026-08-24
 

@@ -17,7 +17,7 @@ env:
 
 defaults:
   run:
-    working-directory: wmux-clean
+    working-directory: .
 
 jobs:
   quality:
@@ -36,8 +36,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/Cargo.lock') }}
+            target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -68,8 +68,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/Cargo.lock') }}
+            target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Run portable semantic conformance
         run: cargo run --locked -p wmux-conformance --release
@@ -103,8 +103,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/Cargo.lock') }}
+            target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Lint native adapter
         run: cargo clippy --locked -p ${{ matrix.package }} --all-targets -- -D warnings
@@ -160,8 +160,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/Cargo.lock') }}
+            target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Run deterministic CI stress profile
         run: cargo run --locked -p wmux-stress --release -- --profile ci
@@ -183,8 +183,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/fuzz/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/fuzz/Cargo.lock') }}
+            fuzz/target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('fuzz/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Install cargo-fuzz
         run: command -v cargo-fuzz >/dev/null 2>&1 || cargo +nightly-2026-08-22 install cargo-fuzz --locked
@@ -201,7 +201,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-crash-artifacts
-          path: wmux-clean/fuzz/artifacts/
+          path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -219,8 +219,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            wmux-clean/target/
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('wmux-clean/Cargo.lock') }}
+            target/
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Enforce full release performance gate
         run: cargo run --locked -p wmux-bench --release -- --suite full --gate

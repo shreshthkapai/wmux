@@ -36,7 +36,7 @@ Confirm the workspace version and changelog agree:
 ```powershell
 $version = "1.0.1"
 $tag = "v$version"
-Select-String -Path wmux-clean/Cargo.toml -Pattern "version = `"$version`""
+Select-String -Path Cargo.toml -Pattern "version = `"$version`""
 Select-String -Path CHANGELOG.md -Pattern "^## \[$version\]"
 ```
 
@@ -45,7 +45,7 @@ changing the tag.
 
 ## 2. Run the local quality gate
 
-From `wmux-clean/`:
+From the repository root:
 
 ```powershell
 cargo fmt --all -- --check
@@ -65,7 +65,7 @@ not native runtime evidence.
 From the repository root, check the dependency and distribution policies:
 
 ```powershell
-cargo deny --manifest-path wmux-clean/Cargo.toml check
+cargo deny --manifest-path Cargo.toml check
 dist generate --check
 dist plan --tag=$tag
 ```
@@ -120,21 +120,12 @@ archive contents, and executes both x86_64 Linux musl binaries.
 
 Do not tag a commit while any required hosted job is pending or failing.
 
-## 5. Decide the existing GitHub history cutover
+## 5. Confirm repository state
 
-The confirmed public GitHub repository contains an older C++ implementation,
-while this Rust repository began with independent history. Before configuring
-a remote or pushing, choose and document one of these approaches:
-
-1. preserve the old default branch history through an explicit merge or an
-   archive branch; or
-2. replace the remote default branch after recording an immutable recovery
-   reference to the previous tip.
-
-Review the exact refs and recovery procedure before any destructive remote
-operation. This runbook intentionally provides no force-push command. The
-workspace rename from `wmux-clean/` is also a separate approved change; update
-the single member path in `dist-workspace.toml` when that move occurs.
+Confirm the release commit is on `main`, the working tree contains no product
+changes, and `origin` points to the public wmux repository. Never move or
+replace a published release tag. This runbook intentionally provides no
+force-push command.
 
 ## 6. Configure repository release settings
 

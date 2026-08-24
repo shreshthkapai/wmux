@@ -3,16 +3,50 @@
 version = 4
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "close_fds"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc416f33de9d59e79e57560f450d21ff8393adcf1cdfc3e6d8fb93d5f88a2ed"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "crossterm"
@@ -77,6 +111,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,62 +138,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "mux-cli"
-version = "0.1.0"
-
-[[package]]
-name = "mux-client"
-version = "0.1.0"
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
- "mux-cli",
- "mux-platform",
- "mux-platform-windows",
- "mux-protocol",
-]
-
-[[package]]
-name = "mux-core"
-version = "0.1.0"
-dependencies = [
- "vte",
-]
-
-[[package]]
-name = "mux-platform"
-version = "0.1.0"
-dependencies = [
- "mux-core",
- "mux-protocol",
-]
-
-[[package]]
-name = "mux-platform-unix"
-version = "0.1.0"
-dependencies = [
- "mux-platform",
-]
-
-[[package]]
-name = "mux-platform-windows"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "mux-core",
- "mux-platform",
-]
-
-[[package]]
-name = "mux-protocol"
-version = "0.1.0"
-
-[[package]]
-name = "mux-server"
-version = "0.1.0"
-dependencies = [
- "mux-core",
- "mux-platform",
- "mux-platform-windows",
- "mux-protocol",
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -169,6 +172,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "proc-macro2"
@@ -254,35 +263,78 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "socket2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "syn"
+version = "2.0.118"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "tokio"
+version = "1.52.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+dependencies = [
+ "bytes",
+ "libc",
+ "mio",
+ "pin-project-lite",
+ "socket2",
+ "tokio-macros",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "utf8parse"
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vte"
-version = "0.11.1"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5022b5fbf9407086c180e9557be968742d839e68346af7792b8592489732197"
+checksum = "231fdcd7ef3037e8330d8e17e61011a2c244126acc0a982f4040ac3f9f0bc077"
 dependencies = [
- "utf8parse",
- "vte_generate_state_changes",
-]
-
-[[package]]
-name = "vte_generate_state_changes"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e369bee1b05d510a7b4ed645f5faa90619e05437111783ea5848f28d97d3c2e"
-dependencies = [
- "proc-macro2",
- "quote",
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]
@@ -400,3 +452,124 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wmux"
+version = "1.0.1"
+dependencies = [
+ "tokio",
+ "wmux-cli",
+ "wmux-config",
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
+ "wmux-unix",
+ "wmux-windows",
+]
+
+[[package]]
+name = "wmux-bench"
+version = "1.0.1"
+dependencies = [
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+]
+
+[[package]]
+name = "wmux-cli"
+version = "1.0.1"
+dependencies = [
+ "wmux-core",
+]
+
+[[package]]
+name = "wmux-config"
+version = "1.0.1"
+
+[[package]]
+name = "wmux-conformance"
+version = "1.0.1"
+dependencies = [
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+]
+
+[[package]]
+name = "wmux-core"
+version = "1.0.1"
+dependencies = [
+ "smallvec",
+ "unicode-segmentation",
+ "unicode-width",
+ "vte",
+ "wmux-platform",
+]
+
+[[package]]
+name = "wmux-platform"
+version = "1.0.1"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "wmux-protocol"
+version = "1.0.1"
+dependencies = [
+ "wmux-core",
+ "wmux-platform",
+]
+
+[[package]]
+name = "wmux-server"
+version = "1.0.1"
+dependencies = [
+ "tokio",
+ "wmux-config",
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+]
+
+[[package]]
+name = "wmux-stress"
+version = "1.0.1"
+dependencies = [
+ "tokio",
+ "wmux-config",
+ "wmux-core",
+ "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
+]
+
+[[package]]
+name = "wmux-unix"
+version = "1.0.1"
+dependencies = [
+ "close_fds",
+ "crossterm",
+ "libc",
+ "nix",
+ "tokio",
+ "wmux-config",
+ "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
+]
+
+[[package]]
+name = "wmux-windows"
+version = "1.0.1"
+dependencies = [
+ "crossterm",
+ "tokio",
+ "windows-sys 0.61.2",
+ "wmux-config",
+ "wmux-platform",
+ "wmux-protocol",
+ "wmux-server",
+]
