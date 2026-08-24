@@ -28,19 +28,18 @@ behavior from entering the shared semantic path.
 
 ### Default UI evidence
 
-The accepted 16-case aggregate is `c283cc090b2e4197` after adding the
-server-owned status row, connected box-drawing borders, active-pane emphasis,
-and stable full-terminal window-list centering to the multiple-client scene
-fixture. Source audit confirms that this is the only portable case that
-composes renderer output; the remaining 15 case fingerprints retain their
-previous semantic inputs. Windows produces the new aggregate and
-`EXPECTED_DIFFERENCES` remains empty. Linux and macOS confirmation still
-requires their native hosted runners.
+The accepted 16-case aggregate is `b82606bed0adc486` after protocol version 8
+added bounded client working-directory context to `Hello` and the control case
+received a version-neutral name. The existing server-owned status row,
+connected box-drawing borders, active-pane emphasis, and stable full-terminal
+window-list centering remain in the multiple-client scene fixture.
+`EXPECTED_DIFFERENCES` remains empty; hosted Windows, Linux, and macOS runners
+must produce the same aggregate.
 
 ### Phase 7 shared-semantics evidence
 
 Phase 7 extends the portable suite to 16 cases. The added
-`control-protocol-v7` case covers stable record IDs, arbitrary binary pane
+`control-protocol` case covers stable record IDs, arbitrary binary pane
 output, notifications, ordered command completion, and bounded recovery. On
 2026-08-22, Windows and Linux produced the same aggregate fingerprint
 `d5670ad858ef5735`; `EXPECTED_DIFFERENCES` remains empty.
@@ -60,7 +59,7 @@ daemon children cannot inherit unrelated server descriptors.
 
 ### Phase 8 beta-core evidence
 
-Phase 8 keeps the 16-case protocol-v7 portable suite unchanged and adds an
+Phase 8 keeps the 16-case portable protocol suite unchanged and adds an
 external deterministic stress gate through the real server loop. On
 2026-08-22, two Windows runs and two Linux runs produced conformance aggregate
 `d5670ad858ef5735` and stress aggregate `d537f5686435cc2e` every time.

@@ -62,6 +62,9 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
         .expect("server platform is constructed");
     let transport = UnixClientTransport::from_runtime_directory(runtime.path().to_path_buf())
         .expect("client transport is constructed");
+    let project = runtime.path().join("project directory");
+    fs::create_dir_all(&project).expect("client project directory is created");
+    let project = fs::canonicalize(project).expect("client project directory is canonicalized");
     let (server_result_tx, server_result_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         let result = wmux_server::run_with_platform_and_config(
@@ -71,8 +74,15 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
         let _ = server_result_tx.send(result);
     });
 
-    let mut attached = connect_and_handshake(&transport).await;
+    let mut attached = connect_and_handshake_at(&transport, &project).await;
     command(&mut attached, "new-session -s native").await;
+    let cwd_marker = format!("WMUX_CWD_{}", project.display());
+    write_message(
+        &mut attached,
+        Message::Input(b"printf 'WMUX_CWD_%s\\n' \"$PWD\"\n".to_vec()),
+    )
+    .await;
+    wait_for_output(&mut attached, cwd_marker.as_bytes()).await;
     write_message(
         &mut attached,
         Message::Input(b"printf 'WMUX_%s' TYPED\n".to_vec()),
@@ -192,6 +202,14 @@ async fn run_restart(runtime: &Path) {
 }
 
 async fn connect_and_handshake(transport: &UnixClientTransport) -> BoxedIpcStream {
+    let current_dir = std::env::current_dir().unwrap();
+    connect_and_handshake_at(transport, &current_dir).await
+}
+
+async fn connect_and_handshake_at(
+    transport: &UnixClientTransport,
+    current_dir: &Path,
+) -> BoxedIpcStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut stream = loop {
         match transport.connect().await {
@@ -209,6 +227,7 @@ async fn connect_and_handshake(transport: &UnixClientTransport) -> BoxedIpcStrea
             version: VERSION,
             pid: process::id(),
             capabilities: TerminalCapabilities::default(),
+            current_dir: current_dir.to_string_lossy().into_owned(),
         },
     )
     .await;

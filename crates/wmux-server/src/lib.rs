@@ -210,6 +210,7 @@ enum OwnerMessage {
     Register {
         outbound: async_mpsc::Sender<Outbound>,
         capabilities: TerminalCapabilities,
+        current_dir: PathBuf,
         reply: oneshot::Sender<ClientId>,
     },
     Event(ServerEvent),
@@ -254,14 +255,15 @@ async fn handle_connection(
         ));
     }
     let mut stream = accepted.stream;
-    let capabilities = handshake(&mut stream).await?;
+    let handshake = handshake(&mut stream).await?;
 
     let (outbound_tx, outbound_rx) = async_mpsc::channel(CLIENT_OUTPUT_MESSAGES);
     let (reply_tx, reply_rx) = oneshot::channel();
     owner_tx
         .send(OwnerMessage::Register {
             outbound: outbound_tx,
-            capabilities,
+            capabilities: handshake.capabilities,
+            current_dir: handshake.current_dir,
             reply: reply_tx,
         })
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server owner stopped"))?;
@@ -440,15 +442,35 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
     Some(OwnerMessage::Event(event))
 }
 
+struct ClientHandshake {
+    capabilities: TerminalCapabilities,
+    current_dir: PathBuf,
+}
+
 async fn handshake(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-) -> io::Result<TerminalCapabilities> {
+) -> io::Result<ClientHandshake> {
     match read_async_message(&mut *stream).await? {
         Some(Message::Hello {
             version,
             capabilities,
+            current_dir,
             ..
         }) if version == VERSION => {
+            let current_dir = PathBuf::from(current_dir);
+            if !current_dir.is_absolute() {
+                write_async_message(
+                    stream,
+                    Message::CommandErr(
+                        "client working directory must be an absolute path".to_string(),
+                    ),
+                )
+                .await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "client working directory must be absolute",
+                ));
+            }
             write_async_message(
                 stream,
                 Message::HelloOk {
@@ -458,7 +480,10 @@ async fn handshake(
                 },
             )
             .await?;
-            Ok(capabilities)
+            Ok(ClientHandshake {
+                capabilities,
+                current_dir,
+            })
         }
         Some(Message::Hello { version, .. }) => {
             write_async_message(
@@ -756,7 +781,12 @@ impl Runtime {
         self.test_platform.requests()
     }
 
-    fn ensure_platform_pane(&mut self, pane_id: PaneId, size: TerminalSize) -> io::Result<()> {
+    fn ensure_platform_pane(
+        &mut self,
+        pane_id: PaneId,
+        size: TerminalSize,
+        current_dir: Option<&Path>,
+    ) -> io::Result<()> {
         if self.platform_panes.contains_key(&pane_id) {
             return Ok(());
         }
@@ -771,7 +801,7 @@ impl Runtime {
                 pane: PlatformPaneId::new(pane_id.raw()),
                 size,
                 command: None,
-                cwd: None,
+                cwd: current_dir.map(Path::to_path_buf),
                 environment,
             }))
             .map_err(PlatformError::into_io)?;
@@ -780,10 +810,14 @@ impl Runtime {
         Ok(())
     }
 
-    fn ensure_platform_panes_for_client(&mut self, client: ClientId) -> io::Result<()> {
+    fn ensure_platform_panes_for_client(
+        &mut self,
+        client: ClientId,
+        current_dir: Option<&Path>,
+    ) -> io::Result<()> {
         let pane_sizes = self.pane_sizes_for_client(client);
         for (pane, size) in &pane_sizes {
-            self.ensure_platform_pane(*pane, *size)?;
+            self.ensure_platform_pane(*pane, *size, current_dir)?;
         }
         Ok(())
     }
@@ -1296,6 +1330,7 @@ struct ClientView {
     scroll_offsets: BTreeMap<PaneId, usize>,
     copy_mode: Option<CopyMode>,
     control: Option<ControlClient>,
+    current_dir: PathBuf,
 }
 
 struct ControlClient {
@@ -1306,7 +1341,20 @@ struct ControlClient {
 }
 
 impl ClientView {
+    #[cfg(test)]
     fn new(outbound: async_mpsc::Sender<Outbound>, capabilities: TerminalCapabilities) -> Self {
+        Self::registered(
+            outbound,
+            capabilities,
+            std::env::current_dir().expect("test process has a working directory"),
+        )
+    }
+
+    fn registered(
+        outbound: async_mpsc::Sender<Outbound>,
+        capabilities: TerminalCapabilities,
+        current_dir: PathBuf,
+    ) -> Self {
         let size = TerminalSize::new(80, 24);
         Self {
             outbound,
@@ -1326,6 +1374,7 @@ impl ClientView {
             scroll_offsets: BTreeMap::new(),
             copy_mode: None,
             control: None,
+            current_dir,
         }
     }
 
@@ -1764,14 +1813,17 @@ impl ServerOwner {
             OwnerMessage::Register {
                 outbound,
                 capabilities,
+                current_dir,
                 reply,
             } => {
                 if self.is_shutting_down() {
                     return;
                 }
                 let client = self.runtime.state.add_client();
-                self.clients
-                    .insert(client, ClientView::new(outbound, capabilities));
+                self.clients.insert(
+                    client,
+                    ClientView::registered(outbound, capabilities, current_dir),
+                );
                 let _ = reply.send(client);
             }
             OwnerMessage::Event(event) => {
@@ -2451,7 +2503,12 @@ impl ServerOwner {
         match effect {
             CommandEffect::EnsurePane { pane } => {
                 let size = self.pane_size(pane).unwrap_or(TerminalSize::new(80, 24));
-                self.runtime.ensure_platform_pane(pane, size)?;
+                let current_dir = self
+                    .clients
+                    .get(&queued.client)
+                    .map(|view| view.current_dir.clone());
+                self.runtime
+                    .ensure_platform_pane(pane, size, current_dir.as_deref())?;
                 self.runtime.apply_pending_pane_resizes()?;
                 Ok(false)
             }
@@ -3033,7 +3090,12 @@ impl ServerOwner {
     ) -> io::Result<()> {
         self.runtime.resize_client_window(client, size);
         self.runtime.cleanup_platform_panes();
-        self.runtime.ensure_platform_panes_for_client(client)?;
+        let current_dir = self
+            .clients
+            .get(&client)
+            .map(|view| view.current_dir.clone());
+        self.runtime
+            .ensure_platform_panes_for_client(client, current_dir.as_deref())?;
         self.runtime.apply_pending_pane_resizes()?;
         Ok(())
     }
@@ -3876,7 +3938,7 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, read_async_message, render_full_for_client,
+        collect_pane_events, handshake, read_async_message, render_full_for_client,
         run_with_platform_and_config, write_async_message, write_outbound_messages,
         ClientRenderSpec, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime,
         ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
@@ -3886,6 +3948,7 @@ mod tests {
     use crate::theme_runtime::ThemeLoader;
     use std::{
         collections::BTreeMap,
+        path::Path,
         sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
@@ -4926,6 +4989,41 @@ mod tests {
     }
 
     async fn memory_handshake(connector: &MemoryConnector) -> tokio::io::DuplexStream {
+        let current_dir = std::env::current_dir().unwrap();
+        memory_handshake_at(connector, &current_dir).await
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_a_relative_client_working_directory() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_handshake = tokio::spawn(async move { handshake(&mut server).await });
+        write_async_message(
+            &mut client,
+            Message::Hello {
+                version: VERSION,
+                pid: 42,
+                capabilities: TerminalCapabilities::default(),
+                current_dir: "relative/project".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            read_async_message(&mut client).await.unwrap(),
+            Some(Message::CommandErr(message)) if message.contains("absolute path")
+        ));
+        let error = match server_handshake.await.unwrap() {
+            Ok(_) => panic!("relative working directory was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    async fn memory_handshake_at(
+        connector: &MemoryConnector,
+        current_dir: &Path,
+    ) -> tokio::io::DuplexStream {
         let mut stream = connector.connect();
         write_async_message(
             &mut stream,
@@ -4933,6 +5031,7 @@ mod tests {
                 version: VERSION,
                 pid: 42,
                 capabilities: TerminalCapabilities::default(),
+                current_dir: current_dir.to_string_lossy().into_owned(),
             },
         )
         .await
@@ -5011,7 +5110,8 @@ mod tests {
             None
         );
 
-        let mut client = memory_handshake(&connector).await;
+        let requested_dir = std::env::current_dir().unwrap().join("client-project");
+        let mut client = memory_handshake_at(&connector, &requested_dir).await;
         command_ok(&mut client, "new-session -d -s durable").await;
         wait_until(|| {
             pty.requests()
@@ -5029,6 +5129,9 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        assert!(pty.requests().iter().any(|request| {
+            matches!(request, PlatformRequest::SpawnPane(spawn) if spawn.pane == first_pane && spawn.cwd.as_deref() == Some(requested_dir.as_path()))
+        }));
 
         command_ok(&mut client, "attach-session -t durable").await;
         write_async_message(
@@ -5145,7 +5248,7 @@ mod tests {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("platform", 80, 24);
         runtime
-            .ensure_platform_pane(created.pane, TerminalSize::new(80, 24))
+            .ensure_platform_pane(created.pane, TerminalSize::new(80, 24), None)
             .unwrap();
         runtime
             .write_pane_input(

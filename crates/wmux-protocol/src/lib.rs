@@ -5,10 +5,11 @@ use wmux_core::{
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
-pub const VERSION: u32 = 7;
-pub const MAGIC: [u8; 4] = *b"WMX7";
+pub const VERSION: u32 = 8;
+pub const MAGIC: [u8; 4] = *b"WMX8";
 pub const FRAME_HEADER_LEN: usize = 9;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_CLIENT_CWD_BYTES: usize = 64 * 1024;
 const KEY_PREFIX_LEN: usize = 6;
 const CONTROL_OUTPUT_PREFIX_LEN: usize = 9;
 const ENCODED_HEADER_LEN: usize = FRAME_HEADER_LEN + CONTROL_OUTPUT_PREFIX_LEN;
@@ -109,6 +110,7 @@ pub enum Message {
         version: u32,
         pid: u32,
         capabilities: TerminalCapabilities,
+        current_dir: String,
     },
     HelloOk {
         version: u32,
@@ -243,8 +245,17 @@ impl EncodedPayload {
                 version,
                 pid,
                 capabilities,
+                current_dir,
+            } => {
+                let mut bytes = Vec::with_capacity(16 + current_dir.len());
+                bytes.extend_from_slice(&version.to_le_bytes());
+                bytes.extend_from_slice(&pid.to_le_bytes());
+                bytes.extend_from_slice(&capabilities.bits().to_le_bytes());
+                bytes.extend_from_slice(&(current_dir.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(current_dir.as_bytes());
+                Self::Owned(bytes)
             }
-            | Message::HelloOk {
+            Message::HelloOk {
                 version,
                 pid,
                 capabilities,
@@ -322,7 +333,7 @@ pub fn write_message(mut writer: impl Write, message: &Message) -> io::Result<()
     }
     if matches!(
         message,
-        Message::ControlCommand { .. } | Message::ControlRecord(_)
+        Message::Hello { .. } | Message::ControlCommand { .. } | Message::ControlRecord(_)
     ) {
         let frame = encode_frame(message);
         writer.write_all(&frame)?;
@@ -362,12 +373,8 @@ fn frame_header(tag: u8, payload_len: usize) -> [u8; FRAME_HEADER_LEN] {
 
 fn borrowed_payload<'a>(message: &'a Message, fixed: &'a mut [u8; 12]) -> &'a [u8] {
     match message {
-        Message::Hello {
-            version,
-            pid,
-            capabilities,
-        }
-        | Message::HelloOk {
+        Message::Hello { .. } => unreachable!("client hello uses an owned payload"),
+        Message::HelloOk {
             version,
             pid,
             capabilities,
@@ -487,7 +494,8 @@ fn read_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
 
 fn payload_len(message: &Message) -> usize {
     match message {
-        Message::Hello { .. } | Message::HelloOk { .. } => 12,
+        Message::Hello { current_dir, .. } => 16 + current_dir.len(),
+        Message::HelloOk { .. } => 12,
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => text.len(),
         Message::ControlCommand { command, .. } => 8 + command.len(),
         Message::ControlRecord(record) => control_record_len(record),
@@ -508,8 +516,15 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
             version,
             pid,
             capabilities,
+            current_dir,
+        } => {
+            out.extend_from_slice(&version.to_le_bytes());
+            out.extend_from_slice(&pid.to_le_bytes());
+            out.extend_from_slice(&capabilities.bits().to_le_bytes());
+            out.extend_from_slice(&(current_dir.len() as u32).to_le_bytes());
+            out.extend_from_slice(current_dir.as_bytes());
         }
-        | Message::HelloOk {
+        Message::HelloOk {
             version,
             pid,
             capabilities,
@@ -554,11 +569,12 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
 fn decode_payload_owned(tag: u8, payload: Vec<u8>) -> io::Result<Message> {
     match tag {
         1 => {
-            let (version, pid, capabilities) = hello_fields(&payload)?;
+            let (version, pid, capabilities, current_dir) = client_hello_fields(&payload)?;
             Ok(Message::Hello {
                 version,
                 pid,
                 capabilities,
+                current_dir,
             })
         }
         2 => {
@@ -1066,6 +1082,22 @@ fn hello_fields(payload: &[u8]) -> io::Result<(u32, u32, TerminalCapabilities)> 
     ))
 }
 
+fn client_hello_fields(payload: &[u8]) -> io::Result<(u32, u32, TerminalCapabilities, String)> {
+    if payload.len() < 16 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad hello"));
+    }
+    let current_dir_len =
+        u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]) as usize;
+    if current_dir_len > MAX_CLIENT_CWD_BYTES || payload.len() != 16 + current_dir_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad hello"));
+    }
+    let (version, pid, capabilities) = hello_fields(&payload[..12])?;
+    let current_dir = std::str::from_utf8(&payload[16..])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hello cwd utf8"))?
+        .to_string();
+    Ok((version, pid, capabilities, current_dir))
+}
+
 fn string_payload(payload: Vec<u8>) -> io::Result<String> {
     String::from_utf8(payload)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8"))
@@ -1076,7 +1108,8 @@ mod tests {
     use super::{
         decode_frame_header, decode_frame_payload, decode_frame_payload_owned, encode_frame,
         read_message, write_message, EncodedFrame, Message, TerminalCapabilities, WireKeyCode,
-        WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAGIC, MAX_FRAME, VERSION,
+        WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAGIC, MAX_CLIENT_CWD_BYTES, MAX_FRAME,
+        VERSION,
     };
     use std::io;
     use wmux_core::{
@@ -1087,12 +1120,13 @@ mod tests {
 
     #[test]
     fn roundtrips_all_basics() {
-        assert_eq!(MAGIC, *b"WMX7");
+        assert_eq!(MAGIC, *b"WMX8");
         let messages = [
             Message::Hello {
                 version: VERSION,
                 pid: 10,
                 capabilities: TerminalCapabilities::new(TerminalCapabilities::SYNCHRONIZED_OUTPUT),
+                current_dir: "/work/project".to_string(),
             },
             Message::Command("new -s x".to_string()),
             Message::Input(b"abc".to_vec()),
@@ -1198,9 +1232,51 @@ mod tests {
     }
 
     #[test]
+    fn hello_rejects_a_mismatched_working_directory_length() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&VERSION.to_le_bytes());
+        payload.extend_from_slice(&10_u32.to_le_bytes());
+        payload.extend_from_slice(&TerminalCapabilities::default().bits().to_le_bytes());
+        payload.extend_from_slice(&8_u32.to_le_bytes());
+        payload.extend_from_slice(b"/work");
+
+        assert_eq!(
+            decode_frame_payload_owned(1, payload).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn hello_rejects_invalid_or_oversized_working_directories() {
+        let mut invalid_utf8 = Vec::new();
+        invalid_utf8.extend_from_slice(&VERSION.to_le_bytes());
+        invalid_utf8.extend_from_slice(&10_u32.to_le_bytes());
+        invalid_utf8.extend_from_slice(&TerminalCapabilities::default().bits().to_le_bytes());
+        invalid_utf8.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_utf8.push(0xff);
+        assert_eq!(
+            decode_frame_payload_owned(1, invalid_utf8)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&VERSION.to_le_bytes());
+        oversized.extend_from_slice(&10_u32.to_le_bytes());
+        oversized.extend_from_slice(&TerminalCapabilities::default().bits().to_le_bytes());
+        oversized.extend_from_slice(&((MAX_CLIENT_CWD_BYTES + 1) as u32).to_le_bytes());
+        oversized.resize(16 + MAX_CLIENT_CWD_BYTES + 1, b'x');
+        assert_eq!(
+            decode_frame_payload_owned(1, oversized).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn protocol_documentation_matches_wire_constants() {
-        assert_eq!(VERSION, 7);
-        assert_eq!(MAGIC, *b"WMX7");
+        assert_eq!(VERSION, 8);
+        assert_eq!(MAGIC, *b"WMX8");
         let documentation = include_str!("../../../docs/ipc-protocol.md");
         assert!(documentation
             .lines()
@@ -1221,7 +1297,7 @@ mod tests {
             raw: "\u{3bb}".as_bytes().to_vec(),
         });
         let frame = encode_frame(&message);
-        assert_eq!(frame, b"WMX7\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
+        assert_eq!(frame, b"WMX8\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
         assert_eq!(read_message(frame.as_slice()).unwrap(), Some(message));
     }
 

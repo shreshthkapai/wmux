@@ -686,6 +686,10 @@ impl MemoryHarness {
                 version: VERSION,
                 pid: std::process::id(),
                 capabilities: TerminalCapabilities::default(),
+                current_dir: std::env::current_dir()
+                    .expect("stress process has a working directory")
+                    .to_string_lossy()
+                    .into_owned(),
             },
         )
         .await?;

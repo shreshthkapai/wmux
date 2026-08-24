@@ -257,11 +257,11 @@ impl WindowsPtyBackend {
                 format!("platform pane {} already exists", request.pane.raw()),
             ));
         }
-        if request.command.is_some() || request.cwd.is_some() {
+        if request.command.is_some() {
             return Err(PlatformError::new(
                 PlatformErrorKind::Unsupported,
                 "spawn pane",
-                "custom Windows pane command and cwd are not implemented",
+                "custom Windows pane commands are not implemented",
             ));
         }
         let environment = request
@@ -278,6 +278,7 @@ impl WindowsPtyBackend {
             request.pane,
             request.size,
             &environment,
+            request.cwd.as_deref(),
             &self.runtime,
             Arc::clone(&self.notifier),
         )

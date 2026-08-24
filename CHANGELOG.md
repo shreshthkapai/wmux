@@ -7,6 +7,19 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.3] - 2026-08-24
+
+### Changed
+
+- IPC protocol version 8 carries a bounded, absolute client working directory
+  as client-scoped pane launch context.
+
+### Fixed
+
+- New sessions, windows, and panes now start in the directory from which their
+  client invoked wmux instead of inheriting the persistent server's older
+  working directory on Windows, Linux, and macOS.
+
 ## [1.0.2] - 2026-08-24
 
 ### Added
@@ -73,7 +86,8 @@ No changes yet.
   live server state migration is not implemented.
 - Windows ARM64 and package-manager repositories are not included in v1.0.0.
 
-[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/shreshthkapai/wmux/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/shreshthkapai/wmux/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shreshthkapai/wmux/releases/tag/v1.0.0

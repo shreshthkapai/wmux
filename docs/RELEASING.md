@@ -9,8 +9,8 @@ an explicit maintainer decision.
 
 - Initial release: `1.0.0`
 - Initial tag: `v1.0.0`
-- Current release: `1.0.2`
-- Current tag: `v1.0.2`
+- Current release: `1.0.3`
+- Current tag: `v1.0.3`
 - GitHub repository: `https://github.com/shreshthkapai/wmux`
 - Release type: normal GitHub release, not a prerelease
 - Release tool: dist 0.32.0
@@ -34,7 +34,7 @@ git diff --check
 Confirm the workspace version and changelog agree:
 
 ```powershell
-$version = "1.0.2"
+$version = "1.0.3"
 $tag = "v$version"
 Select-String -Path Cargo.toml -Pattern "version = `"$version`""
 Select-String -Path CHANGELOG.md -Pattern "^## \[$version\]"

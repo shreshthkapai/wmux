@@ -1,7 +1,7 @@
 # IPC Protocol
 
-Protocol version: 7
-Wire magic: WMX7
+Protocol version: 8
+Wire magic: WMX8
 Maximum frame payload: 16777216 bytes
 
 wmux IPC is a versioned, framed byte protocol between disposable clients and
@@ -15,7 +15,7 @@ Every frame has a 9-byte header followed by the declared payload:
 
 | Offset | Size | Field | Encoding |
 | --- | ---: | --- | --- |
-| 0 | 4 | magic | ASCII `WMX7` |
+| 0 | 4 | magic | ASCII `WMX8` |
 | 4 | 1 | message tag | unsigned byte |
 | 5 | 4 | payload length | little-endian `u32` |
 
@@ -27,7 +27,7 @@ output, paste, key raw bytes, and clipboard payloads may contain any byte.
 
 | Tag | Message | Payload |
 | ---: | --- | --- |
-| 1 | `Hello` | version `u32`, diagnostic PID `u32`, capability bits `u32` |
+| 1 | `Hello` | version `u32`, diagnostic PID `u32`, capability bits `u32`, cwd length `u32`, absolute cwd UTF-8 bytes |
 | 2 | `HelloOk` | version `u32`, diagnostic PID `u32`, capability bits `u32` |
 | 3 | `Command` | UTF-8 command text |
 | 4 | `CommandOk` | UTF-8 result text |
@@ -45,11 +45,12 @@ output, paste, key raw bytes, and clipboard payloads may contain any byte.
 | 16 | `ControlCommand` | sequence `u64`, UTF-8 command text |
 | 17 | `ControlRecord` | structured record tag and record payload |
 
-`Hello` and `HelloOk` payloads are exactly 12 bytes. Capability bit 0 means
-synchronized output and bit 1 means scroll-region support; unknown bits are
-preserved but do not grant behavior the receiver does not implement. Mouse
-payloads are exactly 7 bytes. `Resize` is exactly 4 bytes. `Detach` and
-`Shutdown` reject non-empty payloads.
+`HelloOk` payloads are exactly 12 bytes. `Hello` has a 16-byte fixed prefix and
+an exact length-prefixed client working directory limited to 65,536 bytes.
+Capability bit 0 means synchronized output and bit 1 means scroll-region
+support; unknown bits are preserved but do not grant behavior the receiver
+does not implement. Mouse payloads are exactly 7 bytes. `Resize` is exactly 4
+bytes. `Detach` and `Shutdown` reject non-empty payloads.
 
 ### Semantic key payload
 
@@ -75,17 +76,23 @@ the protocol and may be empty.
 
 ## Handshake and identity
 
-The first client frame must be `Hello` with version 7. A compatible server
+The first client frame must be `Hello` with version 8. A compatible server
 answers `HelloOk` before accepting commands. A numeric mismatch returns a
 protocol-version error naming both versions. Invalid magic means an
 incompatible service owns the endpoint; the client reports that condition and
 asks the user to stop it rather than retrying startup.
 
+`Hello.current_dir` is the absolute directory from which the disposable client
+was invoked. The server stores it as client-scoped launch context and supplies
+it to pane processes created by that client's commands. The persistent
+daemon's own working directory is never used as a substitute. Non-UTF-8,
+relative, oversized, truncated, and trailing directory data is rejected.
+
 On Windows, `Hello.pid` is diagnostic only. The server derives peer identity
 from the connected named-pipe client's impersonation token and compares its
 user SID with the SID that owns the protected endpoint. Verification happens
-before `HelloOk` and before client registration. No PID, username environment
-variable, or protocol field is an authorization input.
+before `HelloOk` and before client registration. No PID, working directory,
+username environment variable, or protocol field is an authorization input.
 
 ## Malformed input and disconnects
 

@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     mem,
     os::windows::{ffi::OsStrExt, io::FromRawHandle},
+    path::Path,
     ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -94,6 +95,7 @@ pub fn spawn_shell(
     pane: PlatformPaneId,
     size: TerminalSize,
     env_overrides: &[(String, String)],
+    current_dir: Option<&Path>,
     runtime: &TokioHandle,
     notify: PlatformNotifier,
 ) -> io::Result<(ConptyPane, PlatformEventReceiver)> {
@@ -109,6 +111,10 @@ pub fn spawn_shell(
 
     let mut command_line = default_shell_command_line();
     let mut environment = environment_block(env_overrides);
+    let current_dir = current_dir.map(wide_path_null).transpose()?;
+    let current_dir_ptr = current_dir
+        .as_ref()
+        .map_or(ptr::null(), |path| path.as_ptr());
     let mut process_info = ProcessInformation::default();
     let created = unsafe {
         CreateProcessW(
@@ -119,7 +125,7 @@ pub fn spawn_shell(
             0,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             environment.as_mut_ptr().cast(),
-            ptr::null(),
+            current_dir_ptr,
             &mut startup.inner.startup_info,
             &mut process_info,
         )
@@ -489,6 +495,18 @@ fn wide_null(value: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn wide_path_null(path: &Path) -> io::Result<Vec<u16>> {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "working directory contains a NUL character",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 fn failed(hr: i32) -> bool {
@@ -862,6 +880,7 @@ mod tests {
             pane_id,
             TerminalSize::new(80, 24),
             &[],
+            None,
             runtime.handle(),
             notify,
         )
@@ -897,6 +916,78 @@ mod tests {
     }
 
     #[test]
+    fn conpty_shell_starts_in_the_requested_working_directory() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let notify: PlatformNotifier = Arc::new(|_| {});
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let current_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("wmux cwd test {} {unique}", std::process::id()));
+        std::fs::create_dir_all(&current_dir).unwrap();
+        let pane_id = PlatformPaneId::new(99_004);
+        let (mut pane, mut events) = spawn_shell(
+            pane_id,
+            TerminalSize::new(80, 24),
+            &[],
+            Some(&current_dir),
+            runtime.handle(),
+            notify,
+        )
+        .unwrap();
+        pane.write_input(b"cd\r".to_vec()).unwrap();
+
+        let expected = current_dir.to_string_lossy().to_ascii_lowercase();
+        let output = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut output = Vec::new();
+                while let Some(event) = events.recv().await {
+                    if let PlatformEvent::PtyOutput { bytes, .. } = event {
+                        output.extend_from_slice(&bytes);
+                        if String::from_utf8_lossy(&output)
+                            .to_ascii_lowercase()
+                            .contains(&expected)
+                        {
+                            return output;
+                        }
+                    }
+                }
+                output
+            })
+            .await
+            .expect("timed out waiting for the ConPTY working directory")
+        });
+
+        assert!(String::from_utf8_lossy(&output)
+            .to_ascii_lowercase()
+            .contains(&expected));
+        pane.write_input(b"exit\r".to_vec()).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, PlatformEvent::PtyExited { .. }) {
+                        pane.finish_after_process_exit();
+                        return;
+                    }
+                }
+                panic!("ConPTY closed before reporting shell exit")
+            })
+            .await
+            .expect("timed out waiting for the ConPTY shell to exit");
+        });
+        drop(events);
+        drop(pane);
+        std::fs::remove_dir(&current_dir).unwrap();
+    }
+
+    #[test]
     fn terminating_a_pane_kills_its_descendant_process_tree() {
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
@@ -909,6 +1000,7 @@ mod tests {
             pane_id,
             TerminalSize::new(120, 30),
             &[],
+            None,
             runtime.handle(),
             notify,
         )
@@ -975,6 +1067,7 @@ mod tests {
             pane_id,
             TerminalSize::new(80, 24),
             &[],
+            None,
             runtime.handle(),
             notify,
         )

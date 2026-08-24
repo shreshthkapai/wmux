@@ -15,9 +15,9 @@ name = "wmux-bench"
 path = "src/main.rs"
 
 [dependencies]
-wmux-core = { path = "../wmux-core", version = "=1.0.2" }
-wmux-platform = { path = "../wmux-platform", version = "=1.0.2" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.2" }
+wmux-core = { path = "../wmux-core", version = "=1.0.3" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.3" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.3" }
 
 [lints]
 workspace = true

@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     future::Future,
     io::{self, BufRead, IoSlice, Write},
+    path::Path,
     process,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,7 +26,7 @@ use wmux_platform::{
 };
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
-    WireKeyCode, WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, VERSION,
+    WireKeyCode, WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAX_CLIENT_CWD_BYTES, VERSION,
 };
 
 pub fn run_with_platform(
@@ -771,10 +772,11 @@ async fn connect_for_invocation(
     transport: Arc<dyn ClientTransport>,
 ) -> io::Result<BoxedIpcStream> {
     let endpoint_name = transport.endpoint().display().to_string();
+    let current_dir = client_current_dir().map_err(PlatformError::into_io)?;
     connect_with_startup_policy(
         invocation.startup,
         &endpoint_name,
-        || connect_async_handshake_once(transport.as_ref(), capabilities),
+        || connect_async_handshake_once(transport.as_ref(), capabilities, current_dir.clone()),
         || {
             let spec = server_spec()
                 .map_err(|error| PlatformError::from_io("build server daemon spec", error))?;
@@ -789,6 +791,7 @@ async fn connect_for_invocation(
 async fn connect_async_handshake_once(
     transport: &dyn ClientTransport,
     capabilities: TerminalCapabilities,
+    current_dir: String,
 ) -> PlatformResult<BoxedIpcStream> {
     let mut pipe = transport.connect().await?;
     write_async_message(
@@ -797,6 +800,7 @@ async fn connect_async_handshake_once(
             version: VERSION,
             pid: process::id(),
             capabilities,
+            current_dir,
         },
     )
     .await
@@ -827,6 +831,37 @@ async fn connect_async_handshake_once(
             "server closed during handshake",
         )),
     }
+}
+
+fn client_current_dir() -> PlatformResult<String> {
+    let current_dir = std::env::current_dir()
+        .map_err(|error| PlatformError::from_io("read client working directory", error))?;
+    client_current_dir_text(&current_dir)
+}
+
+fn client_current_dir_text(current_dir: &Path) -> PlatformResult<String> {
+    if !current_dir.is_absolute() {
+        return Err(PlatformError::new(
+            PlatformErrorKind::InvalidInput,
+            "encode client working directory",
+            "working directory is not absolute",
+        ));
+    }
+    let current_dir = current_dir.to_str().ok_or_else(|| {
+        PlatformError::new(
+            PlatformErrorKind::InvalidInput,
+            "encode client working directory",
+            "working directory is not valid UTF-8",
+        )
+    })?;
+    if current_dir.len() > MAX_CLIENT_CWD_BYTES {
+        return Err(PlatformError::new(
+            PlatformErrorKind::InvalidInput,
+            "encode client working directory",
+            format!("working directory exceeds {MAX_CLIENT_CWD_BYTES} bytes"),
+        ));
+    }
+    Ok(current_dir.to_string())
 }
 
 async fn connect_with_startup_policy<T, Connect, ConnectFuture, Spawn, Sleep, SleepFuture>(
@@ -960,11 +995,11 @@ fn terminal_capabilities() -> TerminalCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_io_loop, attached_command, classify_attached_inbound, connect_with_startup_policy,
-        control_io_loop, escape_control_bytes, format_control_record, format_effective_config,
-        handshake_read_error, no_server_message, protocol_error, read_async_message,
-        read_inbound_messages, retry_delays, send_key, wire_key_event, write_async_message,
-        AttachedInbound,
+        attach_io_loop, attached_command, classify_attached_inbound, client_current_dir_text,
+        connect_with_startup_policy, control_io_loop, escape_control_bytes, format_control_record,
+        format_effective_config, handshake_read_error, no_server_message, protocol_error,
+        read_async_message, read_inbound_messages, retry_delays, send_key, wire_key_event,
+        write_async_message, AttachedInbound,
     };
     use std::{
         cell::Cell,
@@ -986,6 +1021,21 @@ mod tests {
     };
 
     struct NoopTerminal;
+
+    #[test]
+    fn client_working_directory_must_be_absolute() {
+        let current_dir = std::env::current_dir().unwrap();
+        assert_eq!(
+            client_current_dir_text(&current_dir).unwrap(),
+            current_dir.to_str().unwrap()
+        );
+        assert_eq!(
+            client_current_dir_text(std::path::Path::new("relative/project"))
+                .unwrap_err()
+                .kind(),
+            PlatformErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn effective_config_reports_theme_sources_without_resolving_provider_output() {
@@ -1079,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_terminal_key_converts_exactly_to_protocol_v6() {
+    fn platform_terminal_key_converts_exactly_to_protocol() {
         let event = wmux_platform::TerminalKeyEvent {
             code: wmux_platform::TerminalKeyCode::Char('λ'),
             modifiers: wmux_platform::TerminalKeyModifiers::new(

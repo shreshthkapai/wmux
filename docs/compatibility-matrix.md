@@ -19,7 +19,7 @@ an actual macOS runner, macOS runtime rows remain `manual-pending` or
 
 | Contract | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| Portable protocol-v7 conformance | `verified` | `verified` | `compile-only` |
+| Portable protocol conformance | `verified` | `verified` | `compile-only` |
 | Workspace and shared-runtime tests | `verified` | `verified` | `compile-only` |
 | Native transport authentication | `verified` | `verified` | `compile-only` |
 | Native PTY input, output, resize, and exit | `verified` | `verified` | `compile-only` |

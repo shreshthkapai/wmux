@@ -190,7 +190,7 @@ The final local verification on 2026-08-22 produced:
 
 - 343 Windows workspace tests and 349 Linux Unix/shared tests passed;
 - format checks and warnings-denied clippy passed on Windows and Linux;
-- protocol-v7 conformance produced all 16 case fingerprints and aggregate
+- portable protocol conformance produced all 16 case fingerprints and aggregate
   `d5670ad858ef5735` on both systems, with no expected differences;
 - real Windows and Linux control clients created a session, listed state, ran
   a native shell job, observed structured ordered records, shut down the

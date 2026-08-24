@@ -174,6 +174,10 @@ async fn connect_and_handshake(transport: &WindowsClientTransport) -> BoxedIpcSt
             version: VERSION,
             pid: std::process::id(),
             capabilities: TerminalCapabilities::default(),
+            current_dir: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
         },
     )
     .await;

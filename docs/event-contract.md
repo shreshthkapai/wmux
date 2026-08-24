@@ -41,6 +41,12 @@ ResizePane
 TerminatePane
 ```
 
+`SpawnPane.cwd` is client-scoped launch context. A disposable client sends its
+absolute invocation directory during the authenticated handshake; commands
+that create panes preserve that directory through the serialized owner loop.
+The native adapter applies it when creating the child process. The persistent
+server's own working directory is not part of pane semantics.
+
 `wmux_platform::PlatformEvent` carries PTY output, process exit, final stream
 closure, and classified backend errors back from a backend. `PlatformPaneId`
 is a stable semantic token, never a raw OS handle. `PtyExited` and `PtyClosed`

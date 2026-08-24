@@ -17,7 +17,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xc283_cc09_0b2e_4197;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xb826_06be_d0ad_c486;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformFamily {
@@ -123,7 +123,7 @@ fn control_protocol_case() -> Result<CaseResult, String> {
         hash.bytes(&frame);
     }
     Ok(CaseResult {
-        name: "control-protocol-v7",
+        name: "control-protocol",
         fingerprint: hash.finish(),
     })
 }
@@ -1026,7 +1026,7 @@ mod tests {
         assert!(report
             .cases
             .iter()
-            .any(|case| case.name == "control-protocol-v7"));
+            .any(|case| case.name == "control-protocol"));
         assert_eq!(report.suite_fingerprint, EXPECTED_PORTABLE_FINGERPRINT);
     }
 

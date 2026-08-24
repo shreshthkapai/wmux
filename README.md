@@ -57,6 +57,10 @@ Create and attach to a named session:
 wmux new -s demo
 ```
 
+Client-requested panes start in the directory from which that client invoked
+wmux, even when the persistent server was started earlier from another
+directory.
+
 Detach with `Ctrl-b d`, then reattach:
 
 ```sh

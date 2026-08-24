@@ -19,7 +19,7 @@ smallvec.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 vte.workspace = true
-wmux-platform = { path = "../wmux-platform", version = "=1.0.2" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.3" }
 
 [lints]
 workspace = true
