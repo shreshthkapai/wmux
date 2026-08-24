@@ -569,7 +569,19 @@ fn set_private_modes(screen: &mut Screen, params: &[u16], enabled: bool) {
     for mode in params {
         match *mode {
             25 => screen.set_cursor_visible(enabled),
-            47 | 1047 | 1049 => screen.set_alternate(enabled),
+            47 => screen.switch_alternate(enabled, false),
+            1047 => screen.switch_alternate(enabled, !enabled),
+            1048 if enabled => screen.save_cursor(),
+            1048 => screen.restore_cursor(),
+            1049 if enabled && !screen.alternate_active() => {
+                screen.save_cursor();
+                screen.switch_alternate(true, true);
+            }
+            1049 if !enabled => {
+                screen.switch_alternate(false, true);
+                screen.restore_cursor();
+            }
+            1049 => {}
             9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 => screen.set_mouse_mode(*mode, enabled),
             2004 => screen.set_bracketed_paste(enabled),
             2026 => screen.set_synchronized_output(enabled),
@@ -1075,10 +1087,120 @@ mod tests {
         let mut engine = TerminalEngine::new();
         let mut screen = Screen::new(20, 5);
         engine.feed(&mut screen, b"primary");
-        engine.feed(&mut screen, b"\x1b[?1049halt");
+        engine.feed(&mut screen, b"\x1b[?1049h\x1b[Halt");
         assert_eq!(screen.grid().line(0).unwrap().text(), "alt");
         engine.feed(&mut screen, b"\x1b[?1049l");
         assert_eq!(screen.grid().line(0).unwrap().text(), "primary");
+    }
+
+    #[test]
+    fn mode_1049_restores_primary_cursor_state_and_repaints_primary_rows() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+        engine.feed(&mut screen, b"primary\x1b[3;6H\x1b[31m");
+
+        engine.feed(&mut screen, b"\x1b[?1049h");
+        assert!(screen.alternate_active());
+        assert_eq!(screen.cursor(), (2, 5));
+
+        // A cursor save performed by the full-screen application belongs to
+        // the alternate screen and must not replace the primary saved state.
+        engine.feed(&mut screen, b"\x1b[4;9H\x1b7\x1b[32malt");
+        engine.feed(&mut screen, b"\x1b[?1049l");
+
+        assert!(!screen.alternate_active());
+        assert_eq!(screen.cursor(), (2, 5));
+        assert_eq!(screen.current_style().fg, Color::Indexed(1));
+        assert_eq!(render_text(&screen, 0), "primary");
+        for row in 0..screen.rows() {
+            assert_eq!(screen.line_generation(row), Some(screen.generation()));
+        }
+
+        engine.feed(&mut screen, b"next");
+        assert_eq!(render_text(&screen, 0), "primary");
+        assert_eq!(render_text(&screen, 2), "     next");
+    }
+
+    #[test]
+    fn mode_1048_saves_and_restores_cursor_state_without_switching_buffers() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+
+        engine.feed(
+            &mut screen,
+            b"\x1b[2;4H\x1b[1m\x1b[?1048h\x1b[4;8H\x1b[22m\x1b[?1048l",
+        );
+
+        assert!(!screen.alternate_active());
+        assert_eq!(screen.cursor(), (1, 3));
+        assert!(screen.current_style().bold);
+    }
+
+    #[test]
+    fn mode_1049_clamps_the_restored_cursor_after_an_alternate_screen_resize() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(10, 5);
+        engine.feed(&mut screen, b"\x1b[5;10H\x1b[?1049h");
+
+        screen.resize(4, 2);
+        engine.feed(&mut screen, b"\x1b[?1049l");
+
+        assert!(!screen.alternate_active());
+        assert_eq!(screen.cursor(), (1, 3));
+    }
+
+    #[test]
+    fn mode_1049_reflows_the_saved_primary_cursor_during_resize() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(5, 4);
+        engine.feed(&mut screen, b"abcdefghij\x1b[?1049h");
+
+        screen.resize(3, 4);
+        engine.feed(&mut screen, b"\x1b[?1049l");
+
+        assert_eq!(screen.cursor(), (3, 1));
+        assert_eq!(render_text(&screen, 0), "abc");
+        assert_eq!(render_text(&screen, 1), "def");
+        assert_eq!(render_text(&screen, 2), "ghi");
+        assert_eq!(render_text(&screen, 3), "j");
+
+        engine.feed(&mut screen, b"k");
+        assert_eq!(render_text(&screen, 3), "jk");
+    }
+
+    #[test]
+    fn mode_47_preserves_alternate_contents_across_buffer_switches() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+
+        engine.feed(&mut screen, b"\x1b[?47halt\x1b[?47l\x1b[?47h");
+
+        assert!(screen.alternate_active());
+        assert_eq!(render_text(&screen, 0), "alt");
+    }
+
+    #[test]
+    fn mode_1047_clears_alternate_contents_when_leaving() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+
+        engine.feed(&mut screen, b"\x1b[?47halt\x1b[?47l\x1b[?1047h");
+        assert_eq!(render_text(&screen, 0), "alt");
+
+        engine.feed(&mut screen, b"\x1b[?1047l\x1b[?47h");
+        assert!(screen.alternate_active());
+        assert_eq!(render_text(&screen, 0), "");
+    }
+
+    #[test]
+    fn mode_1049_clears_previous_alternate_contents_when_entering() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+
+        engine.feed(&mut screen, b"\x1b[?47hold\x1b[?47l\x1b[?1049h");
+
+        assert!(screen.alternate_active());
+        assert_eq!(render_text(&screen, 0), "");
     }
 
     #[test]

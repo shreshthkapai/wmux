@@ -137,6 +137,14 @@ pub struct DamageStatus {
     pub requires_full_redraw: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SavedCursorState {
+    row: u16,
+    col: u16,
+    style: Style,
+    pending_wrap: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Screen {
     primary: Grid,
@@ -144,7 +152,8 @@ pub struct Screen {
     alternate_active: bool,
     cursor_row: u16,
     cursor_col: u16,
-    saved_cursor: Option<(u16, u16)>,
+    saved_primary_cursor: Option<SavedCursorState>,
+    saved_alternate_cursor: Option<SavedCursorState>,
     scroll_top: u16,
     scroll_bottom: u16,
     pending_primary_rows: Vec<bool>,
@@ -173,7 +182,8 @@ impl Screen {
             alternate_active: false,
             cursor_row: 0,
             cursor_col: 0,
-            saved_cursor: None,
+            saved_primary_cursor: None,
+            saved_alternate_cursor: None,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             pending_primary_rows: vec![false; rows as usize],
@@ -865,15 +875,18 @@ impl Screen {
     }
 
     pub fn set_alternate(&mut self, enabled: bool) {
+        self.switch_alternate(enabled, true);
+    }
+
+    pub(crate) fn switch_alternate(&mut self, enabled: bool, clear: bool) {
         self.pending_wrap = false;
         if self.alternate_active == enabled {
             return;
         }
-        self.alternate_active = enabled;
-        if enabled {
+        if clear {
             self.alternate.clear();
         }
-        self.move_to(0, 0);
+        self.alternate_active = enabled;
         self.mark_all_rows_changed();
     }
 
@@ -952,12 +965,29 @@ impl Screen {
     }
 
     pub fn save_cursor(&mut self) {
-        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+        let saved = Some(SavedCursorState {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            style: self.current_style,
+            pending_wrap: self.pending_wrap,
+        });
+        if self.alternate_active {
+            self.saved_alternate_cursor = saved;
+        } else {
+            self.saved_primary_cursor = saved;
+        }
     }
 
     pub fn restore_cursor(&mut self) {
-        if let Some((row, col)) = self.saved_cursor {
-            self.move_to(row, col);
+        let saved = if self.alternate_active {
+            self.saved_alternate_cursor
+        } else {
+            self.saved_primary_cursor
+        };
+        if let Some(saved) = saved {
+            self.move_to(saved.row, saved.col);
+            self.current_style = saved.style;
+            self.pending_wrap = saved.pending_wrap;
         }
     }
 
@@ -973,7 +1003,43 @@ impl Screen {
         }
         self.pending_wrap = false;
         let (cursor_row, cursor_col) = if self.alternate_active {
-            self.primary.resize(cols, rows);
+            if let Some(mut saved) = self.saved_primary_cursor {
+                let was_pending_wrap = saved.pending_wrap;
+                let saved_col = saved.col;
+                let cursor_in_default_tail = !was_pending_wrap
+                    && self
+                        .primary
+                        .line(saved.row)
+                        .is_some_and(|line| usize::from(saved.col) >= line.stored_len());
+                let (row, col) = self
+                    .primary
+                    .resize_with_cursor(cols, rows, saved.row, saved.col);
+                saved.row = row;
+                saved.col = if cursor_in_default_tail {
+                    saved_col.min(cols.saturating_sub(1))
+                } else {
+                    col
+                };
+                if was_pending_wrap {
+                    let mut cell_col = col;
+                    if let Some(line) = self.primary.line(row) {
+                        while cell_col > 0 && line.width_at(cell_col) == 0 {
+                            cell_col -= 1;
+                        }
+                        let width = u16::from(line.width_at(cell_col).max(1));
+                        if cell_col.saturating_add(width) >= cols {
+                            saved.col = cols.saturating_sub(1);
+                            saved.pending_wrap = true;
+                        } else {
+                            saved.col = cell_col + width;
+                            saved.pending_wrap = false;
+                        }
+                    }
+                }
+                self.saved_primary_cursor = Some(saved);
+            } else {
+                self.primary.resize(cols, rows);
+            }
             self.alternate
                 .resize_without_reflow(cols, rows, self.cursor_row, self.cursor_col)
         } else {

@@ -30,6 +30,25 @@ This separates input parsing from collected screen-write operations while using
 a maintained Rust VT parser instead of a
 wmux-specific escape state machine.
 
+## Alternate Screen And Cursor State
+
+The authoritative screen implements DEC private alternate-buffer modes as
+distinct operations rather than treating every mode as a generic toggle:
+
+- mode 47 switches buffers while preserving alternate contents;
+- mode 1047 clears alternate contents when returning to the primary buffer;
+- mode 1048 saves or restores cursor state without switching buffers; and
+- mode 1049 saves primary cursor state, enters a cleared alternate buffer,
+  then returns to the primary buffer and restores that state.
+
+Primary and alternate buffers keep independent saved cursor state. The modeled
+state includes position, rendition, and pending-wrap state. A saved primary
+cursor follows primary-grid reflow during an alternate-screen resize, and its
+restored coordinates remain bounded by the new dimensions. Entering or leaving
+an alternate buffer marks every row of the destination grid as changed so each
+client repaints from the server-owned screen rather than retaining pixels from
+the previous buffer.
+
 ## Generations And Journal
 
 Every non-empty applied batch advances the pane screen generation exactly
@@ -69,7 +88,7 @@ detect journal gaps; they do not replace the authoritative grid.
 ## Correctness Gates
 
 The benchmark crate retains the previous parser model under `cfg(test)` only.
-Every deterministic Codex and Claude replay frame is applied to both parsers,
+Every deterministic replay frame is applied to both parsers,
 then all visible cells, cursor state, and relevant modes are compared. Core
 tests cover split UTF-8, malformed and oversized CSI, wide cells, alternate
 screens, synchronized output, journal rollover, and generation assignment.
