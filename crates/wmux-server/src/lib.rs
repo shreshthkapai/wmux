@@ -24,7 +24,7 @@ use wmux_core::{
     parse_command_text, render_damage_from_structure, render_diff_scene_with_capabilities,
     route_key, BareKey, ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue,
     CommandSource, ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode,
-    InputRoute, JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
+    InputRoute, Job, JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
     PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
     RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style, UiFrame,
 };
@@ -41,7 +41,9 @@ use wmux_protocol::{
 
 mod theme_runtime;
 
-use theme_runtime::{ClientThemeState, ConfigThemeLoader, ThemeLoader, ThemeRuntime};
+use theme_runtime::{
+    ClientThemeState, ConfigThemeLoader, PendingProvider, ThemeLoader, ThemeRuntime,
+};
 
 const TRACE_PREVIEW_BYTES: usize = 96;
 const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -66,6 +68,8 @@ const OUTPUT_ROUND_TIME: Duration = Duration::from_millis(4);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_FILE_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_FILE_BYTES: usize = wmux_core::paste::MAX_PASTE_BUFFER_BYTES;
+const THEME_PROVIDER_OUTPUT_BYTES: usize = 64 * 1024;
+const THEME_PROVIDER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn run_with_platform(platform: Box<dyn ServerPlatform>) -> io::Result<()> {
     run_with_platform_and_config(platform, load_config())
@@ -1444,6 +1448,7 @@ impl ServerOwner {
             shutdown: ShutdownState::Running,
             shutdown_tx: Some(shutdown_tx),
         };
+        owner.start_startup_theme_provider();
         owner.enqueue_startup_config();
         owner
     }
@@ -1466,8 +1471,135 @@ impl ServerOwner {
             shutdown: ShutdownState::Running,
             shutdown_tx: None,
         };
+        owner.start_startup_theme_provider();
         owner.enqueue_startup_config();
         owner
+    }
+
+    fn start_startup_theme_provider(&mut self) {
+        let sources = self.runtime.config.ui().clone();
+        let Some(command) = sources.theme_provider().map(str::to_owned) else {
+            return;
+        };
+        let static_candidate = match sources.resolve_static_candidate() {
+            Ok(candidate) => Arc::new(candidate),
+            Err(error) => {
+                eprintln!("wmux theme provider setup error: {error}");
+                return;
+            }
+        };
+        let generation = self.theme.begin_request();
+        let job = match self.runtime.state.jobs.start_internal(
+            command.clone(),
+            JobContinuation::ThemeProvider { generation },
+            ClientId::new(0),
+            CommandSource::Config,
+            THEME_PROVIDER_OUTPUT_BYTES,
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("wmux theme provider setup error: {error}");
+                return;
+            }
+        };
+        if let Err(error) = self.submit_theme_provider(job, command) {
+            self.runtime.state.jobs.finish(job);
+            eprintln!("wmux theme provider start error: {error}");
+            return;
+        }
+        self.theme.install_provider(PendingProvider {
+            generation,
+            job,
+            deadline: Instant::now() + THEME_PROVIDER_TIMEOUT,
+            sources,
+            static_candidate,
+            failure: None,
+            termination_requested: false,
+        });
+    }
+
+    fn reload_theme(&mut self, queued: &QueuedCommand, sources: ThemeSources) -> io::Result<()> {
+        let static_candidate = Arc::new(
+            sources
+                .resolve_static_candidate()
+                .map_err(io::Error::other)?,
+        );
+        let fallback = sources
+            .resolve_from_static(&static_candidate, None)
+            .map_err(io::Error::other)?;
+        let Some(command) = sources.theme_provider().map(str::to_owned) else {
+            self.cancel_pending_theme_provider("theme reload superseded");
+            self.theme.replace(sources, fallback);
+            self.invalidate_theme_clients();
+            return Ok(());
+        };
+
+        self.cancel_pending_theme_provider("theme reload superseded");
+        let generation = self.theme.begin_request();
+        let job = self
+            .runtime
+            .state
+            .jobs
+            .start_with_output_limit(
+                command.clone(),
+                false,
+                JobContinuation::ThemeProvider { generation },
+                queued.clone(),
+                THEME_PROVIDER_OUTPUT_BYTES,
+            )
+            .map_err(io::Error::other)?;
+        if let Err(error) = self.submit_theme_provider(job, command) {
+            self.runtime.state.jobs.finish(job);
+            return Err(error);
+        }
+        self.theme.install_provider(PendingProvider {
+            generation,
+            job,
+            deadline: Instant::now() + THEME_PROVIDER_TIMEOUT,
+            sources,
+            static_candidate,
+            failure: None,
+            termination_requested: false,
+        });
+        Ok(())
+    }
+
+    fn submit_theme_provider(&mut self, job: JobId, command: String) -> io::Result<()> {
+        self.runtime
+            .job_backend
+            .submit(JobRequest::Spawn(SpawnJob {
+                job: PlatformJobId::new(job.raw()),
+                command,
+                cwd: std::env::current_dir().ok(),
+                environment: vec![
+                    (
+                        "WMUX_THEME_SCHEMA".into(),
+                        wmux_config::THEME_SCHEMA_VERSION.to_string().into(),
+                    ),
+                    ("WMUX_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+                ],
+            }))
+            .map_err(PlatformError::into_io)
+    }
+
+    fn cancel_pending_theme_provider(&mut self, message: &str) {
+        let Some(pending) = self.theme.cancel_pending_provider() else {
+            return;
+        };
+        let _ = self.runtime.job_backend.submit(JobRequest::Terminate {
+            job: PlatformJobId::new(pending.job.raw()),
+        });
+        self.complete_theme_provider_owner(pending.job, Err(message.to_owned()));
+    }
+
+    fn invalidate_theme_clients(&mut self) {
+        let now = Instant::now();
+        for view in self.clients.values_mut() {
+            view.full_render = true;
+            view.render_state.invalidate();
+            view.structure = None;
+            view.request_immediate_render(now);
+        }
     }
 
     fn enqueue_startup_config(&mut self) {
@@ -1543,6 +1675,9 @@ impl ServerOwner {
                 did_work = true;
             }
             let now = Instant::now();
+            if self.expire_theme_provider(now) {
+                did_work = true;
+            }
             if self.runtime.expire_synchronized_output(now)
                 || self.runtime.expire_resize_repaint_holds(now)
             {
@@ -1594,6 +1729,7 @@ impl ServerOwner {
             .filter(|view| view.attached && !view.blocked && view.queued_bytes == 0)
             .filter_map(|view| view.theme_state.next_deadline(self.theme.active()))
             .min();
+        let provider = self.theme.provider_deadline();
         let synchronized_output = self
             .runtime
             .sync_started_at
@@ -1617,7 +1753,7 @@ impl ServerOwner {
                 }
             })
             .min();
-        [render, animation, synchronized_output, resize]
+        [render, animation, provider, synchronized_output, resize]
             .into_iter()
             .flatten()
             .min()
@@ -2017,15 +2153,39 @@ impl ServerOwner {
                 match event {
                     JobEvent::Output { bytes, .. } => {
                         self.runtime.state.jobs.append_output(job, &bytes);
+                        if self
+                            .runtime
+                            .state
+                            .jobs
+                            .get(job)
+                            .is_some_and(Job::output_truncated)
+                        {
+                            self.fail_theme_provider(
+                                job,
+                                "theme provider output exceeded 65536 bytes".to_owned(),
+                                true,
+                            );
+                        }
                     }
                     JobEvent::Exited { exit_code, .. } => {
                         self.runtime.state.jobs.mark_exited(job, exit_code);
                     }
                     JobEvent::BackendError { error, .. } => {
-                        self.runtime.state.jobs.append_output(
-                            job,
-                            format!("wmux job backend error: {error}\n").as_bytes(),
-                        );
+                        let provider = self.runtime.state.jobs.get(job).is_some_and(|job| {
+                            matches!(job.continuation, JobContinuation::ThemeProvider { .. })
+                        });
+                        if provider {
+                            self.fail_theme_provider(
+                                job,
+                                format!("theme provider backend error: {error}"),
+                                true,
+                            );
+                        } else {
+                            self.runtime.state.jobs.append_output(
+                                job,
+                                format!("wmux job backend error: {error}\n").as_bytes(),
+                            );
+                        }
                     }
                     JobEvent::Closed { .. } => self.finish_job(job),
                 }
@@ -2037,10 +2197,52 @@ impl ServerOwner {
         processed
     }
 
+    fn fail_theme_provider(&mut self, job: JobId, message: String, terminate: bool) {
+        let should_terminate = self.theme.pending_provider_mut(job).is_some_and(|pending| {
+            if pending.failure.is_none() {
+                pending.failure = Some(message);
+            }
+            if terminate && !pending.termination_requested {
+                pending.termination_requested = true;
+                true
+            } else {
+                false
+            }
+        });
+        if should_terminate {
+            let _ = self.runtime.job_backend.submit(JobRequest::Terminate {
+                job: PlatformJobId::new(job.raw()),
+            });
+        }
+    }
+
+    fn expire_theme_provider(&mut self, now: Instant) -> bool {
+        let expired = self
+            .theme
+            .pending_provider()
+            .filter(|pending| !pending.termination_requested && now >= pending.deadline)
+            .map(|pending| pending.job);
+        let Some(job) = expired else {
+            return false;
+        };
+        let message = "theme provider timed out after 2 seconds".to_owned();
+        self.fail_theme_provider(job, message.clone(), true);
+        self.complete_theme_provider_owner(job, Err(message));
+        true
+    }
+
     fn finish_job(&mut self, job_id: JobId) {
         let Some(job) = self.runtime.state.jobs.finish(job_id) else {
             return;
         };
+        let provider_generation = match &job.continuation {
+            JobContinuation::ThemeProvider { generation } => Some(*generation),
+            _ => None,
+        };
+        if let Some(generation) = provider_generation {
+            self.finish_theme_provider(job, generation);
+            return;
+        }
         let exit_code = job.exit_code();
         let success = exit_code == Some(0);
         let mut output = String::from_utf8_lossy(job.output()).into_owned();
@@ -2080,6 +2282,9 @@ impl ServerOwner {
                 JobContinuation::RunShell if success => Ok(output),
                 JobContinuation::RunShell => Err(job_failure(exit_code, &output)),
                 JobContinuation::IfShell { .. } => Ok(String::new()),
+                JobContinuation::ThemeProvider { .. } => {
+                    unreachable!("theme provider jobs return before shell-job completion")
+                }
             };
             if let Some(completion) = self.runtime.queue.finish(owner, result) {
                 self.send_command_completion(completion);
@@ -2102,6 +2307,72 @@ impl ServerOwner {
             wmux_core::HookEvent::JobFinished,
             wmux_core::OptionTarget::Server,
         );
+    }
+
+    fn finish_theme_provider(&mut self, job: Job, generation: u64) {
+        let Some(pending) = self.theme.take_pending_provider(job.id, generation) else {
+            if let Some(owner) = job.owner {
+                if let Some(completion) = self.runtime.queue.finish(
+                    owner,
+                    Err("theme provider result was superseded".to_owned()),
+                ) {
+                    self.send_command_completion(completion);
+                }
+            }
+            return;
+        };
+
+        let result = if let Some(failure) = pending.failure {
+            Err(failure)
+        } else if job.output_truncated() {
+            Err("theme provider output exceeded 65536 bytes".to_owned())
+        } else if job.exit_code() != Some(0) {
+            Err(format!(
+                "theme provider exited with {}",
+                job.exit_code()
+                    .map_or_else(|| "no exit code".to_owned(), |code| code.to_string())
+            ))
+        } else {
+            std::str::from_utf8(job.output())
+                .map_err(|error| format!("theme provider output is not UTF-8: {error}"))
+                .and_then(|output| {
+                    pending
+                        .sources
+                        .resolve_from_static(&pending.static_candidate, Some(output.as_bytes()))
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|theme| {
+                    let name = theme.name.clone();
+                    if self.theme.commit(generation, pending.sources, theme) {
+                        self.invalidate_theme_clients();
+                        Ok(format!("theme reloaded: {name}"))
+                    } else {
+                        Err("theme provider result was superseded".to_owned())
+                    }
+                })
+        };
+
+        if let Some(owner) = job.owner {
+            if let Some(completion) = self.runtime.queue.finish(owner, result) {
+                self.send_command_completion(completion);
+            }
+        } else if let Err(error) = result {
+            eprintln!("wmux startup theme provider error: {error}");
+        }
+    }
+
+    fn complete_theme_provider_owner(&mut self, job: JobId, result: Result<String, String>) {
+        let owner = self
+            .runtime
+            .state
+            .jobs
+            .get(job)
+            .and_then(|job| job.owner.clone());
+        if let Some(owner) = owner {
+            if let Some(completion) = self.runtime.queue.finish(owner, result) {
+                self.send_command_completion(completion);
+            }
+        }
     }
 
     fn enqueue_hook_notification(
@@ -2243,17 +2514,7 @@ impl ServerOwner {
             }
             CommandEffect::ReloadTheme { requester: _ } => {
                 let sources = self.theme_loader.load_sources().map_err(io::Error::other)?;
-                let candidate = sources.resolve(None).map_err(io::Error::other)?;
-                let previous_generation = self.theme.generation();
-                let generation = self.theme.replace(sources, candidate);
-                debug_assert!(generation > previous_generation);
-                let now = Instant::now();
-                for view in self.clients.values_mut() {
-                    view.full_render = true;
-                    view.render_state.invalidate();
-                    view.structure = None;
-                    view.request_immediate_render(now);
-                }
+                self.reload_theme(queued, sources)?;
                 Ok(false)
             }
             CommandEffect::Confirm {
@@ -3620,6 +3881,7 @@ mod tests {
         ClientRenderSpec, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime,
         ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
         COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME,
+        THEME_PROVIDER_OUTPUT_BYTES,
     };
     use crate::theme_runtime::ThemeLoader;
     use std::{
@@ -3631,15 +3893,15 @@ mod tests {
     use tokio::sync::mpsc;
     use wmux_config::{parse_config, ThemeSources, WmuxConfig};
     use wmux_core::{
-        parse_command_text, Command, CommandList, CommandSource, ControlNotification,
-        ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget, OptionValue,
-        RenderCapabilities, RenderState, ServerEvent, SplitDirection,
+        parse_command_text, ClientId, Color, Command, CommandList, CommandSource,
+        ControlNotification, ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget,
+        OptionValue, RenderCapabilities, RenderState, ServerEvent, SplitDirection,
     };
     use wmux_platform::{
         AcceptedConnection, Endpoint, JobBackend, JobNotifier, MouseButton, MouseEvent,
         MouseEventKind, MouseModifiers, PeerIdentity, PlatformError, PlatformErrorKind,
-        PlatformEvent, PlatformFuture, PlatformNotifier, PlatformPaneId, PlatformRequest,
-        PlatformResult, PtyBackend, ServerListener, ServerPlatform, TerminalSize,
+        PlatformEvent, PlatformFuture, PlatformJobId, PlatformNotifier, PlatformPaneId,
+        PlatformRequest, PlatformResult, PtyBackend, ServerListener, ServerPlatform, TerminalSize,
     };
     use wmux_protocol::{Message, TerminalCapabilities, VERSION};
     use wmux_protocol::{WireKeyCode, WireKeyEvent, WireKeyModifiers};
@@ -3887,6 +4149,414 @@ mod tests {
             Ok(Outbound::Message(Message::Output(_)))
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    fn provider_sources(command: &str) -> ThemeSources {
+        parse_config(&format!(
+            "ui.theme_provider = {command}\nui.active_border.foreground = \"#ffffff\"\n"
+        ))
+        .unwrap()
+        .ui()
+        .clone()
+    }
+
+    fn start_foreground_provider(
+        command: &str,
+    ) -> (
+        ServerOwner,
+        ClientId,
+        mpsc::Receiver<Outbound>,
+        PlatformJobId,
+    ) {
+        let loader = Arc::new(FixedThemeLoader::new(Ok(provider_sources(command))));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            loader as Arc<dyn ThemeLoader>,
+        );
+        let client = owner.runtime.state.add_client();
+        let (outbound, receiver) = mpsc::channel(8);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let wmux_platform::JobRequest::Spawn(spawn) = &owner.runtime.test_jobs.requests()[0] else {
+            panic!("provider job spawns")
+        };
+        (owner, client, receiver, spawn.job)
+    }
+
+    #[test]
+    fn startup_theme_provider_replaces_the_static_fallback_after_success() {
+        let config =
+            parse_config("ui.theme = double\nui.theme_provider = startup-theme\n").unwrap();
+        let mut owner = ServerOwner::new_test(config);
+
+        assert_eq!(owner.theme.active().name, "double");
+        assert_eq!(owner.theme.generation(), 1);
+        let wmux_platform::JobRequest::Spawn(spawn) = &owner.runtime.test_jobs.requests()[0] else {
+            panic!("startup provider job spawns")
+        };
+        assert_eq!(spawn.command, "startup-theme");
+        let job = spawn.job;
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Output {
+                job,
+                bytes: br#"{"schema":1,"name":"startup-generated"}"#.to_vec(),
+            },
+        );
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(0),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert_eq!(owner.theme.active().name, "startup-generated");
+        assert_eq!(owner.theme.generation(), 2);
+    }
+
+    #[test]
+    fn theme_provider_applies_once_on_closed_and_completes_foreground_reload() {
+        let loader = Arc::new(FixedThemeLoader::new(Ok(provider_sources("paint-theme"))));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            Arc::clone(&loader) as Arc<dyn ThemeLoader>,
+        );
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("provider", 40, 8);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound, mut receiver) = mpsc::channel(8);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert_eq!(owner.theme.generation(), 1);
+        let requests = owner.runtime.test_jobs.requests();
+        let wmux_platform::JobRequest::Spawn(spawn) = &requests[0] else {
+            panic!("provider job spawns")
+        };
+        assert_eq!(spawn.command, "paint-theme");
+        assert_eq!(
+            spawn
+                .environment
+                .iter()
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["WMUX_THEME_SCHEMA", "WMUX_VERSION"]
+        );
+        let job = spawn.job;
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Output {
+                job,
+                bytes: br##"{"schema":1,"name":"generated","active_border":{"fg":"#ff0000"}}"##
+                    .to_vec(),
+            },
+        );
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(0),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert_eq!(owner.theme.generation(), 2);
+        assert_eq!(owner.theme.active().name, "generated");
+        assert_eq!(
+            owner.theme.active().base.active_border.style.fg,
+            Color::Rgb(255, 255, 255)
+        );
+        assert!(owner.clients[&client].full_render);
+        assert!(owner.runtime.state.panes.contains_key(&created.pane));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandOk(message)))
+                if message == "theme reloaded: generated"
+        ));
+    }
+
+    #[test]
+    fn malformed_theme_provider_output_preserves_active_theme() {
+        let loader = Arc::new(FixedThemeLoader::new(Ok(provider_sources("bad-theme"))));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            Arc::clone(&loader) as Arc<dyn ThemeLoader>,
+        );
+        let client = owner.runtime.state.add_client();
+        let (outbound, mut receiver) = mpsc::channel(8);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let wmux_platform::JobRequest::Spawn(spawn) = &owner.runtime.test_jobs.requests()[0] else {
+            panic!("provider job spawns")
+        };
+        let job = spawn.job;
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Output {
+                job,
+                bytes: b"{".to_vec(),
+            },
+        );
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(0),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert_eq!(owner.theme.generation(), 1);
+        assert_eq!(owner.theme.active().name, "default");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("document")
+        ));
+    }
+
+    #[test]
+    fn theme_provider_timeout_terminates_process_tree_and_finishes_reload() {
+        let loader = Arc::new(FixedThemeLoader::new(Ok(provider_sources("slow-theme"))));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            Arc::clone(&loader) as Arc<dyn ThemeLoader>,
+        );
+        let client = owner.runtime.state.add_client();
+        let (outbound, mut receiver) = mpsc::channel(8);
+        owner.clients.insert(
+            client,
+            ClientView::new(outbound, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let wmux_platform::JobRequest::Spawn(spawn) = &owner.runtime.test_jobs.requests()[0] else {
+            panic!("provider job spawns")
+        };
+        let job = spawn.job;
+
+        assert!(owner.expire_theme_provider(Instant::now() + Duration::from_secs(3)));
+
+        assert!(owner.runtime.test_jobs.requests().iter().any(|request| {
+            matches!(request, wmux_platform::JobRequest::Terminate { job: target } if *target == job)
+        }));
+        assert_eq!(owner.theme.generation(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("timed out")
+        ));
+    }
+
+    #[test]
+    fn theme_provider_rejects_nonzero_oversize_and_backend_failures() {
+        let (mut owner, _client, mut receiver, job) = start_foreground_provider("nonzero");
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(9),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("exited with 9")
+        ));
+        assert_eq!(owner.theme.generation(), 1);
+
+        let (mut owner, _client, mut receiver, job) = start_foreground_provider("oversize");
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Output {
+                job,
+                bytes: vec![b'x'; THEME_PROVIDER_OUTPUT_BYTES + 1],
+            },
+        );
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::Exited {
+                job,
+                exit_code: Some(0),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert!(owner.runtime.test_jobs.requests().iter().any(|request| {
+            matches!(request, wmux_platform::JobRequest::Terminate { job: target } if *target == job)
+        }));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("exceeded 65536")
+        ));
+        assert_eq!(owner.theme.generation(), 1);
+
+        let (mut owner, _client, mut receiver, job) = start_foreground_provider("backend");
+        owner.runtime.test_jobs.emit(
+            job,
+            wmux_platform::JobEvent::BackendError {
+                job,
+                error: PlatformError::new(
+                    PlatformErrorKind::Other,
+                    "read provider",
+                    "scripted failure",
+                ),
+            },
+        );
+        owner
+            .runtime
+            .test_jobs
+            .emit(job, wmux_platform::JobEvent::Closed { job });
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("backend error")
+        ));
+        assert_eq!(owner.theme.generation(), 1);
+    }
+
+    #[test]
+    fn newer_theme_provider_generation_supersedes_late_output() {
+        let loader = Arc::new(FixedThemeLoader::new(Ok(provider_sources("first"))));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            Arc::clone(&loader) as Arc<dyn ThemeLoader>,
+        );
+        let first_client = owner.runtime.state.add_client();
+        let second_client = owner.runtime.state.add_client();
+        let (first_outbound, mut first_receiver) = mpsc::channel(8);
+        let (second_outbound, mut second_receiver) = mpsc::channel(8);
+        owner.clients.insert(
+            first_client,
+            ClientView::new(first_outbound, TerminalCapabilities::default()),
+        );
+        owner.clients.insert(
+            second_client,
+            ClientView::new(second_outbound, TerminalCapabilities::default()),
+        );
+        owner.enqueue_command_list(
+            first_client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let wmux_platform::JobRequest::Spawn(first_spawn) = &owner.runtime.test_jobs.requests()[0]
+        else {
+            panic!("first provider spawns")
+        };
+        let first_job = first_spawn.job;
+
+        loader.set(Ok(provider_sources("second")));
+        owner.enqueue_command_list(
+            second_client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        let requests = owner.runtime.test_jobs.requests();
+        let second_job = requests
+            .iter()
+            .find_map(|request| match request {
+                wmux_platform::JobRequest::Spawn(spawn) if spawn.command == "second" => {
+                    Some(spawn.job)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(requests.iter().any(|request| {
+            matches!(request, wmux_platform::JobRequest::Terminate { job } if *job == first_job)
+        }));
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandErr(message)))
+                if message.contains("superseded")
+        ));
+
+        for (job, name) in [(first_job, "stale"), (second_job, "current")] {
+            owner.runtime.test_jobs.emit(
+                job,
+                wmux_platform::JobEvent::Output {
+                    job,
+                    bytes: format!(r#"{{"schema":1,"name":"{name}"}}"#).into_bytes(),
+                },
+            );
+            owner.runtime.test_jobs.emit(
+                job,
+                wmux_platform::JobEvent::Exited {
+                    job,
+                    exit_code: Some(0),
+                },
+            );
+            owner
+                .runtime
+                .test_jobs
+                .emit(job, wmux_platform::JobEvent::Closed { job });
+        }
+        assert!(owner.process_job_events(CONTROL_EVENTS_PER_TURN));
+
+        assert_eq!(owner.theme.generation(), 3);
+        assert_eq!(owner.theme.active().name, "current");
+        assert!(matches!(
+            second_receiver.try_recv(),
+            Ok(Outbound::Message(Message::CommandOk(message)))
+                if message == "theme reloaded: current"
+        ));
     }
 
     #[test]

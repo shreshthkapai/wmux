@@ -24,6 +24,9 @@ pub enum JobContinuation {
         if_true: CommandList,
         if_false: Option<CommandList>,
     },
+    ThemeProvider {
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -36,8 +39,19 @@ pub struct Job {
     pub continuation: JobContinuation,
     pub owner: Option<QueuedCommand>,
     output: Vec<u8>,
+    output_limit: usize,
     output_truncated: bool,
     exit_code: Option<u32>,
+}
+
+struct JobStart {
+    command: String,
+    background: bool,
+    client: crate::ClientId,
+    source: CommandSource,
+    continuation: JobContinuation,
+    owner: Option<QueuedCommand>,
+    output_limit: usize,
 }
 
 impl Job {
@@ -66,6 +80,56 @@ impl JobStore {
         continuation: JobContinuation,
         queued: QueuedCommand,
     ) -> Result<JobId, String> {
+        self.start_with_output_limit(
+            command,
+            background,
+            continuation,
+            queued,
+            MAX_JOB_OUTPUT_BYTES,
+        )
+    }
+
+    pub fn start_with_output_limit(
+        &mut self,
+        command: String,
+        background: bool,
+        continuation: JobContinuation,
+        queued: QueuedCommand,
+        output_limit: usize,
+    ) -> Result<JobId, String> {
+        let client = queued.client;
+        let source = queued.source;
+        self.start_job(JobStart {
+            command,
+            background,
+            client,
+            source,
+            continuation,
+            owner: (!background).then_some(queued),
+            output_limit,
+        })
+    }
+
+    pub fn start_internal(
+        &mut self,
+        command: String,
+        continuation: JobContinuation,
+        client: crate::ClientId,
+        source: CommandSource,
+        output_limit: usize,
+    ) -> Result<JobId, String> {
+        self.start_job(JobStart {
+            command,
+            background: true,
+            client,
+            source,
+            continuation,
+            owner: None,
+            output_limit,
+        })
+    }
+
+    fn start_job(&mut self, start: JobStart) -> Result<JobId, String> {
         if self.jobs.len() >= MAX_JOBS {
             return Err("too many active jobs (limit 64)".to_string());
         }
@@ -78,13 +142,14 @@ impl JobStore {
             id,
             Job {
                 id,
-                command,
-                background,
-                client: queued.client,
-                source: queued.source,
-                continuation,
-                owner: (!background).then_some(queued),
+                command: start.command,
+                background: start.background,
+                client: start.client,
+                source: start.source,
+                continuation: start.continuation,
+                owner: start.owner,
                 output: Vec::new(),
+                output_limit: start.output_limit.clamp(1, MAX_JOB_OUTPUT_BYTES),
                 output_truncated: false,
                 exit_code: None,
             },
@@ -96,7 +161,7 @@ impl JobStore {
         let Some(job) = self.jobs.get_mut(&id) else {
             return false;
         };
-        let available = MAX_JOB_OUTPUT_BYTES.saturating_sub(job.output.len());
+        let available = job.output_limit.saturating_sub(job.output.len());
         let accepted = available.min(bytes.len());
         job.output.extend_from_slice(&bytes[..accepted]);
         job.output_truncated |= accepted != bytes.len();
@@ -116,6 +181,9 @@ impl JobStore {
     }
     pub fn contains(&self, id: JobId) -> bool {
         self.jobs.contains_key(&id)
+    }
+    pub fn get(&self, id: JobId) -> Option<&Job> {
+        self.jobs.get(&id)
     }
     pub fn owns_sequence(&self, sequence: u64) -> bool {
         self.jobs.values().any(|job| {
@@ -180,5 +248,42 @@ mod tests {
             ),
             Err("too many active jobs (limit 64)".into())
         );
+    }
+
+    #[test]
+    fn provider_jobs_use_their_own_bounded_capture_limit() {
+        let mut jobs = JobStore::default();
+        let job = jobs
+            .start_with_output_limit(
+                "provider".into(),
+                false,
+                JobContinuation::ThemeProvider { generation: 3 },
+                queued(1),
+                64 * 1024,
+            )
+            .unwrap();
+
+        assert!(jobs.append_output(job, &vec![b'x'; 64 * 1024 + 1]));
+        let finished = jobs.finish(job).unwrap();
+        assert_eq!(finished.output().len(), 64 * 1024);
+        assert!(finished.output_truncated());
+    }
+
+    #[test]
+    fn internal_provider_job_does_not_manufacture_a_command_owner() {
+        let mut jobs = JobStore::default();
+        let job = jobs
+            .start_internal(
+                "provider".into(),
+                JobContinuation::ThemeProvider { generation: 4 },
+                ClientId::new(0),
+                CommandSource::Config,
+                64 * 1024,
+            )
+            .unwrap();
+
+        let finished = jobs.finish(job).unwrap();
+        assert!(finished.background);
+        assert!(finished.owner.is_none());
     }
 }

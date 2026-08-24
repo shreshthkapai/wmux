@@ -4,8 +4,7 @@ use std::{
 };
 
 use wmux_config::{ThemeError, ThemeSources, WmuxConfig};
-use wmux_core::UiFrame;
-use wmux_core::UiTheme;
+use wmux_core::{JobId, UiFrame, UiTheme};
 
 pub(crate) trait ThemeLoader: Send + Sync {
     fn load_sources(&self) -> Result<ThemeSources, String>;
@@ -23,8 +22,20 @@ impl ThemeLoader for ConfigThemeLoader {
 
 pub(crate) struct ThemeRuntime {
     generation: u64,
+    requested_generation: u64,
     active: Arc<UiTheme>,
     sources: ThemeSources,
+    pending_provider: Option<PendingProvider>,
+}
+
+pub(crate) struct PendingProvider {
+    pub(crate) generation: u64,
+    pub(crate) job: JobId,
+    pub(crate) deadline: Instant,
+    pub(crate) sources: ThemeSources,
+    pub(crate) static_candidate: Arc<UiTheme>,
+    pub(crate) failure: Option<String>,
+    pub(crate) termination_requested: bool,
 }
 
 pub(crate) struct ClientThemeState {
@@ -84,8 +95,10 @@ impl ThemeRuntime {
         let active = Arc::new(sources.resolve(None)?);
         Ok(Self {
             generation: 1,
+            requested_generation: 1,
             active,
             sources,
+            pending_provider: None,
         })
     }
 
@@ -98,10 +111,67 @@ impl ThemeRuntime {
     }
 
     pub(crate) fn replace(&mut self, sources: ThemeSources, theme: UiTheme) -> u64 {
-        self.generation = self.generation.saturating_add(1);
+        let generation = self.begin_request();
+        let replaced = self.commit(generation, sources, theme);
+        debug_assert!(replaced);
+        generation
+    }
+
+    pub(crate) fn begin_request(&mut self) -> u64 {
+        self.requested_generation = self.requested_generation.saturating_add(1);
+        self.requested_generation
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        generation: u64,
+        sources: ThemeSources,
+        theme: UiTheme,
+    ) -> bool {
+        if generation != self.requested_generation {
+            return false;
+        }
+        self.generation = generation;
         self.active = Arc::new(theme);
         self.sources = sources;
-        self.generation
+        true
+    }
+
+    pub(crate) fn install_provider(&mut self, pending: PendingProvider) -> Option<PendingProvider> {
+        self.pending_provider.replace(pending)
+    }
+
+    pub(crate) fn pending_provider(&self) -> Option<&PendingProvider> {
+        self.pending_provider.as_ref()
+    }
+
+    pub(crate) fn pending_provider_mut(&mut self, job: JobId) -> Option<&mut PendingProvider> {
+        self.pending_provider
+            .as_mut()
+            .filter(|pending| pending.job == job)
+    }
+
+    pub(crate) fn take_pending_provider(
+        &mut self,
+        job: JobId,
+        generation: u64,
+    ) -> Option<PendingProvider> {
+        let matches = self
+            .pending_provider
+            .as_ref()
+            .is_some_and(|pending| pending.job == job && pending.generation == generation);
+        matches.then(|| self.pending_provider.take()).flatten()
+    }
+
+    pub(crate) fn cancel_pending_provider(&mut self) -> Option<PendingProvider> {
+        self.pending_provider.take()
+    }
+
+    pub(crate) fn provider_deadline(&self) -> Option<Instant> {
+        self.pending_provider
+            .as_ref()
+            .filter(|pending| !pending.termination_requested)
+            .map(|pending| pending.deadline)
     }
 }
 

@@ -91,6 +91,11 @@ impl ThemeSources {
     }
 
     pub fn resolve(&self, provider: Option<&[u8]>) -> Result<UiTheme, ThemeError> {
+        let static_candidate = self.resolve_static_candidate()?;
+        self.resolve_from_static(&static_candidate, provider)
+    }
+
+    pub fn resolve_static_candidate(&self) -> Result<UiTheme, ThemeError> {
         let mut candidate = preset(&self.preset)?;
         if let Some(path) = &self.theme_file {
             let bytes = fs::read(path).map_err(|error| {
@@ -98,6 +103,15 @@ impl ThemeSources {
             })?;
             parse_theme_document(&bytes)?.apply(&mut candidate)?;
         }
+        Ok(candidate)
+    }
+
+    pub fn resolve_from_static(
+        &self,
+        static_candidate: &UiTheme,
+        provider: Option<&[u8]>,
+    ) -> Result<UiTheme, ThemeError> {
+        let mut candidate = static_candidate.clone();
         if let Some(bytes) = provider {
             parse_theme_document(bytes)?.apply(&mut candidate)?;
         }
