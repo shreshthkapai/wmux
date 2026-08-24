@@ -18,6 +18,9 @@ pub fn execute(state: &mut ServerState, queued: impl Borrow<QueuedCommand>) -> C
             Command::KillServer => effects.push(CommandEffect::Shutdown {
                 requester: queued.client,
             }),
+            Command::ReloadTheme => effects.push(CommandEffect::ReloadTheme {
+                requester: queued.client,
+            }),
             Command::CopyMode => effects.push(CommandEffect::EnterCopyMode {
                 client: queued.client,
             }),

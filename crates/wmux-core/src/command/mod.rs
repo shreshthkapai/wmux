@@ -174,6 +174,7 @@ pub enum Command {
         target: SessionSelector,
     },
     RefreshClient,
+    ReloadTheme,
     ConfirmBefore {
         prompt: String,
         commands: CommandList,
@@ -358,6 +359,9 @@ pub enum CommandEffect {
     },
     RefreshClient {
         client: ClientId,
+    },
+    ReloadTheme {
+        requester: ClientId,
     },
     Confirm {
         client: ClientId,
@@ -1031,12 +1035,14 @@ pub(super) fn execute_state_command(
             message: String::new(),
             attached_pane: None,
         },
-        Command::StartServer | Command::KillServer | Command::CopyMode => CommandResult {
-            sequence: queued.sequence,
-            ok: true,
-            message: String::new(),
-            attached_pane: None,
-        },
+        Command::StartServer | Command::KillServer | Command::CopyMode | Command::ReloadTheme => {
+            CommandResult {
+                sequence: queued.sequence,
+                ok: true,
+                message: String::new(),
+                attached_pane: None,
+            }
+        }
         Command::ListClients => {
             let mut lines = state
                 .clients
@@ -1748,6 +1754,10 @@ const COMMAND_TABLE: &[CommandEntry] = &[
         alias: Some("refresh"),
     },
     CommandEntry {
+        name: "reload-theme",
+        alias: None,
+    },
+    CommandEntry {
         name: "rotate-window",
         alias: Some("rotatew"),
     },
@@ -1876,6 +1886,10 @@ pub(super) fn parse_single_command(
         "refresh-client" => {
             validate_arguments(argv, &[], &[], 0)?;
             Ok(Command::RefreshClient)
+        }
+        "reload-theme" => {
+            validate_arguments(argv, &[], &[], 0)?;
+            Ok(Command::ReloadTheme)
         }
         "confirm-before" => parse_confirm_before(argv, depth),
         "command-prompt" => parse_command_prompt(argv),
@@ -3136,6 +3150,7 @@ fn format_command(command: &Command) -> String {
             "switch-client"
         }
         Command::RefreshClient => "refresh-client",
+        Command::ReloadTheme => "reload-theme",
         Command::ConfirmBefore { prompt, commands } => {
             arguments.extend(["-p".to_string(), prompt.clone()]);
             let nested = format_command_list(commands);
@@ -3519,6 +3534,23 @@ mod tests {
                 final_in_list: true,
             },
         )
+    }
+
+    #[test]
+    fn reload_theme_is_a_strict_serialized_command() {
+        let commands = parse_command_text("reload-theme").unwrap();
+        assert_eq!(commands[0], Command::ReloadTheme);
+        assert_eq!(super::format_command(&commands[0]), "reload-theme");
+        assert!(parse_command_text("reload-theme extra").is_err());
+
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let outcome = execute_one(&mut state, client, "reload-theme");
+        assert!(outcome.ok);
+        assert_eq!(
+            outcome.effects.as_slice(),
+            [CommandEffect::ReloadTheme { requester: client }]
+        );
     }
 
     #[test]

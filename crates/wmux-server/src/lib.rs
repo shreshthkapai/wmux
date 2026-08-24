@@ -18,15 +18,15 @@ use tokio::{
     sync::{mpsc as async_mpsc, mpsc::error::TrySendError, oneshot},
     task::JoinSet,
 };
-use wmux_config::{config_path, WmuxConfig};
+use wmux_config::{config_path, ThemeSources, WmuxConfig};
 use wmux_core::{
-    build_window_scene_with_client_overlay, build_window_structure, execute, pane_area_rows,
+    build_window_scene_with_theme, build_window_structure_with_theme, execute, pane_area_rows,
     parse_command_text, render_damage_from_structure, render_diff_scene_with_capabilities,
     route_key, BareKey, ClientId, ClientInput, Command, CommandEffect, CommandList, CommandQueue,
     CommandSource, ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode,
     InputRoute, JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
     PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
-    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
+    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style, UiFrame,
 };
 use wmux_platform::{
     AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
@@ -38,6 +38,10 @@ use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
     WireKeyCode, WireKeyEvent, FRAME_HEADER_LEN, MAX_FRAME, VERSION,
 };
+
+mod theme_runtime;
+
+use theme_runtime::{ConfigThemeLoader, ThemeLoader, ThemeRuntime};
 
 const TRACE_PREVIEW_BYTES: usize = 96;
 const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1361,8 +1365,21 @@ impl Outbound {
     }
 }
 
+fn initial_theme(sources: ThemeSources) -> ThemeRuntime {
+    match ThemeRuntime::new(sources) {
+        Ok(theme) => theme,
+        Err(error) => {
+            eprintln!("wmux UI theme error: {error}; using default theme");
+            ThemeRuntime::new(ThemeSources::default())
+                .expect("the built-in default theme is always valid")
+        }
+    }
+}
+
 struct ServerOwner {
     runtime: Runtime,
+    theme: ThemeRuntime,
+    theme_loader: Arc<dyn ThemeLoader>,
     clients: BTreeMap<ClientId, ClientView>,
     pending_pastes: VecDeque<PendingPaste>,
     started_at: Instant,
@@ -1414,8 +1431,11 @@ impl ServerOwner {
         job_backend: Box<dyn JobBackend>,
         shutdown_tx: oneshot::Sender<()>,
     ) -> Self {
+        let theme = initial_theme(config.ui().clone());
         let mut owner = Self {
             runtime: Runtime::with_backends(config, pty_backend, job_backend),
+            theme,
+            theme_loader: Arc::new(ConfigThemeLoader),
             clients: BTreeMap::new(),
             pending_pastes: VecDeque::new(),
             started_at: Instant::now(),
@@ -1428,8 +1448,16 @@ impl ServerOwner {
 
     #[cfg(test)]
     fn new_test(config: WmuxConfig) -> Self {
+        Self::new_test_with_theme_loader(config, Arc::new(ConfigThemeLoader))
+    }
+
+    #[cfg(test)]
+    fn new_test_with_theme_loader(config: WmuxConfig, theme_loader: Arc<dyn ThemeLoader>) -> Self {
+        let theme = initial_theme(config.ui().clone());
         let mut owner = Self {
             runtime: Runtime::with_config(config),
+            theme,
+            theme_loader,
             clients: BTreeMap::new(),
             pending_pastes: VecDeque::new(),
             started_at: Instant::now(),
@@ -2205,6 +2233,21 @@ impl ServerOwner {
                 }
                 Ok(false)
             }
+            CommandEffect::ReloadTheme { requester: _ } => {
+                let sources = self.theme_loader.load_sources().map_err(io::Error::other)?;
+                let candidate = sources.resolve(None).map_err(io::Error::other)?;
+                let previous_generation = self.theme.generation();
+                let generation = self.theme.replace(sources, candidate);
+                debug_assert!(generation > previous_generation);
+                let now = Instant::now();
+                for view in self.clients.values_mut() {
+                    view.full_render = true;
+                    view.render_state.invalidate();
+                    view.structure = None;
+                    view.request_immediate_render(now);
+                }
+                Ok(false)
+            }
             CommandEffect::Confirm {
                 client,
                 prompt,
@@ -2596,9 +2639,13 @@ impl ServerOwner {
         else {
             return Ok(());
         };
-        let Some(structure) =
-            build_window_structure(&self.runtime.state, session, view.size.cols, view.size.rows)
-        else {
+        let Some(structure) = build_window_structure_with_theme(
+            &self.runtime.state,
+            session,
+            view.size.cols,
+            view.size.rows,
+            &self.theme.active().base,
+        ) else {
             return Ok(());
         };
         let Some((pane, column, row)) = structure.pane_at(event.column, event.row) else {
@@ -2763,11 +2810,13 @@ impl ServerOwner {
                 .clients
                 .get(&client)
                 .is_some_and(|client| client.confirmation.is_some() || client.prompt.is_some());
-            let Some(structure) = build_window_structure(
+            let frame = &self.theme.active().base;
+            let Some(structure) = build_window_structure_with_theme(
                 &self.runtime.state,
                 session,
                 view.size.cols,
                 view.size.rows,
+                frame,
             ) else {
                 self.clients.insert(client, view);
                 continue;
@@ -2800,15 +2849,19 @@ impl ServerOwner {
                 continue;
             }
             let mut candidate = view.render_state.clone();
+            let render = ClientRenderSpec {
+                size: view.size,
+                capabilities: view.capabilities,
+                frame,
+            };
             let bytes = if view.full_render {
                 render_full_for_client(
                     &mut self.runtime,
                     client,
-                    view.size,
                     &mut candidate,
-                    view.capabilities,
                     &mut view.scroll_offsets,
                     view.copy_mode.as_ref(),
+                    render,
                 )
             } else if self.runtime.resize_repaint_holds.is_empty()
                 && view.scroll_offsets.is_empty()
@@ -2826,22 +2879,20 @@ impl ServerOwner {
                     render_diff_for_client(
                         &mut self.runtime,
                         client,
-                        view.size,
                         &mut candidate,
-                        view.capabilities,
                         &mut view.scroll_offsets,
                         view.copy_mode.as_ref(),
+                        render,
                     )
                 })
             } else {
                 render_diff_for_client(
                     &mut self.runtime,
                     client,
-                    view.size,
                     &mut candidate,
-                    view.capabilities,
                     &mut view.scroll_offsets,
                     view.copy_mode.as_ref(),
+                    render,
                 )
             };
             let delivered = if bytes.is_empty() {
@@ -3282,14 +3333,20 @@ fn client_prompt(client: &wmux_core::Client) -> Option<ClientPrompt> {
         })
 }
 
+#[derive(Clone, Copy)]
+struct ClientRenderSpec<'a> {
+    size: TerminalSize,
+    capabilities: RenderCapabilities,
+    frame: &'a UiFrame,
+}
+
 fn render_full_for_client(
     runtime: &mut Runtime,
     client: ClientId,
-    size: TerminalSize,
     render_state: &mut RenderState,
-    capabilities: RenderCapabilities,
     scroll_offsets: &mut BTreeMap<PaneId, usize>,
     copy_mode: Option<&CopyMode>,
+    render: ClientRenderSpec<'_>,
 ) -> Vec<u8> {
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
@@ -3297,11 +3354,11 @@ fn render_full_for_client(
     let prompt = runtime.state.clients.get(&client).and_then(client_prompt);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
-    let Some(scene) = build_window_scene_with_client_overlay(
+    let Some(scene) = build_window_scene_with_theme(
         &runtime.state,
         session,
-        size.cols,
-        size.rows,
+        render.size.cols,
+        render.size.rows,
         PaneSceneOverrides {
             previous_frame_panes: &previous_frame_panes,
             retained_frames: &retained_frames,
@@ -3309,20 +3366,20 @@ fn render_full_for_client(
             previous: Some(render_state),
         },
         prompt.as_ref().map(ClientPrompt::render_overlay),
+        render.frame,
     ) else {
         return Vec::new();
     };
-    render_diff_scene_with_capabilities(&scene, render_state, capabilities)
+    render_diff_scene_with_capabilities(&scene, render_state, render.capabilities)
 }
 
 fn render_diff_for_client(
     runtime: &mut Runtime,
     client: ClientId,
-    size: TerminalSize,
     render_state: &mut RenderState,
-    capabilities: RenderCapabilities,
     scroll_offsets: &mut BTreeMap<PaneId, usize>,
     copy_mode: Option<&CopyMode>,
+    render: ClientRenderSpec<'_>,
 ) -> Vec<u8> {
     let Some((session, _, _)) = runtime.state.active_window_and_pane_for_client(client) else {
         return Vec::new();
@@ -3330,11 +3387,11 @@ fn render_diff_for_client(
     let prompt = runtime.state.clients.get(&client).and_then(client_prompt);
     let (previous_frame_panes, retained_frames) = retained_panes_for_client(runtime, client);
     let viewports = pane_viewports_for_client(runtime, client, scroll_offsets, copy_mode);
-    let Some(scene) = build_window_scene_with_client_overlay(
+    let Some(scene) = build_window_scene_with_theme(
         &runtime.state,
         session,
-        size.cols,
-        size.rows,
+        render.size.cols,
+        render.size.rows,
         PaneSceneOverrides {
             previous_frame_panes: &previous_frame_panes,
             retained_frames: &retained_frames,
@@ -3342,10 +3399,11 @@ fn render_diff_for_client(
             previous: Some(render_state),
         },
         prompt.as_ref().map(ClientPrompt::render_overlay),
+        render.frame,
     ) else {
         return Vec::new();
     };
-    render_diff_scene_with_capabilities(&scene, render_state, capabilities)
+    render_diff_scene_with_capabilities(&scene, render_state, render.capabilities)
 }
 
 fn pane_viewports_for_client(
@@ -3543,18 +3601,20 @@ fn text(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         collect_pane_events, read_async_message, render_full_for_client,
-        run_with_platform_and_config, write_async_message, write_outbound_messages, ClientView,
-        FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime, ServerOwner, TestJobBackend,
-        TestJobHandle, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
-        PER_PANE_OUTPUT_TIME,
+        run_with_platform_and_config, write_async_message, write_outbound_messages,
+        ClientRenderSpec, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime,
+        ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
+        COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME,
     };
+    use crate::theme_runtime::ThemeLoader;
     use std::{
         collections::BTreeMap,
+        sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
     use tokio::sync::mpsc;
-    use wmux_config::{parse_config, WmuxConfig};
+    use wmux_config::{parse_config, ThemeSources, WmuxConfig};
     use wmux_core::{
         parse_command_text, Command, CommandList, CommandSource, ControlNotification,
         ControlRecord, KeyBinding, KeyCode, KeyTableName, OptionTarget, OptionValue,
@@ -3573,6 +3633,24 @@ mod tests {
         endpoint: Endpoint,
         owner: PeerIdentity,
         accepted: mpsc::UnboundedReceiver<AcceptedConnection>,
+    }
+
+    struct FixedThemeLoader(Mutex<Result<ThemeSources, String>>);
+
+    impl FixedThemeLoader {
+        fn new(result: Result<ThemeSources, String>) -> Self {
+            Self(Mutex::new(result))
+        }
+
+        fn set(&self, result: Result<ThemeSources, String>) {
+            *self.0.lock().unwrap() = result;
+        }
+    }
+
+    impl ThemeLoader for FixedThemeLoader {
+        fn load_sources(&self) -> Result<ThemeSources, String> {
+            self.0.lock().unwrap().clone()
+        }
     }
 
     impl ServerListener for MemoryListener {
@@ -3709,6 +3787,53 @@ mod tests {
                 .unwrap(),
             OptionValue::String("config".to_string())
         );
+    }
+
+    #[test]
+    fn static_theme_reload_swaps_atomically_without_touching_panes() {
+        let replacement = parse_config("ui.theme = double\n").unwrap().ui().clone();
+        let loader = Arc::new(FixedThemeLoader::new(Ok(replacement)));
+        let mut owner = ServerOwner::new_test_with_theme_loader(
+            WmuxConfig::default(),
+            Arc::clone(&loader) as Arc<dyn ThemeLoader>,
+        );
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("theme", 40, 8);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound, _receiver) = mpsc::channel(8);
+        let mut view = ClientView::new(outbound, TerminalCapabilities::default());
+        view.full_render = false;
+        owner.clients.insert(client, view);
+
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.theme.generation(), 2);
+        assert_eq!(owner.theme.active().name, "double");
+        assert!(owner.clients[&client].full_render);
+        assert!(owner.runtime.state.panes.contains_key(&created.pane));
+
+        owner.clients.get_mut(&client).unwrap().full_render = false;
+        loader.set(Err("test reload failure".to_owned()));
+        owner.enqueue_command_list(
+            client,
+            parse_command_text("reload-theme").unwrap(),
+            CommandSource::ClientRequest,
+        );
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+
+        assert_eq!(owner.theme.generation(), 2);
+        assert_eq!(owner.theme.active().name, "double");
+        assert!(!owner.clients[&client].full_render);
+        assert!(owner.runtime.state.panes.contains_key(&created.pane));
     }
 
     #[test]
@@ -4704,11 +4829,14 @@ mod tests {
         let frame = render_full_for_client(
             &mut runtime,
             client,
-            TerminalSize::new(80, 24),
             &mut render_state,
-            RenderCapabilities::default(),
             &mut scroll_offsets,
             None,
+            ClientRenderSpec {
+                size: TerminalSize::new(80, 24),
+                capabilities: RenderCapabilities::default(),
+                frame: &wmux_core::UiFrame::default(),
+            },
         );
         let frame = String::from_utf8(frame).unwrap();
 

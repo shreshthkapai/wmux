@@ -51,6 +51,7 @@ Commands:\n\
   config path|show|effective\n\
   list-keys|lsk [-T table]\n\
   refresh-client\n\
+  theme reload\n\
   send-keys|send [-l] [-N repeat] [-t target-pane] key [key ...]\n\
   send-prefix [-t target-pane]\n\
   switch-client [-lnp | -t target-session]\n\
@@ -81,6 +82,12 @@ pub fn parse(args: &[String]) -> Result<Invocation, CliError> {
                 "effective" => Ok(Invocation::Config(ConfigAction::Effective)),
                 _ => parse_server(args),
             }
+        }
+        [theme, command] if theme == "theme" && command == "reload" => {
+            return parse_server(&["reload-theme".to_owned()]);
+        }
+        [theme, ..] if theme == "theme" => {
+            return Err(CliError("usage: wmux theme reload".to_owned()));
         }
         [argument, ..] if argument.starts_with('-') => {
             return Err(CliError(format!("unknown option: {argument}")))
@@ -216,6 +223,16 @@ mod tests {
 
         let switch = server(&["switchc", "-n"]);
         assert_eq!(switch.argv, args(&["switch-client", "-n"]));
+    }
+
+    #[test]
+    fn theme_reload_is_adapted_to_the_serialized_server_command() {
+        let invocation = server(&["theme", "reload"]);
+
+        assert_eq!(invocation.argv, args(&["reload-theme"]));
+        assert!(!invocation.attached);
+        assert_eq!(invocation.startup, StartupPolicy::RequireExisting);
+        assert!(parse(&args(&["theme", "unknown"])).is_err());
     }
 
     #[test]
