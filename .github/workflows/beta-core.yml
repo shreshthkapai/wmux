@@ -79,6 +79,7 @@ jobs:
   native:
     name: Native lifecycle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +108,35 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - name: Lint native adapter
         run: cargo clippy --locked -p ${{ matrix.package }} --all-targets -- -D warnings
+      - name: Guard macOS PTY startup
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p wmux-unix --lib \
+            process::tests::custom_command_cwd_and_environment_are_applied -- \
+            --exact --nocapture --test-threads=1 &
+          cargo_pid=$!
+
+          for _ in {1..90}; do
+            if ! kill -0 "$cargo_pid" 2>/dev/null; then
+              wait "$cargo_pid"
+              exit $?
+            fi
+            sleep 1
+          done
+
+          echo "macOS PTY startup exceeded 90 seconds"
+          ps -axo pid,ppid,state,etime,command
+          while read -r test_pid; do
+            sample_file="/tmp/wmux-pty-${test_pid}.sample.txt"
+            sample "$test_pid" 5 1 -file "$sample_file" || true
+            test -f "$sample_file" && cat "$sample_file"
+          done < <(pgrep -f 'target/debug/deps/wmux_unix-' || true)
+
+          kill "$cargo_pid" 2>/dev/null || true
+          wait "$cargo_pid" 2>/dev/null || true
+          exit 1
       - name: Test native adapter and lifecycle
         run: cargo test --locked -p ${{ matrix.package }} --all-targets -- --test-threads=1
       - name: Check native binaries
