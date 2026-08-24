@@ -41,7 +41,7 @@ use wmux_protocol::{
 
 mod theme_runtime;
 
-use theme_runtime::{ConfigThemeLoader, ThemeLoader, ThemeRuntime};
+use theme_runtime::{ClientThemeState, ConfigThemeLoader, ThemeLoader, ThemeRuntime};
 
 const TRACE_PREVIEW_BYTES: usize = 96;
 const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1285,6 +1285,7 @@ struct ClientView {
     blocked: bool,
     full_render: bool,
     scheduler: FrameScheduler,
+    theme_state: ClientThemeState,
     consumed_generations: BTreeMap<PaneId, u64>,
     structure: Option<StructuralScene>,
     capabilities: RenderCapabilities,
@@ -1312,6 +1313,7 @@ impl ClientView {
             blocked: false,
             full_render: true,
             scheduler: FrameScheduler::new(),
+            theme_state: ClientThemeState::new(0, Instant::now()),
             consumed_generations: BTreeMap::new(),
             structure: None,
             capabilities: RenderCapabilities {
@@ -1586,6 +1588,12 @@ impl ServerOwner {
             .filter(|view| !view.blocked)
             .filter_map(|view| view.scheduler.deadline)
             .min();
+        let animation = self
+            .clients
+            .values()
+            .filter(|view| view.attached && !view.blocked && view.queued_bytes == 0)
+            .filter_map(|view| view.theme_state.next_deadline(self.theme.active()))
+            .min();
         let synchronized_output = self
             .runtime
             .sync_started_at
@@ -1609,7 +1617,7 @@ impl ServerOwner {
                 }
             })
             .min();
-        [render, synchronized_output, resize]
+        [render, animation, synchronized_output, resize]
             .into_iter()
             .flatten()
             .min()
@@ -2777,6 +2785,7 @@ impl ServerOwner {
     }
 
     fn render_due_clients(&mut self, now: Instant) -> bool {
+        let active_theme = self.theme.active();
         let due = self
             .clients
             .iter()
@@ -2784,10 +2793,14 @@ impl ServerOwner {
                 (view.attached
                     && !view.blocked
                     && view.queued_bytes == 0
-                    && view
+                    && (view
                         .scheduler
                         .deadline
-                        .is_some_and(|deadline| now >= deadline))
+                        .is_some_and(|deadline| now >= deadline)
+                        || view
+                            .theme_state
+                            .next_deadline(active_theme)
+                            .is_some_and(|deadline| now >= deadline)))
                 .then_some(*client)
             })
             .collect::<Vec<_>>();
@@ -2810,7 +2823,9 @@ impl ServerOwner {
                 .clients
                 .get(&client)
                 .is_some_and(|client| client.confirmation.is_some() || client.prompt.is_some());
-            let frame = &self.theme.active().base;
+            let (frame, _) =
+                view.theme_state
+                    .select(self.theme.active(), self.theme.generation(), now);
             let Some(structure) = build_window_structure_with_theme(
                 &self.runtime.state,
                 session,
@@ -3834,6 +3849,44 @@ mod tests {
         assert_eq!(owner.theme.active().name, "double");
         assert!(!owner.clients[&client].full_render);
         assert!(owner.runtime.state.panes.contains_key(&created.pane));
+    }
+
+    #[test]
+    fn theme_animation_skips_blocked_backlog_and_emits_one_current_frame() {
+        let config = parse_config("ui.animation = pulse\nui.animation_fps = 10\n").unwrap();
+        let mut owner = ServerOwner::new_test(config);
+        let client = owner.runtime.state.add_client();
+        let created = owner.runtime.state.create_session("animated", 40, 8);
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound, mut receiver) = mpsc::channel(8);
+        let mut view = ClientView::new(outbound, TerminalCapabilities::default());
+        view.attached = true;
+        let start = Instant::now();
+        view.theme_state
+            .select(owner.theme.active(), owner.theme.generation(), start);
+        view.blocked = true;
+        view.queued_bytes = 64;
+        owner.clients.insert(client, view);
+
+        assert_eq!(owner.next_deadline(), None);
+        let late = start + Duration::from_millis(650);
+        let view = owner.clients.get_mut(&client).unwrap();
+        view.queued_bytes = 0;
+        owner
+            .handle_event(ServerEvent::ClientWritable { client })
+            .unwrap();
+
+        assert!(owner.render_due_clients(late));
+        assert!(!owner.render_due_clients(late));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Outbound::Message(Message::Output(_)))
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

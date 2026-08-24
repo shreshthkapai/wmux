@@ -1,6 +1,10 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use wmux_config::{ThemeError, ThemeSources, WmuxConfig};
+use wmux_core::UiFrame;
 use wmux_core::UiTheme;
 
 pub(crate) trait ThemeLoader: Send + Sync {
@@ -21,6 +25,58 @@ pub(crate) struct ThemeRuntime {
     generation: u64,
     active: Arc<UiTheme>,
     sources: ThemeSources,
+}
+
+pub(crate) struct ClientThemeState {
+    generation: u64,
+    started_at: Instant,
+    rendered_frame: usize,
+    next_frame: Option<Instant>,
+}
+
+impl ClientThemeState {
+    pub(crate) const fn new(generation: u64, started_at: Instant) -> Self {
+        Self {
+            generation,
+            started_at,
+            rendered_frame: 0,
+            next_frame: None,
+        }
+    }
+
+    pub(crate) fn select<'a>(
+        &mut self,
+        theme: &'a UiTheme,
+        generation: u64,
+        now: Instant,
+    ) -> (&'a UiFrame, Option<Instant>) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.started_at = now;
+            self.rendered_frame = 0;
+            self.next_frame = None;
+        }
+        let Some(animation) = &theme.animation else {
+            self.rendered_frame = 0;
+            self.next_frame = None;
+            return (&theme.base, None);
+        };
+        let elapsed_ms = now
+            .saturating_duration_since(self.started_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let selection = animation.select(elapsed_ms);
+        self.rendered_frame = selection.index;
+        self.next_frame = selection
+            .next_in_ms
+            .and_then(|millis| now.checked_add(Duration::from_millis(u64::from(millis))));
+        (&animation.frames[selection.index], self.next_frame)
+    }
+
+    pub(crate) fn next_deadline(&self, theme: &UiTheme) -> Option<Instant> {
+        theme.animation.as_ref()?;
+        self.next_frame
+    }
 }
 
 impl ThemeRuntime {
@@ -52,8 +108,9 @@ impl ThemeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use wmux_config::{parse_config, ThemeSources};
-    use wmux_core::{BorderGlyphSet, UiTheme};
+    use wmux_core::{AnimationSpec, AnimationTarget, BorderGlyphSet, Playback, UiFrame, UiTheme};
 
     fn sources(config: &str) -> ThemeSources {
         parse_config(config).unwrap().ui().clone()
@@ -83,5 +140,66 @@ mod tests {
         assert!(error.to_string().contains("missing"));
         assert_eq!(runtime.generation(), 1);
         assert_eq!(runtime.active(), &before);
+    }
+
+    fn looping_theme() -> UiTheme {
+        let first = UiFrame {
+            duration_ms: 200,
+            ..UiFrame::default()
+        };
+        let mut second = first.clone();
+        second.active_border.style.dim = true;
+        UiTheme {
+            name: "looping".to_owned(),
+            base: UiFrame::default(),
+            animation: Some(
+                AnimationSpec::new(AnimationTarget::Both, Playback::Loop, vec![first, second])
+                    .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn static_theme_never_schedules_an_animation_deadline() {
+        let start = Instant::now();
+        let mut state = ClientThemeState::new(1, start);
+        let theme = UiTheme::default();
+
+        let (frame, deadline) = state.select(&theme, 1, start);
+
+        assert_eq!(frame, &UiFrame::default());
+        assert_eq!(deadline, None);
+        assert_eq!(state.next_deadline(&theme), None);
+    }
+
+    #[test]
+    fn looping_theme_schedules_one_boundary_and_skips_backlog() {
+        let theme = looping_theme();
+        let start = Instant::now();
+        let mut state = ClientThemeState::new(7, start);
+
+        let (first, first_deadline) = state.select(&theme, 7, start);
+        assert_eq!(first, &theme.animation.as_ref().unwrap().frames[0]);
+        assert_eq!(first_deadline, Some(start + Duration::from_millis(200)));
+
+        let late = start + Duration::from_millis(650);
+        let (current, current_deadline) = state.select(&theme, 7, late);
+        assert_eq!(current, &theme.animation.as_ref().unwrap().frames[1]);
+        assert_eq!(current_deadline, Some(start + Duration::from_millis(800)));
+        assert_eq!(state.next_deadline(&theme), current_deadline);
+    }
+
+    #[test]
+    fn new_generation_restarts_the_client_clock_at_frame_zero() {
+        let theme = looping_theme();
+        let start = Instant::now();
+        let mut state = ClientThemeState::new(1, start);
+        state.select(&theme, 1, start + Duration::from_millis(250));
+
+        let reload = start + Duration::from_secs(3);
+        let (frame, deadline) = state.select(&theme, 2, reload);
+
+        assert_eq!(frame, &theme.animation.as_ref().unwrap().frames[0]);
+        assert_eq!(deadline, Some(reload + Duration::from_millis(200)));
     }
 }
