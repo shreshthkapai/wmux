@@ -76,12 +76,26 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
 
     let mut attached = connect_and_handshake_at(&transport, &project).await;
     command(&mut attached, "new-session -s native").await;
+    let cwd_marker = project.join(".wmux-cwd-observed");
     write_message(
         &mut attached,
-        Message::Input(b"printf 'WMUX_CWD_%s\\n' \"${PWD##*/}\"\n".to_vec()),
+        Message::Input(b"printf '%s\\n' \"$PWD\" > .wmux-cwd-observed\n".to_vec()),
     )
     .await;
-    wait_for_output(&mut attached, b"WMUX_CWD_project directory").await;
+    let observed_cwd = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match fs::read_to_string(&cwd_marker) {
+                Ok(contents) if !contents.is_empty() => return contents,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("pane cwd marker could not be read: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pane writes its cwd marker");
+    assert_eq!(Path::new(observed_cwd.trim_end()), project);
     write_message(
         &mut attached,
         Message::Input(b"printf 'WMUX_%s' TYPED\n".to_vec()),
