@@ -5,6 +5,10 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
+No changes yet.
+
+## [1.0.2] - 2026-08-24
+
 ### Added
 
 - Added terminal-native UI theming for pane borders and the status row with
@@ -21,6 +25,12 @@ All notable changes to wmux are documented in this file. The project follows
 
 - Promoted the production Cargo workspace to the repository root and removed
   the obsolete duplicate workspace and temporary nested directory.
+
+### Fixed
+
+- Restored primary-screen cursor, style, wrap, and repaint state when terminal
+  applications leave alternate-screen modes, including correct behavior across
+  resize and reflow.
 
 ## [1.0.1] - 2026-08-24
 
@@ -63,6 +73,7 @@ All notable changes to wmux are documented in this file. The project follows
   live server state migration is not implemented.
 - Windows ARM64 and package-manager repositories are not included in v1.0.0.
 
-[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/shreshthkapai/wmux/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shreshthkapai/wmux/releases/tag/v1.0.0

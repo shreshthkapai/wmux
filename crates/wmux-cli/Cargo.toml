@@ -15,7 +15,7 @@ name = "wmux_cli"
 path = "src/lib.rs"
 
 [dependencies]
-wmux-core = { path = "../wmux-core", version = "=1.0.1" }
+wmux-core = { path = "../wmux-core", version = "=1.0.2" }
 
 [lints]
 workspace = true
