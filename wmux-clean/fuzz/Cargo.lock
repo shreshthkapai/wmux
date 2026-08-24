@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -258,14 +258,14 @@ dependencies = [
 
 [[package]]
 name = "wmux-platform"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "wmux-protocol"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "wmux-core",
  "wmux-platform",

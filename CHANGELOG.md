@@ -5,6 +5,10 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
+No changes yet.
+
+## [1.0.1] - 2026-08-24
+
 ### Changed
 
 - Pane processes now receive wmux-native identity variables and advertise
@@ -44,5 +48,6 @@ All notable changes to wmux are documented in this file. The project follows
   live server state migration is not implemented.
 - Windows ARM64 and package-manager repositories are not included in v1.0.0.
 
-[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/shreshthkapai/wmux/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shreshthkapai/wmux/releases/tag/v1.0.0

@@ -9,6 +9,8 @@ an explicit maintainer decision.
 
 - Initial release: `1.0.0`
 - Initial tag: `v1.0.0`
+- Current release: `1.0.1`
+- Current tag: `v1.0.1`
 - GitHub repository: `https://github.com/shreshthkapai/wmux`
 - Release type: normal GitHub release, not a prerelease
 - Release tool: dist 0.32.0
@@ -32,12 +34,14 @@ git diff --check
 Confirm the workspace version and changelog agree:
 
 ```powershell
-rg -n 'version = "1.0.0"' wmux-clean/Cargo.toml
-rg -n '^## \[1.0.0\]' CHANGELOG.md
+$version = "1.0.1"
+$tag = "v$version"
+Select-String -Path wmux-clean/Cargo.toml -Pattern "version = `"$version`""
+Select-String -Path CHANGELOG.md -Pattern "^## \[$version\]"
 ```
 
-For later releases, replace `1.0.0` throughout this runbook's commands with
-the intended SemVer version. Add the release notes before changing the tag.
+For later releases, change `$version` once. Add the release notes before
+changing the tag.
 
 ## 2. Run the local quality gate
 
@@ -63,7 +67,7 @@ From the repository root, check the dependency and distribution policies:
 ```powershell
 cargo deny --manifest-path wmux-clean/Cargo.toml check
 dist generate --check
-dist plan --tag=v1.0.0
+dist plan --tag=$tag
 ```
 
 The dist plan must list exactly one application, five platform targets, and
@@ -72,7 +76,7 @@ both binaries in every target archive.
 ## 3. Inspect a local Windows release build
 
 ```powershell
-dist build --tag=v1.0.0 --target=x86_64-pc-windows-msvc
+dist build --tag=$tag --target=x86_64-pc-windows-msvc
 ```
 
 Locate the generated ZIP and its `.sha256` sidecar. First run the verifier's
@@ -96,7 +100,7 @@ Extract the Windows ZIP and verify the paired versions:
 .\wmux-server.exe --version
 ```
 
-Both commands must print version `1.0.0`. Do not accept an archive containing
+Both commands must print `$version`. Do not accept an archive containing
 only the client; the client locates `wmux-server` beside its own executable.
 
 ## 4. Validate hosted CI
@@ -154,7 +158,7 @@ Only after the history cutover is approved, the remote is configured, and the
 release commit is present on `main`, dispatch the generated release workflow:
 
 ```powershell
-gh workflow run release.yml --ref main -f tag=v1.0.0
+gh workflow run release.yml --ref main -f tag=$tag
 ```
 
 The generated release workflow builds the exact `main` commit selected by the
