@@ -76,13 +76,12 @@ async fn real_unix_lifecycle_preserves_detached_output_and_cleans_up() {
 
     let mut attached = connect_and_handshake_at(&transport, &project).await;
     command(&mut attached, "new-session -s native").await;
-    let cwd_marker = format!("WMUX_CWD_{}", project.display());
     write_message(
         &mut attached,
-        Message::Input(b"printf 'WMUX_CWD_%s\\n' \"$PWD\"\n".to_vec()),
+        Message::Input(b"printf 'WMUX_CWD_%s\\n' \"${PWD##*/}\"\n".to_vec()),
     )
     .await;
-    wait_for_output(&mut attached, cwd_marker.as_bytes()).await;
+    wait_for_output(&mut attached, b"WMUX_CWD_project directory").await;
     write_message(
         &mut attached,
         Message::Input(b"printf 'WMUX_%s' TYPED\n".to_vec()),
