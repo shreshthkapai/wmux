@@ -14,5 +14,10 @@ publish.workspace = true
 name = "wmux_config"
 path = "src/lib.rs"
 
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+wmux-core = { path = "../wmux-core", version = "=1.0.1" }
+
 [lints]
 workspace = true

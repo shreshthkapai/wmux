@@ -71,12 +71,53 @@ fn show_config() -> io::Result<()> {
 
 fn show_effective_config() -> io::Result<()> {
     let config = WmuxConfig::load_or_create()?;
-    println!("agent_compat = {}", config.agent_compat);
-    println!("agent_ui = {:?}", config.agent_ui);
-    for (key, value) in config.pane_environment(1) {
-        println!("pane.env.{key} = {value}");
-    }
+    print!("{}", format_effective_config(&config));
     Ok(())
+}
+
+fn format_effective_config(config: &WmuxConfig) -> String {
+    let mut output = format!(
+        "agent_compat = {}\nagent_ui = {:?}\n",
+        config.agent_compat, config.agent_ui
+    );
+    for (key, value) in config.pane_environment(1) {
+        output.push_str(&format!("pane.env.{key} = {value}\n"));
+    }
+    let ui = config.ui();
+    output.push_str(&format!("ui.theme = {}\n", ui.preset_name()));
+    output.push_str(&format!(
+        "ui.theme_file = {}\n",
+        ui.theme_file()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    ));
+    output.push_str(&format!(
+        "ui.theme_provider = {}\n",
+        ui.theme_provider().unwrap_or_default()
+    ));
+    output.push_str(&format!(
+        "ui.animation = {}\n",
+        ui.animation_name().unwrap_or("theme-defined-or-off")
+    ));
+    if let Some(target) = ui.animation_target() {
+        let target = match target {
+            wmux_core::AnimationTarget::Borders => "border",
+            wmux_core::AnimationTarget::Status => "status",
+            wmux_core::AnimationTarget::Both => "both",
+        };
+        output.push_str(&format!("ui.animation_target = {target}\n"));
+    }
+    if let Some(fps) = ui.animation_fps() {
+        output.push_str(&format!("ui.animation_fps = {fps}\n"));
+    }
+    if let Some(playback) = ui.animation_playback() {
+        let playback = match playback {
+            wmux_core::Playback::Once => "once",
+            wmux_core::Playback::Loop => "loop",
+        };
+        output.push_str(&format!("ui.animation_playback = {playback}\n"));
+    }
+    output
 }
 
 fn server_spec() -> io::Result<DaemonSpec> {
@@ -920,9 +961,10 @@ fn terminal_capabilities() -> TerminalCapabilities {
 mod tests {
     use super::{
         attach_io_loop, attached_command, classify_attached_inbound, connect_with_startup_policy,
-        control_io_loop, escape_control_bytes, format_control_record, handshake_read_error,
-        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
-        send_key, wire_key_event, write_async_message, AttachedInbound,
+        control_io_loop, escape_control_bytes, format_control_record, format_effective_config,
+        handshake_read_error, no_server_message, protocol_error, read_async_message,
+        read_inbound_messages, retry_delays, send_key, wire_key_event, write_async_message,
+        AttachedInbound,
     };
     use std::{
         cell::Cell,
@@ -944,6 +986,21 @@ mod tests {
     };
 
     struct NoopTerminal;
+
+    #[test]
+    fn effective_config_reports_theme_sources_without_resolving_provider_output() {
+        let config = wmux_config::parse_config(
+            "ui.theme = neon\nui.theme_provider = trusted-theme\nui.animation = pulse\n",
+        )
+        .unwrap();
+
+        let output = format_effective_config(&config);
+
+        assert!(output.contains("ui.theme = neon\n"));
+        assert!(output.contains("ui.theme_provider = trusted-theme\n"));
+        assert!(output.contains("ui.animation = pulse\n"));
+        assert!(!output.contains("schema"));
+    }
 
     impl TerminalBackend for NoopTerminal {
         fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {

@@ -5,6 +5,13 @@ use std::{
     path::PathBuf,
 };
 
+pub mod theme;
+
+pub use theme::{
+    parse_theme_document, ThemeError, ThemePatch, ThemeSources, UiConfig, MAX_THEME_DOCUMENT_BYTES,
+    THEME_SCHEMA_VERSION,
+};
+
 pub const CONFIG_ENV: &str = "WMUX_CONFIG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +19,7 @@ pub struct WmuxConfig {
     pub agent_compat: bool,
     pub agent_ui: AgentUi,
     pub pane_env: BTreeMap<String, String>,
+    ui: UiConfig,
     command_source: ConfigCommandSource,
 }
 
@@ -48,6 +56,7 @@ impl Default for WmuxConfig {
             agent_compat: true,
             agent_ui: AgentUi::Plain,
             pane_env: agent_env(AgentUi::Plain),
+            ui: UiConfig::default(),
             command_source: ConfigCommandSource {
                 text: String::new(),
                 first_line: 1,
@@ -60,13 +69,27 @@ impl WmuxConfig {
     pub fn load_or_create() -> io::Result<Self> {
         let path = config_path();
         match fs::read_to_string(&path) {
-            Ok(config) => parse_config(&config).map_err(invalid_config),
+            Ok(config) => parse_config(&config)
+                .map(|mut config| {
+                    if let Some(directory) = path.parent() {
+                        config.ui.resolve_relative_theme_file(directory);
+                    }
+                    config
+                })
+                .map_err(invalid_config),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&path, default_config_text())?;
-                parse_config(default_config_text()).map_err(invalid_config)
+                parse_config(default_config_text())
+                    .map(|mut config| {
+                        if let Some(directory) = path.parent() {
+                            config.ui.resolve_relative_theme_file(directory);
+                        }
+                        config
+                    })
+                    .map_err(invalid_config)
             }
             Err(error) => Err(error),
         }
@@ -81,6 +104,10 @@ impl WmuxConfig {
 
     pub fn command_source(&self) -> &ConfigCommandSource {
         &self.command_source
+    }
+
+    pub fn ui(&self) -> &UiConfig {
+        &self.ui
     }
 }
 
@@ -120,6 +147,24 @@ pane.env.TERM_PROGRAM_VERSION = wmux
 pane.env.NO_COLOR = 1
 pane.env.CLICOLOR = 0
 pane.env.CLICOLOR_FORCE = 0
+
+# UI defaults inherit the terminal foreground/background and do not animate.
+# ui.theme = default
+# ui.theme_file = ""
+# ui.theme_provider = ""
+# ui.border.style = single
+# ui.border.foreground = default
+# ui.border.background = default
+# ui.active_border.style = heavy
+# ui.active_border.foreground = default
+# ui.active_border.background = default
+# ui.status.style = reverse
+# ui.status.foreground = default
+# ui.status.background = default
+# ui.animation = off
+# ui.animation_target = both
+# ui.animation_fps = 12
+# ui.animation_playback = loop
 "#
 }
 
@@ -127,6 +172,7 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
     let mut agent_compat = None;
     let mut agent_ui = None;
     let mut explicit_env = BTreeMap::new();
+    let mut ui = UiConfig::default();
     let mut command_text = String::with_capacity(input.len());
 
     for (line_index, raw_line) in input.lines().enumerate() {
@@ -167,6 +213,9 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
                 return Err(format!("line {}: invalid environment name", line_index + 1));
             }
             explicit_env.insert(name.to_string(), value);
+        } else if key.starts_with("ui.") {
+            ui.apply_config_option(key, &value)
+                .map_err(|error| format!("line {}: {error}", line_index + 1))?;
         } else {
             return Err(format!("line {}: unknown option {key}", line_index + 1));
         }
@@ -187,6 +236,7 @@ pub fn parse_config(input: &str) -> Result<WmuxConfig, String> {
         agent_compat,
         agent_ui,
         pane_env,
+        ui,
         command_source: ConfigCommandSource {
             text: command_text,
             first_line: 1,
