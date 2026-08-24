@@ -17,6 +17,7 @@ pub mod state;
 pub mod target;
 pub mod terminal;
 pub mod text;
+pub mod theme;
 
 pub use command::{
     execute, parse_command, parse_command_argv, parse_command_text, quote_argument,
@@ -66,3 +67,7 @@ pub use terminal::{
     CsiParams, TerminalBatch, TerminalEngine, TerminalEvent, TerminalOperation, MAX_OSC_BYTES,
 };
 pub use text::{extends_grapheme, scalar_width, CellText, MAX_CELL_TEXT_BYTES};
+pub use theme::{
+    AnimationSpec, AnimationTarget, BorderGlyphSet, BorderTheme, FrameSelection, Playback,
+    StatusTheme, UiFrame, UiTheme, DOWN, LEFT, MAX_THEME_FPS, MAX_THEME_FRAMES, RIGHT, UP,
+};
