@@ -12,6 +12,8 @@ workspace graph. The targets exercise only OS-neutral code:
 - `command_text` bounds input to 1 MiB, decodes arbitrary bytes lossily, and
   parses and walks every command in successful command lists without executing
   server mutations.
+- `theme_json` bounds input to 64 KiB and exercises the strict schema decoder,
+  including colour, glyph, status-template, and animation validation.
 
 Install `cargo-fuzz` and run sanitizer-backed fuzzing on a supported nightly
 Linux or macOS x86-64/aarch64 host. Run these commands from the repository
@@ -20,19 +22,21 @@ root so artifacts stay in the ignored per-target directories:
 ```bash
 rustup toolchain install nightly --profile minimal
 cargo +nightly install cargo-fuzz --locked
-mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes
+mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes fuzz/artifacts/theme_json
 cargo +nightly fuzz run command_text -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/command_text/
 cargo +nightly fuzz run protocol_frame -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/protocol_frame/
 cargo +nightly fuzz run terminal_bytes -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/terminal_bytes/
+cargo +nightly fuzz run theme_json -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/theme_json/
 ```
 
-Those three 30-second runs are the CI smoke gate. The release-candidate gate
+Those four 30-second runs are the CI smoke gate. The release-candidate gate
 runs every target for 15 minutes:
 
 ```bash
 cargo +nightly fuzz run command_text -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/command_text/
 cargo +nightly fuzz run protocol_frame -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/protocol_frame/
 cargo +nightly fuzz run terminal_bytes -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/terminal_bytes/
+cargo +nightly fuzz run theme_json -- -max_total_time=900 -artifact_prefix=fuzz/artifacts/theme_json/
 ```
 
 Minimize and replay a sanitizer artifact before converting it into an owning

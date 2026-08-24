@@ -189,13 +189,15 @@ jobs:
       - name: Install cargo-fuzz
         run: command -v cargo-fuzz >/dev/null 2>&1 || cargo +nightly-2026-08-22 install cargo-fuzz --locked
       - name: Prepare artifact directories
-        run: mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes
+        run: mkdir -p fuzz/artifacts/command_text fuzz/artifacts/protocol_frame fuzz/artifacts/terminal_bytes fuzz/artifacts/theme_json
       - name: Fuzz command parser
         run: cargo +nightly-2026-08-22 fuzz run command_text -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/command_text/
       - name: Fuzz protocol decoder
         run: cargo +nightly-2026-08-22 fuzz run protocol_frame -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/protocol_frame/
       - name: Fuzz terminal engine
         run: cargo +nightly-2026-08-22 fuzz run terminal_bytes -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/terminal_bytes/
+      - name: Fuzz theme document decoder
+        run: cargo +nightly-2026-08-22 fuzz run theme_json -- -max_total_time=30 -artifact_prefix=fuzz/artifacts/theme_json/
       - name: Upload fuzz crash artifacts
         if: failure()
         uses: actions/upload-artifact@v7

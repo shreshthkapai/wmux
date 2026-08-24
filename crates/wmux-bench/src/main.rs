@@ -12,10 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 use wmux_core::{
-    build_window_scene, build_window_structure, parse_command_text, render_damage_from_structure,
-    render_diff, render_diff_scene, render_full_scene, route_key, ClientId, Command, CommandList,
-    CommandQueue, CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers,
-    RenderCapabilities, RenderState, Screen, ServerState, SplitDirection, TerminalEngine,
+    build_window_scene, build_window_scene_with_theme, build_window_structure, parse_command_text,
+    render_damage_from_structure, render_diff, render_diff_scene, render_full_scene, route_key,
+    AnimationSpec, AnimationTarget, ClientId, Color, Command, CommandList, CommandQueue,
+    CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, PaneSceneOverrides,
+    Playback, RenderCapabilities, RenderState, Screen, ServerState, SplitDirection, TerminalEngine,
+    UiFrame,
 };
 use wmux_platform::{
     PlatformEvent, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend, TerminalSize,
@@ -144,6 +146,7 @@ const SCENARIOS: &[&str] = &[
     "hybrid-frame-codex",
     "hybrid-frame-claude",
     "scene-frame-codex",
+    "animated-ui",
     "idle-input-render",
     "damage-proportional",
     "large-paste",
@@ -213,6 +216,12 @@ fn main() {
         &options,
         "scene-frame-codex",
         || scene_frame_workload(config, options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "animated-ui",
+        || animated_ui_workload(config, options.suite),
         &mut reports,
     );
     run_selected(
@@ -657,6 +666,92 @@ fn scene_frame_workload(config: WorkloadConfig, suite: Suite) -> Report {
             }
         },
     )
+}
+
+fn animated_ui_workload(config: WorkloadConfig, suite: Suite) -> Report {
+    let iterations = config.tui_frames.max(20);
+    let mut state = ServerState::new();
+    let created = state.create_session("animated", COLS, ROWS);
+    state
+        .split_pane(
+            created.window,
+            Some(created.pane),
+            SplitDirection::LeftRight,
+            COLS,
+            ROWS,
+        )
+        .expect("animated split pane");
+
+    let mut first = UiFrame {
+        duration_ms: 50,
+        ..UiFrame::default()
+    };
+    first.active_border.style.fg = Color::Indexed(13);
+    first.status.center_style.fg = Color::Indexed(13);
+    let mut second = first.clone();
+    second.active_border.style.fg = Color::Indexed(14);
+    second.status.center_style.fg = Color::Indexed(14);
+    let animation = AnimationSpec::new(AnimationTarget::Both, Playback::Loop, vec![first, second])
+        .expect("valid benchmark animation");
+
+    let initial = build_window_scene_with_theme(
+        &state,
+        created.session,
+        COLS,
+        ROWS,
+        PaneSceneOverrides {
+            previous_frame_panes: &[],
+            retained_frames: &[],
+            viewports: &[],
+            previous: None,
+        },
+        None,
+        &animation.frames[0],
+    )
+    .expect("initial animated scene");
+    let mut render_state = RenderState::new(COLS, ROWS);
+    black_box(render_full_scene(&initial, &mut render_state));
+
+    measure("animated-ui", suite, 0, iterations as u64, move || {
+        let mut sink = CountingSink::default();
+        let mut latencies = Vec::with_capacity(iterations);
+        let mut pending_frame = None;
+        let mut max_queue_depth = 0;
+        for iteration in 0..iterations {
+            let elapsed_ms = (iteration as u64 + 1) * 50;
+            pending_frame = Some(animation.select(elapsed_ms).index);
+            max_queue_depth = max_queue_depth.max(usize::from(pending_frame.is_some()));
+
+            let started = Instant::now();
+            let frame = &animation.frames[pending_frame.take().expect("queued frame")];
+            let scene = build_window_scene_with_theme(
+                &state,
+                created.session,
+                COLS,
+                ROWS,
+                PaneSceneOverrides {
+                    previous_frame_panes: &[],
+                    retained_frames: &[],
+                    viewports: &[],
+                    previous: Some(&render_state),
+                },
+                None,
+                frame,
+            )
+            .expect("animated scene");
+            let rendered = render_diff_scene(&scene, &mut render_state);
+            write_message(&mut sink, &Message::Output(rendered)).expect("encode animated output");
+            latencies.push(nanos(started.elapsed()));
+        }
+        RawResult {
+            latencies_ns: latencies,
+            ipc_bytes: sink.bytes,
+            max_queue_depth,
+            final_queue_depth: usize::from(pending_frame.is_some()),
+            checksum: sink.checksum,
+            ..RawResult::default()
+        }
+    })
 }
 
 fn paste_workload(config: WorkloadConfig, suite: Suite) -> Report {
@@ -1264,6 +1359,7 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
     let required = [
         "parser-codex",
         "parser-claude",
+        "animated-ui",
         "idle-input-render",
         "damage-proportional",
         "history-resize-100k",
@@ -1359,6 +1455,27 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
             "idle input-to-render p95 {:.3} ms exceeds one 60 Hz frame",
             idle_p95 as f64 / 1_000_000.0
         ));
+    }
+
+    let animated = find("animated-ui").expect("required report");
+    if animated.raw.latencies_ns.is_empty() {
+        failures.push("animated-ui produced no samples".to_owned());
+    }
+    let animated_p95 = percentile(&animated.raw.latencies_ns, 95);
+    if animated_p95 > 5_000_000 {
+        failures.push(format!(
+            "animated-ui p95 {:.3} ms exceeds 5 ms",
+            animated_p95 as f64 / 1_000_000.0
+        ));
+    }
+    if animated.raw.max_queue_depth > 1 {
+        failures.push(format!(
+            "animated-ui queued {} obsolete frames",
+            animated.raw.max_queue_depth - 1
+        ));
+    }
+    if animated.raw.final_queue_depth != 0 {
+        failures.push("animated-ui left a frame queued after rendering".to_owned());
     }
 
     let resize = find("history-resize-100k").expect("required report");
@@ -1542,6 +1659,11 @@ mod tests {
         ] {
             assert!(SCENARIOS.contains(&required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn animated_ui_workload_is_registered() {
+        assert!(SCENARIOS.contains(&"animated-ui"));
     }
 
     #[test]

@@ -65,6 +65,7 @@ paths.
 | `frame-codex`, `frame-claude` | Direct screen parser-to-render latency |
 | `scene-frame-codex` | Previous complete structural-scene rebuild path |
 | `hybrid-frame-codex`, `hybrid-frame-claude` | Cached structure plus direct pane-damage path |
+| `animated-ui` | Client-scoped themed scene diff latency, emitted bytes, allocations, and bounded frame slot |
 | `idle-input-render` | Idle key-echo parser-to-render latency |
 | `damage-proportional` | One-cell damage bytes versus a complete scene |
 | `large-paste` | Framed IPC encoding throughput and allocations |
@@ -83,6 +84,15 @@ by the workspace test suite and deterministic final-state checksums.
 Release acceptance is now enforced separately by `--gate`; see
 `performance-gates.md`. Ordinary benchmark runs remain informational so local
 profiling can inspect partial scenarios without triggering unrelated failures.
+
+The `animated-ui` release gate is independent of every static threshold. It
+requires at least one sample, a p95 no greater than 5 ms, a maximum pending
+frame depth of one, and an empty slot after rendering. The workload builds one
+split authoritative scene, alternates two validated border/status frames, and
+diffs through a retained client baseline. On 2026-08-24, the local Windows
+full release run rendered 400 frames at 106.9 us p95, allocated 31.27 MiB in
+total with 0.09 MiB peak live memory, and kept the queue peak at one. Opt-in
+animation never relaxes a default-render, parser, queue, or memory gate.
 
 ## Runtime Scheduling Baseline
 

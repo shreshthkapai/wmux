@@ -5,6 +5,18 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Added terminal-native UI theming for pane borders and the status row with
+  five presets, strict JSON theme files, explicit per-field overrides, custom
+  one-cell glyph sets, and atomic live reloads.
+- Added bounded client-scoped `once` and `loop` animations with built-in
+  effects, custom frames, blocked-client coalescing, and an independent
+  animated-render performance gate.
+- Added trusted one-shot theme providers with strict output validation,
+  startup and reload execution, time/output limits, and newest-generation-only
+  commits.
+
 ### Changed
 
 - Promoted the production Cargo workspace to the repository root and removed

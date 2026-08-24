@@ -39,8 +39,8 @@ sections are bounded to one third of the client width; when the window list no
 longer fits, the current window wins. Control characters from names or titles
 are replaced before cell composition. The window list stays centered against
 the client width while pane focus changes; it only moves when a side section
-would otherwise overlap it. There is no clock, animation, or timer that can
-create idle redraw work.
+would otherwise overlap it. The default has no clock, animation, or timer that
+can create idle redraw work.
 
 Decoration never selects a font or fixed color. Border and status cells keep
 `Color::Default` for both foreground and background, allowing the host
@@ -65,6 +65,23 @@ editing prompts place and show the real terminal cursor at the grapheme-aware
 input position.
 Editing prompts update through client-scoped scene diffs, so typing does not
 mutate the pane grid or require a full-scene repaint.
+
+## Theme Frames
+
+The same scene composer accepts a resolved UI frame for inactive borders,
+active-adjacent borders, status segments, and editing prompts. Presets, theme
+files, one-shot provider output, and explicit configuration are resolved before
+rendering. Reload commits a complete validated theme generation atomically;
+failed candidates never partially repaint a client or mutate pane state. See
+the [UI theme and animation guide](ui-themes.md) for the public schema.
+
+Animation timing is client-scoped and deadline-driven. A client retains its
+own theme generation, start time, rendered-frame index, next boundary, and
+terminal baseline. Blocked clients schedule no animation wakeups. When one
+becomes writable after several missed boundaries, selection advances directly
+to the current deterministic frame and emits at most one update instead of
+replaying obsolete frames. One-shot playback stops scheduling after its final
+frame; static themes never add a deadline.
 
 ## Direct pane damage
 

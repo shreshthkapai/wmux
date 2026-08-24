@@ -109,7 +109,8 @@ wmux config effective
 
 wmux creates a default configuration file on first use. Configuration is
 server-owned and uses the same command parser as interactive commands. See the
-[command and key model](docs/command-key-model.md) and
+[UI theme and animation guide](docs/ui-themes.md),
+[command and key model](docs/command-key-model.md), and
 [known platform differences](docs/known-differences.md).
 
 ## Update
@@ -169,6 +170,7 @@ tracking, coalesced redraws, and batched terminal writes.
 - [Cross-OS conformance](docs/cross-os-conformance.md)
 - [Compatibility evidence](docs/compatibility-matrix.md)
 - [Rendering model](docs/hybrid-rendering.md)
+- [UI themes and animation](docs/ui-themes.md)
 - [Performance gates](docs/performance.md)
 
 ## Contributing and security
