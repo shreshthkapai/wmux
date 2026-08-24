@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     Cell, Color, CursorStyle, DamageOperation, Line, PaneId, Rect, Screen, ServerState, SessionId,
-    SplitDirection, Style, WindowId,
+    SplitDirection, StatusTheme, Style, UiFrame, WindowId, DOWN, LEFT, RIGHT, UP,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +50,7 @@ struct BorderSpan {
     row: u16,
     col: u16,
     cells: Vec<char>,
-    active: bool,
+    style: Style,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,7 +196,7 @@ pub fn build_window_scene(
     cols: u16,
     rows: u16,
 ) -> Option<Scene> {
-    build_window_scene_inner(
+    build_window_scene_with_theme(
         state,
         session,
         cols,
@@ -208,6 +208,7 @@ pub fn build_window_scene(
             previous: None,
         },
         None,
+        &UiFrame::default(),
     )
 }
 
@@ -216,6 +217,16 @@ pub fn build_window_structure(
     session: SessionId,
     cols: u16,
     rows: u16,
+) -> Option<StructuralScene> {
+    build_window_structure_with_theme(state, session, cols, rows, &UiFrame::default())
+}
+
+pub fn build_window_structure_with_theme(
+    state: &ServerState,
+    session: SessionId,
+    cols: u16,
+    rows: u16,
+    frame: &UiFrame,
 ) -> Option<StructuralScene> {
     let window_id = state.active_window_for_session(session)?;
     let window = state.window(window_id)?;
@@ -248,11 +259,20 @@ pub fn build_window_structure(
             &panes,
             window.active_pane,
             two_pane_split,
+            frame,
         )
     } else {
         Vec::new()
     };
-    let status = build_status_line(state, session, window_id, window.active_pane, cols, rows);
+    let status = build_status_line(
+        state,
+        session,
+        window_id,
+        window.active_pane,
+        cols,
+        rows,
+        &frame.status,
+    );
     Some(StructuralScene {
         window: window_id,
         cols,
@@ -278,12 +298,8 @@ fn border_spans(
     panes: &[PaneSpan],
     active_pane: PaneId,
     two_pane_split: Option<(SplitDirection, PaneId, PaneId)>,
+    frame: &UiFrame,
 ) -> Vec<BorderSpan> {
-    const UP: u8 = 1;
-    const RIGHT: u8 = 2;
-    const DOWN: u8 = 4;
-    const LEFT: u8 = 8;
-
     let mut topology = vec![0_u8; usize::from(bounds.cols) * usize::from(bounds.rows)];
     let mut positions = Vec::with_capacity(cells.len());
     for (x, y, ch) in cells {
@@ -353,10 +369,19 @@ fn border_spans(
                 },
                 |owner| owner == active_pane,
             );
-        let ch = border_glyph(directions, active);
+        let border = if active {
+            &frame.active_border
+        } else {
+            &frame.border
+        };
+        let ch = if border.visible {
+            border.glyphs.glyph(directions)
+        } else {
+            ' '
+        };
         if let Some(last) = spans.last_mut() {
             if last.row == y
-                && last.active == active
+                && last.style == border.style
                 && last.col.saturating_add(last.cells.len() as u16) == x
             {
                 last.cells.push(ch);
@@ -367,7 +392,7 @@ fn border_spans(
             row: y,
             col: x,
             cells: vec![ch],
-            active,
+            style: border.style,
         });
     }
     spans
@@ -421,41 +446,6 @@ fn border_touches_rect(x: u16, y: u16, rect: Rect) -> bool {
         || (x >= rect.x && x < right && (y.saturating_add(1) == rect.y || y == bottom))
 }
 
-fn border_glyph(directions: u8, heavy: bool) -> char {
-    let light = match directions & 0b1111 {
-        0b0101 => '│',
-        0b1010 => '─',
-        0b0110 => '┌',
-        0b1100 => '┐',
-        0b0011 => '└',
-        0b1001 => '┘',
-        0b1110 => '┬',
-        0b1011 => '┴',
-        0b0111 => '├',
-        0b1101 => '┤',
-        0b1111 => '┼',
-        mask if mask & 0b0101 != 0 => '│',
-        _ => '─',
-    };
-    if !heavy {
-        return light;
-    }
-    match light {
-        '│' => '┃',
-        '─' => '━',
-        '┌' => '┏',
-        '┐' => '┓',
-        '└' => '┗',
-        '┘' => '┛',
-        '┬' => '┳',
-        '┴' => '┻',
-        '├' => '┣',
-        '┤' => '┫',
-        '┼' => '╋',
-        _ => light,
-    }
-}
-
 fn build_status_line(
     state: &ServerState,
     session_id: SessionId,
@@ -463,24 +453,24 @@ fn build_status_line(
     active_pane: PaneId,
     cols: u16,
     rows: u16,
+    theme: &StatusTheme,
 ) -> Option<Line> {
     if rows <= 1 {
         return None;
     }
     let session = state.sessions.get(&session_id)?;
     let window = state.windows.get(&window_id)?;
-    let base_style = Style {
-        reverse: true,
-        ..Style::default()
-    };
-    let current_style = Style {
-        bold: true,
-        ..Style::default()
-    };
     let mut line = Line::blank(cols);
-    line.clear_all_with_style(base_style);
+    line.clear_all_with_style(theme.base);
 
-    let left = format!(" wmux · {} ", clean_status_text(&session.name));
+    let session_name = clean_status_text(&session.name);
+    let window_name = clean_status_text(&window.name);
+    let window_index = session
+        .winlinks
+        .iter()
+        .filter_map(|winlink_id| state.winlinks.get(winlink_id))
+        .find(|winlink| winlink.window == window_id)
+        .map_or(0, |winlink| winlink.index);
     let pane_index = window
         .panes
         .iter()
@@ -491,18 +481,7 @@ fn build_status_line(
         .get(&active_pane)
         .map(|pane| clean_status_text(pane.screen.title()))
         .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| clean_status_text(&window.name));
-    let right = format!(" pane {pane_index} · {pane_title} ");
-    let side_limit = (cols / 3).max(1);
-    let left_width = status_text_width(&left).min(side_limit);
-    let right_width = status_text_width(&right).min(side_limit);
-    write_status_text(&mut line, 0, left_width, &left, base_style);
-    let right_start = cols.saturating_sub(right_width);
-    write_status_text(&mut line, right_start, cols, &right, base_style);
-
-    let center_start = left_width.saturating_add(1).min(cols);
-    let center_end = right_start.saturating_sub(1).max(center_start);
-    let available = center_end.saturating_sub(center_start);
+        .unwrap_or_else(|| window_name.clone());
     let mut windows = session
         .winlinks
         .iter()
@@ -510,40 +489,146 @@ fn build_status_line(
             let winlink = state.winlinks.get(winlink_id)?;
             let linked_window = state.windows.get(&winlink.window)?;
             let active = *winlink_id == session.active_winlink;
-            let name = clean_status_text(&linked_window.name);
-            let text = if active {
-                format!(" [{}:{}] ", winlink.index, name)
-            } else {
-                format!(" {}:{} ", winlink.index, name)
+            let linked_name = clean_status_text(&linked_window.name);
+            let linked_pane_index = linked_window
+                .panes
+                .iter()
+                .position(|pane| *pane == linked_window.active_pane)
+                .unwrap_or(0);
+            let linked_pane_title = state
+                .panes
+                .get(&linked_window.active_pane)
+                .map(|pane| clean_status_text(pane.screen.title()))
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| linked_name.clone());
+            let values = StatusValues {
+                session: &session_name,
+                window_index: winlink.index,
+                window_name: &linked_name,
+                pane_index: linked_pane_index,
+                pane_title: &linked_pane_title,
             };
-            Some((text, active))
+            let template = if active {
+                &theme.active_window
+            } else {
+                &theme.window
+            };
+            Some((expand_status_template(template, values, ""), active))
         })
         .collect::<Vec<_>>();
-    let all_width = windows
+    let windows_text = windows
         .iter()
-        .map(|(text, _)| status_text_width(text))
-        .fold(0_u16, u16::saturating_add);
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    let values = StatusValues {
+        session: &session_name,
+        window_index,
+        window_name: &window_name,
+        pane_index,
+        pane_title: &pane_title,
+    };
+    let left = expand_status_template(&theme.left, values, &windows_text);
+    let right = expand_status_template(&theme.right, values, &windows_text);
+    let side_limit = (cols / 3).max(1);
+    let left_width = status_text_width(&left).min(side_limit);
+    let right_width = status_text_width(&right).min(side_limit);
+    write_status_text(&mut line, 0, left_width, &left, theme.left_style);
+    let right_start = cols.saturating_sub(right_width);
+    write_status_text(&mut line, right_start, cols, &right, theme.right_style);
+
+    let center_start = left_width.saturating_add(1).min(cols);
+    let center_end = right_start.saturating_sub(1).max(center_start);
+    let available = center_end.saturating_sub(center_start);
+    let mut center = build_center_segments(theme, values, &windows);
+    let all_width = status_segments_width(&center);
     if all_width > available {
         windows.retain(|(_, active)| *active);
+        center = build_center_segments(theme, values, &windows);
     }
-    let windows_width = windows
+    let center_width = status_segments_width(&center).min(available);
+    let preferred_start = cols.saturating_sub(center_width) / 2;
+    let latest_start = center_end.saturating_sub(center_width).max(center_start);
+    let mut column = preferred_start.clamp(center_start, latest_start);
+    for (text, style) in center {
+        column = write_status_text(&mut line, column, center_end, &text, style);
+    }
+    Some(line)
+}
+
+#[derive(Clone, Copy)]
+struct StatusValues<'a> {
+    session: &'a str,
+    window_index: u16,
+    window_name: &'a str,
+    pane_index: usize,
+    pane_title: &'a str,
+}
+
+fn expand_status_template(template: &str, values: StatusValues<'_>, windows: &str) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+        let field = &after_open[..close];
+        match field {
+            "session" => output.push_str(values.session),
+            "window_index" => output.push_str(&values.window_index.to_string()),
+            "window_name" => output.push_str(values.window_name),
+            "pane_index" => output.push_str(&values.pane_index.to_string()),
+            "pane_title" => output.push_str(values.pane_title),
+            "windows" => output.push_str(windows),
+            _ => output.push_str(&rest[open..open + close + 2]),
+        }
+        rest = &after_open[close + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn build_center_segments(
+    theme: &StatusTheme,
+    values: StatusValues<'_>,
+    windows: &[(String, bool)],
+) -> Vec<(String, Style)> {
+    let mut segments = Vec::new();
+    let mut rest = theme.center.as_str();
+    loop {
+        let Some(index) = rest.find("{windows}") else {
+            let text = expand_status_template(rest, values, "");
+            if !text.is_empty() {
+                segments.push((text, theme.center_style));
+            }
+            break;
+        };
+        let text = expand_status_template(&rest[..index], values, "");
+        if !text.is_empty() {
+            segments.push((text, theme.center_style));
+        }
+        segments.extend(windows.iter().map(|(text, active)| {
+            (
+                text.clone(),
+                if *active {
+                    theme.active_window_style
+                } else {
+                    theme.window_style
+                },
+            )
+        }));
+        rest = &rest[index + "{windows}".len()..];
+    }
+    segments
+}
+
+fn status_segments_width(segments: &[(String, Style)]) -> u16 {
+    segments
         .iter()
         .map(|(text, _)| status_text_width(text))
         .fold(0_u16, u16::saturating_add)
-        .min(available);
-    let preferred_start = cols.saturating_sub(windows_width) / 2;
-    let latest_start = center_end.saturating_sub(windows_width).max(center_start);
-    let mut column = preferred_start.clamp(center_start, latest_start);
-    for (text, active) in windows {
-        column = write_status_text(
-            &mut line,
-            column,
-            center_end,
-            &text,
-            if active { current_style } else { base_style },
-        );
-    }
-    Some(line)
 }
 
 fn clean_status_text(text: &str) -> String {
@@ -611,7 +696,15 @@ pub fn build_window_scene_with_viewports(
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
 ) -> Option<Scene> {
-    build_window_scene_inner(state, session, cols, rows, overrides, None)
+    build_window_scene_with_theme(
+        state,
+        session,
+        cols,
+        rows,
+        overrides,
+        None,
+        &UiFrame::default(),
+    )
 }
 
 pub fn build_window_scene_with_client_overlay(
@@ -622,18 +715,27 @@ pub fn build_window_scene_with_client_overlay(
     overrides: PaneSceneOverrides<'_>,
     overlay: Option<ClientOverlay<'_>>,
 ) -> Option<Scene> {
-    build_window_scene_inner(state, session, cols, rows, overrides, overlay)
+    build_window_scene_with_theme(
+        state,
+        session,
+        cols,
+        rows,
+        overrides,
+        overlay,
+        &UiFrame::default(),
+    )
 }
 
-fn build_window_scene_inner(
+pub fn build_window_scene_with_theme(
     state: &ServerState,
     session: SessionId,
     cols: u16,
     rows: u16,
     overrides: PaneSceneOverrides<'_>,
     overlay: Option<ClientOverlay<'_>>,
+    frame: &UiFrame,
 ) -> Option<Scene> {
-    let structure = build_window_structure(state, session, cols, rows)?;
+    let structure = build_window_structure_with_theme(state, session, cols, rows, frame)?;
     let mut lines = vec![Line::blank(cols); rows.max(1) as usize];
 
     let mut cursor = (0, 0);
@@ -697,16 +799,12 @@ fn build_window_scene_inner(
     }
 
     for span in &structure.borders {
-        let style = Style {
-            bold: span.active,
-            ..Style::default()
-        };
         for (offset, ch) in span.cells.iter().copied().enumerate() {
             put_scene_cell(
                 &mut lines,
                 span.col.saturating_add(offset as u16),
                 span.row,
-                Cell::printable(ch, 1, style),
+                Cell::printable(ch, 1, span.style),
             );
         }
     }
@@ -719,7 +817,7 @@ fn build_window_scene_inner(
         let text = match overlay {
             ClientOverlay::Confirmation(text) | ClientOverlay::Editing { text, .. } => text,
         };
-        draw_confirmation_prompt(&mut lines, cols, text);
+        draw_confirmation_prompt(&mut lines, cols, text, frame.status.prompt_style);
         match overlay {
             ClientOverlay::Confirmation(_) => cursor_visible = false,
             ClientOverlay::Editing { cursor_column, .. } => {
@@ -744,7 +842,7 @@ fn build_window_scene_inner(
     })
 }
 
-fn draw_confirmation_prompt(lines: &mut [Line], cols: u16, prompt: &str) {
+fn draw_confirmation_prompt(lines: &mut [Line], cols: u16, prompt: &str, style: Style) {
     let Some(line) = lines.last_mut() else {
         return;
     };
@@ -759,7 +857,7 @@ fn draw_confirmation_prompt(lines: &mut [Line], cols: u16, prompt: &str) {
         if column.saturating_add(width) > cols.max(1) {
             break;
         }
-        line.set(column, character, width as u8, Style::default());
+        line.set(column, character, width as u8, style);
         column += width;
     }
 }
@@ -1492,12 +1590,16 @@ fn clip_cell_to_width(cell: Cell, column: u16, cols: u16) -> Cell {
 mod tests {
     use super::{
         build_window_scene, build_window_scene_with_client_overlay,
-        build_window_scene_with_retained_panes, build_window_scene_with_viewports,
-        build_window_structure, draw_screen, render_damage_from_structure, render_diff,
+        build_window_scene_with_retained_panes, build_window_scene_with_theme,
+        build_window_scene_with_viewports, build_window_structure,
+        build_window_structure_with_theme, draw_screen, render_damage_from_structure, render_diff,
         render_full_scene_with_capabilities, ClientOverlay, PaneSceneOverrides, PaneViewport,
         RenderCapabilities, RenderState, RetainedPaneFrame,
     };
-    use crate::{Color, Line, Rect, Screen, ServerState, SplitDirection, Style, TerminalEngine};
+    use crate::{
+        BorderGlyphSet, Color, Line, Rect, Screen, ServerState, SplitDirection, Style,
+        TerminalEngine, UiFrame, UiTheme,
+    };
     use std::collections::BTreeMap;
 
     fn assert_host_matches_screen(host: &Screen, source: &Screen) {
@@ -1750,6 +1852,161 @@ mod tests {
             .cells()
             .iter()
             .any(|cell| cell.style().bold && !cell.style().reverse));
+    }
+
+    #[test]
+    fn explicit_default_frame_matches_existing_scene_exactly() {
+        let mut server = ServerState::new();
+        let created = server.create_session("parity", 24, 5);
+        server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                24,
+                4,
+            )
+            .unwrap();
+        let frame = UiTheme::default().base;
+
+        assert_eq!(
+            build_window_structure(&server, created.session, 24, 5),
+            build_window_structure_with_theme(&server, created.session, 24, 5, &frame)
+        );
+        assert_eq!(
+            build_window_scene(&server, created.session, 24, 5),
+            build_window_scene_with_theme(
+                &server,
+                created.session,
+                24,
+                5,
+                PaneSceneOverrides {
+                    previous_frame_panes: &[],
+                    retained_frames: &[],
+                    viewports: &[],
+                    previous: None,
+                },
+                None,
+                &frame,
+            )
+        );
+    }
+
+    #[test]
+    fn custom_frame_styles_borders_status_segments_and_editing_prompt() {
+        let mut server = ServerState::new();
+        let created = server.create_session("paint", 40, 5);
+        server.rename_window(created.window, "shell").unwrap();
+        server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                40,
+                4,
+            )
+            .unwrap();
+        server
+            .create_window(created.session, Some("logs".to_owned()), 40, 5)
+            .unwrap();
+        let mut frame = UiFrame::default();
+        frame.border.glyphs = BorderGlyphSet::ASCII;
+        frame.border.style.fg = Color::Indexed(2);
+        frame.active_border.glyphs = BorderGlyphSet::DOUBLE;
+        frame.active_border.style.fg = Color::Indexed(5);
+        frame.status.base.bg = Color::Indexed(0);
+        frame.status.left_style.fg = Color::Indexed(1);
+        frame.status.center_style.fg = Color::Indexed(2);
+        frame.status.window_style.fg = Color::Indexed(3);
+        frame.status.active_window_style.fg = Color::Indexed(4);
+        frame.status.right_style.fg = Color::Indexed(5);
+        frame.status.prompt_style.fg = Color::Indexed(6);
+        frame.status.left = "<{session}>".to_owned();
+        frame.status.center = "~{windows}~".to_owned();
+        frame.status.window = "W{window_index}:{window_name}".to_owned();
+        frame.status.active_window = "A{window_index}:{window_name}".to_owned();
+        frame.status.right = "P{pane_index}:{pane_title}".to_owned();
+
+        let scene = build_window_scene_with_theme(
+            &server,
+            created.session,
+            40,
+            5,
+            PaneSceneOverrides {
+                previous_frame_panes: &[],
+                retained_frames: &[],
+                viewports: &[],
+                previous: None,
+            },
+            None,
+            &frame,
+        )
+        .unwrap();
+        let status = &scene.lines[4];
+        let status_text = status.text();
+        let left = status_text.find("<paint>").unwrap() as u16;
+        let center = status_text.find('~').unwrap() as u16;
+        let ordinary = status_text.find("W0:shell").unwrap() as u16;
+        let active = status_text.find("A1:logs").unwrap() as u16;
+        let right = status_text.find("P0:logs").unwrap() as u16;
+
+        assert_eq!(status.cell(left).unwrap().style().fg, Color::Indexed(1));
+        assert_eq!(status.cell(center).unwrap().style().fg, Color::Indexed(2));
+        assert_eq!(status.cell(ordinary).unwrap().style().fg, Color::Indexed(3));
+        assert_eq!(status.cell(active).unwrap().style().fg, Color::Indexed(4));
+        assert_eq!(status.cell(right).unwrap().style().fg, Color::Indexed(5));
+
+        server.select_window(created.session, 0).unwrap();
+        let split_scene = build_window_scene_with_theme(
+            &server,
+            created.session,
+            40,
+            5,
+            PaneSceneOverrides {
+                previous_frame_panes: &[],
+                retained_frames: &[],
+                viewports: &[],
+                previous: None,
+            },
+            None,
+            &frame,
+        )
+        .unwrap();
+        assert!(split_scene.lines.iter().any(|line| {
+            line.cells()
+                .iter()
+                .any(|cell| cell.ch() == '|' && cell.style().fg == Color::Indexed(2))
+        }));
+        assert!(split_scene.lines.iter().any(|line| {
+            line.cells()
+                .iter()
+                .any(|cell| cell.ch() == '║' && cell.style().fg == Color::Indexed(5))
+        }));
+
+        let prompt = build_window_scene_with_theme(
+            &server,
+            created.session,
+            40,
+            5,
+            PaneSceneOverrides {
+                previous_frame_panes: &[],
+                retained_frames: &[],
+                viewports: &[],
+                previous: None,
+            },
+            Some(ClientOverlay::Editing {
+                text: "rename: box",
+                cursor_column: 11,
+            }),
+            &frame,
+        )
+        .unwrap();
+        assert_eq!(
+            prompt.lines[4].cell(0).unwrap().style().fg,
+            Color::Indexed(6)
+        );
+        assert_eq!(prompt.cursor, (4, 11));
+        assert!(prompt.cursor_visible);
     }
 
     #[test]
