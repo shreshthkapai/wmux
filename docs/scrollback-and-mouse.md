@@ -40,10 +40,13 @@ without flooding IPC with unpressed pointer motion.
 
 The state owner hit-tests the event against the current structural scene:
 
-1. A left press selects the target pane before further routing and schedules a
-   structural redraw so every attached view sees the new active pane.
-2. If the target pane has requested DEC mouse tracking, wmux translates the
-   event to pane-relative coordinates and sends it to that pane.
+1. A left press on an inactive pane selects it and schedules a structural redraw
+   so every attached view sees the new active pane. The press, any drag, and its
+   release are consumed as one focus gesture and do not reach the newly active
+   application.
+2. Outside a focus gesture, if the target pane has requested DEC mouse tracking,
+   wmux translates the event to pane-relative coordinates and sends it to that
+   pane.
 3. Otherwise, if the application has enabled alternate scroll (`1007`) and its
    alternate screen is active, wmux translates wheel input to cursor navigation
    and sends it to that pane.
@@ -54,8 +57,7 @@ The state owner hit-tests the event against the current structural scene:
 6. In explicit copy mode, wheel and left press, drag, and release events are
    consumed by the client's server-owned copy state before application routing.
 7. Other button events without application mouse mode or explicit copy mode do
-   not move the pane application's authoritative cursor. A plain left press
-   only performs the focus change in step 1.
+   not move the pane application's authoritative cursor.
 
 Supported application modes are X10 (`9`), normal (`1000`), button-event
 (`1002`), any-event (`1003`), UTF-8 coordinates (`1005`), SGR (`1006`), and

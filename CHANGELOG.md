@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.10] - 2026-08-25
+
+### Fixed
+
+- Clicking an inactive pane now consumes the complete activation gesture before
+  application mouse routing. Mouse-aware applications no longer receive the
+  focus click or place their own cursor at the clicked cell.
+
 ## [1.0.9] - 2026-08-25
 
 ### Fixed

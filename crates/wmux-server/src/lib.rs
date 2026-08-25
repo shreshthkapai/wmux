@@ -1329,6 +1329,7 @@ struct ClientView {
     capabilities: RenderCapabilities,
     scroll_offsets: BTreeMap<PaneId, usize>,
     copy_mode: Option<CopyMode>,
+    suppress_focus_mouse_gesture: bool,
     control: Option<ControlClient>,
     current_dir: PathBuf,
 }
@@ -1375,6 +1376,7 @@ impl ClientView {
             },
             scroll_offsets: BTreeMap::new(),
             copy_mode: None,
+            suppress_focus_mouse_gesture: false,
             control: None,
             current_dir,
         }
@@ -2983,6 +2985,28 @@ impl ServerOwner {
     }
 
     fn handle_client_mouse(&mut self, client: ClientId, event: MouseEvent) -> io::Result<()> {
+        if self
+            .clients
+            .get(&client)
+            .is_some_and(|view| view.suppress_focus_mouse_gesture)
+        {
+            match event.kind {
+                MouseEventKind::Drag if event.button == MouseButton::Left => return Ok(()),
+                MouseEventKind::Up if event.button == MouseButton::Left => {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.suppress_focus_mouse_gesture = false;
+                    }
+                    return Ok(());
+                }
+                MouseEventKind::Down if event.button == MouseButton::Left => {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.suppress_focus_mouse_gesture = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let Some(view) = self.clients.get(&client) else {
             return Ok(());
         };
@@ -3011,7 +3035,11 @@ impl ServerOwner {
             if self.runtime.state.select_pane(window, pane).is_none() {
                 return Ok(());
             }
+            if let Some(view) = self.clients.get_mut(&client) {
+                view.suppress_focus_mouse_gesture = true;
+            }
             self.request_all_attached_renders(RenderCause::Structural);
+            return Ok(());
         }
 
         if self
@@ -6367,10 +6395,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_left_press_focuses_inactive_pane_without_entering_copy_mode() {
+    fn focus_click_is_consumed_before_application_mouse_routing() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner.runtime.state.create_session("mouse-focus", 80, 24);
-        owner.runtime.apply_pty_output(created.pane, b"prompt>x");
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"prompt>x\x1b[?1002h\x1b[?1006h");
         let second = owner
             .runtime
             .state
@@ -6421,6 +6451,7 @@ mod tests {
 
         assert_eq!(owner.active_pane_for_client(client), Some(created.pane));
         assert!(owner.clients[&client].copy_mode.is_none());
+        assert!(owner.runtime.test_inputs.is_empty());
         assert_eq!(
             owner
                 .runtime
@@ -6432,6 +6463,38 @@ mod tests {
             (0, 8)
         );
         assert!(owner.clients[&client].scheduler.deadline.is_some());
+
+        for kind in [MouseEventKind::Drag, MouseEventKind::Up] {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: MouseEvent {
+                        kind,
+                        button: MouseButton::Left,
+                        modifiers: MouseModifiers::default(),
+                        column: 1,
+                        row: 1,
+                    },
+                })
+                .unwrap();
+        }
+        assert!(owner.runtime.test_inputs.is_empty());
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 1,
+                    row: 1,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(owner.runtime.test_inputs.len(), 1);
+        assert_eq!(owner.runtime.test_inputs[0].0, created.pane);
     }
 
     #[test]
