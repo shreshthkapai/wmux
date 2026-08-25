@@ -732,8 +732,12 @@ impl Screen {
         if self.cursor_row == self.scroll_bottom {
             let top = self.scroll_top;
             let bottom = self.scroll_bottom;
-            if top == 0 && bottom == self.rows().saturating_sub(1) {
-                self.grid_mut().scroll_up_whole_screen(1);
+            if top == 0 {
+                if bottom == self.rows().saturating_sub(1) {
+                    self.grid_mut().scroll_up_whole_screen(1);
+                } else {
+                    self.grid_mut().scroll_top_region_up(bottom, 1);
+                }
             } else {
                 self.grid_mut().scroll_region_up(top, bottom, 1);
             }
@@ -890,6 +894,38 @@ impl Screen {
         let bottom = self.scroll_bottom;
         self.grid_mut().scroll_region_up(row, bottom, count);
         self.mark_range_dirty(row, bottom);
+    }
+
+    pub fn scroll_up(&mut self, count: u16) {
+        self.pending_wrap = false;
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if top == 0 {
+            self.grid_mut().scroll_top_region_up(bottom, count);
+        } else {
+            self.grid_mut().scroll_region_up(top, bottom, count);
+        }
+        self.mark_range_dirty(top, bottom);
+    }
+
+    pub fn scroll_down(&mut self, count: u16) {
+        self.pending_wrap = false;
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        self.grid_mut().scroll_region_down(top, bottom, count);
+        self.mark_range_dirty(top, bottom);
+    }
+
+    pub fn reverse_index(&mut self) {
+        self.pending_wrap = false;
+        if self.cursor_row == self.scroll_top {
+            let top = self.scroll_top;
+            let bottom = self.scroll_bottom;
+            self.grid_mut().scroll_region_down(top, bottom, 1);
+            self.mark_range_dirty(top, bottom);
+        } else {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        }
     }
 
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {

@@ -7,6 +7,15 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.7] - 2026-08-25
+
+### Fixed
+
+- Inline terminal applications and coding agents now retain finalized output
+  in server-owned scrollback when they use top-anchored scrolling regions.
+- Explicit region scrolling and reverse-index operations now honor the active
+  margins, preserving transcript history and viewport placement.
+
 ## [1.0.6] - 2026-08-25
 
 ### Fixed

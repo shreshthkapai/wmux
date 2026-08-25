@@ -6140,6 +6140,45 @@ mod tests {
     }
 
     #[test]
+    fn wheel_scrolls_history_finalized_above_an_inline_agent_viewport() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner
+            .runtime
+            .state
+            .create_session("inline-agent-scroll", 20, 5);
+        owner.runtime.apply_pty_output(
+            created.pane,
+            b"old-one\r\nold-two\r\nold-three\r\ncomposer\r\nstatus",
+        );
+        owner.runtime.apply_pty_output(
+            created.pane,
+            b"\x1b[1;3r\x1b[3;1H\r\nagent-one\r\nagent-two\x1b[r",
+        );
+        owner.runtime.take_history_growth();
+
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 5);
+        owner.clients.insert(client, view);
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: mouse(MouseEventKind::ScrollUp, 1, 1),
+            })
+            .unwrap();
+
+        assert_eq!(owner.clients[&client].scroll_offsets[&created.pane], 2);
+    }
+
+    #[test]
     fn typing_after_wheel_scrollback_returns_only_that_client_to_live_view() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner.runtime.state.create_session("scroll-input", 20, 3);

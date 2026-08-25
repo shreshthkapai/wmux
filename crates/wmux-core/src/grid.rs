@@ -774,6 +774,20 @@ impl Grid {
     }
 
     pub fn scroll_region_up(&mut self, top: u16, bottom: u16, count: u16) {
+        self.scroll_region_up_inner(top, bottom, count, false);
+    }
+
+    pub fn scroll_top_region_up(&mut self, bottom: u16, count: u16) {
+        self.scroll_region_up_inner(0, bottom, count, true);
+    }
+
+    fn scroll_region_up_inner(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        count: u16,
+        preserve_history: bool,
+    ) {
         self.below.clear();
         let top = top.min(self.rows.saturating_sub(1)) as usize;
         let bottom = bottom.min(self.rows.saturating_sub(1)) as usize;
@@ -781,8 +795,14 @@ impl Grid {
             return;
         }
         for _ in 0..count.max(1) {
-            self.visible.remove(top);
+            let removed = self.visible.remove(top);
+            if preserve_history {
+                self.push_history_line(removed);
+            }
             self.visible.insert(bottom, Line::blank(self.cols));
+        }
+        if preserve_history {
+            self.trim_history();
         }
     }
 

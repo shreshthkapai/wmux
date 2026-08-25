@@ -79,3 +79,18 @@ in `docs/copy-mode.md`.
 
 Existing wmux lazy history, structural scene, damage journal, and independent
 client baseline contracts remain authoritative.
+
+## Inline Viewports And Scrolling Regions
+
+Terminal applications can keep an editable viewport at the bottom of the
+screen while finalizing completed output above it. When a line feed or an
+explicit scroll-up operation moves rows out of a scrolling region anchored at
+row zero, wmux records those rows in the pane's canonical history even if the
+region ends above the physical screen bottom. Regions that do not include row
+zero remain isolated from history.
+
+Explicit scroll-up, scroll-down, and reverse-index operations honor the active
+scroll margins. Reverse index scrolls the region downward when the cursor is at
+its top margin and otherwise moves the cursor up without changing pane
+history. These rules let inline applications redraw their live viewport while
+completed transcript rows remain available to wheel and copy-mode navigation.

@@ -67,6 +67,7 @@ pub enum TerminalOperation {
     DeleteChars(u16),
     ScrollUp(u16),
     ScrollDown(u16),
+    ReverseIndex,
     EraseChars(u16),
     MoveRow(u16),
     ModeChange {
@@ -195,7 +196,7 @@ impl Perform for TerminalBatch {
             b'8' => TerminalOperation::RestoreCursor,
             b'D' => TerminalOperation::Execute(b'\n'),
             b'E' => TerminalOperation::Execute(0x85),
-            b'M' => TerminalOperation::MoveUp(1),
+            b'M' => TerminalOperation::ReverseIndex,
             b'c' => TerminalOperation::Reset,
             _ => return,
         };
@@ -424,18 +425,9 @@ fn apply_batch(screen: &mut Screen, batch: &TerminalBatch) -> Option<u64> {
             TerminalOperation::InsertLines(count) => screen.insert_lines(*count),
             TerminalOperation::DeleteLines(count) => screen.delete_lines(*count),
             TerminalOperation::DeleteChars(count) => screen.delete_chars(*count),
-            TerminalOperation::ScrollUp(count) => {
-                let top = 0;
-                let bottom = screen.rows().saturating_sub(1);
-                screen.set_scroll_region(top, bottom);
-                screen.delete_lines(*count);
-            }
-            TerminalOperation::ScrollDown(count) => {
-                let top = 0;
-                let bottom = screen.rows().saturating_sub(1);
-                screen.set_scroll_region(top, bottom);
-                screen.insert_lines(*count);
-            }
+            TerminalOperation::ScrollUp(count) => screen.scroll_up(*count),
+            TerminalOperation::ScrollDown(count) => screen.scroll_down(*count),
+            TerminalOperation::ReverseIndex => screen.reverse_index(),
             TerminalOperation::EraseChars(count) => screen.erase_chars(*count),
             TerminalOperation::MoveRow(row) => screen.move_to(*row, screen.cursor().1),
             TerminalOperation::ModeChange {
@@ -520,16 +512,30 @@ fn record_operation_damage(screen: &mut Screen, operation: &TerminalOperation, b
                 lines: i32::from(*count),
             }
         }
-        TerminalOperation::ScrollDown(count) => DamageOperation::ScrollRegion {
-            top: 0,
-            bottom: screen.rows().saturating_sub(1),
-            lines: -(*count as i32),
-        },
-        TerminalOperation::ScrollUp(count) => DamageOperation::ScrollRegion {
-            top: 0,
-            bottom: screen.rows().saturating_sub(1),
-            lines: i32::from(*count),
-        },
+        TerminalOperation::ScrollDown(count) => {
+            let (top, bottom) = screen.scroll_region();
+            DamageOperation::ScrollRegion {
+                top,
+                bottom,
+                lines: -(*count as i32),
+            }
+        }
+        TerminalOperation::ScrollUp(count) => {
+            let (top, bottom) = screen.scroll_region();
+            DamageOperation::ScrollRegion {
+                top,
+                bottom,
+                lines: i32::from(*count),
+            }
+        }
+        TerminalOperation::ReverseIndex if before.0 == screen.scroll_region().0 => {
+            let (top, bottom) = screen.scroll_region();
+            DamageOperation::ScrollRegion {
+                top,
+                bottom,
+                lines: -1,
+            }
+        }
         TerminalOperation::Execute(byte)
             if matches!(*byte, b'\n' | 0x0b | 0x0c | 0x85)
                 && before.0 == screen.scroll_region().1 =>
@@ -715,6 +721,69 @@ mod tests {
 
         engine.feed(&mut screen, b"\n\x1b[65535B");
         assert_eq!(screen.cursor(), (4, 19));
+    }
+
+    #[test]
+    fn top_anchored_scroll_region_preserves_inline_agent_history() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+        engine.feed(
+            &mut screen,
+            b"old-one\r\nold-two\r\nold-three\r\ncomposer\r\nstatus",
+        );
+
+        // Inline terminal applications finalize transcript rows above their
+        // live viewport by scrolling a top-anchored DEC region. Rows leaving
+        // the top of that region are terminal history, even when the region's
+        // bottom is above the physical screen bottom.
+        engine.feed(
+            &mut screen,
+            b"\x1b[1;3r\x1b[3;1H\r\nagent-one\r\nagent-two\x1b[r",
+        );
+
+        assert_eq!(screen.max_viewport_offset(20), 2);
+        assert_eq!(
+            screen
+                .viewport_lines(20, 5, 2)
+                .iter()
+                .map(crate::Line::text)
+                .collect::<Vec<_>>(),
+            ["old-one", "old-two", "old-three", "agent-one", "agent-two"]
+        );
+    }
+
+    #[test]
+    fn explicit_scroll_up_preserves_top_anchored_region_history() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+        engine.feed(
+            &mut screen,
+            b"old-one\r\nold-two\r\nold-three\r\ncomposer\r\nstatus",
+        );
+
+        engine.feed(&mut screen, b"\x1b[1;3r\x1b[2S\x1b[r");
+
+        assert_eq!(screen.max_viewport_offset(20), 2);
+        assert_eq!(screen.grid().line(0).unwrap().text(), "old-three");
+        assert_eq!(screen.grid().line(3).unwrap().text(), "composer");
+        assert_eq!(screen.grid().line(4).unwrap().text(), "status");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_down_at_the_top_margin() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(20, 5);
+        engine.feed(
+            &mut screen,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[2;4r\x1b[2;1H\x1bM",
+        );
+
+        assert_eq!(screen.cursor(), (1, 0));
+        assert_eq!(screen.grid().line(0).unwrap().text(), "one");
+        assert_eq!(screen.grid().line(1).unwrap().text(), "");
+        assert_eq!(screen.grid().line(2).unwrap().text(), "two");
+        assert_eq!(screen.grid().line(3).unwrap().text(), "three");
+        assert_eq!(screen.grid().line(4).unwrap().text(), "five");
     }
 
     #[test]
