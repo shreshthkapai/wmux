@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.8] - 2026-08-25
+
+### Fixed
+
+- Clicking an inactive pane now selects it before mouse selection or
+  application routing, preventing the server recursion that terminated the
+  session with a connection-reset error.
+
 ## [1.0.7] - 2026-08-25
 
 ### Fixed

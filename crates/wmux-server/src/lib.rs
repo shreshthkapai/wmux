@@ -2986,7 +2986,8 @@ impl ServerOwner {
         let Some(view) = self.clients.get(&client) else {
             return Ok(());
         };
-        let Some((session, _, _)) = self.runtime.state.active_window_and_pane_for_client(client)
+        let Some((session, window, active_pane)) =
+            self.runtime.state.active_window_and_pane_for_client(client)
         else {
             return Ok(());
         };
@@ -3002,6 +3003,16 @@ impl ServerOwner {
         let Some((pane, column, row)) = structure.pane_at(event.column, event.row) else {
             return Ok(());
         };
+
+        if event.kind == MouseEventKind::Down
+            && event.button == MouseButton::Left
+            && pane != active_pane
+        {
+            if self.runtime.state.select_pane(window, pane).is_none() {
+                return Ok(());
+            }
+            self.request_all_attached_renders(RenderCause::Structural);
+        }
 
         if self
             .clients
@@ -6357,6 +6368,59 @@ mod tests {
             .expect("left drag enters copy selection");
         assert!(selection.anchor().is_some());
         assert_eq!(selection.cursor().column, 1);
+    }
+
+    #[test]
+    fn left_press_focuses_an_inactive_pane_before_starting_selection() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("mouse-focus", 80, 24);
+        let second = owner
+            .runtime
+            .state
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                80,
+                24,
+            )
+            .unwrap();
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(80, 24);
+        owner.clients.insert(client, view);
+
+        assert_eq!(owner.active_pane_for_client(client), Some(second));
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 1,
+                    row: 1,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(owner.active_pane_for_client(client), Some(created.pane));
+        assert_eq!(
+            owner.clients[&client]
+                .copy_mode
+                .as_ref()
+                .map(|mode| mode.pane),
+            Some(created.pane)
+        );
+        assert!(owner.clients[&client].scheduler.deadline.is_some());
     }
 
     #[test]

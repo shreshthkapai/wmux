@@ -40,21 +40,23 @@ without flooding IPC with unpressed pointer motion.
 
 The state owner hit-tests the event against the current structural scene:
 
-1. If the target pane has requested DEC mouse tracking, wmux translates the
+1. A left press selects the target pane before further routing and schedules a
+   structural redraw so every attached view sees the new active pane.
+2. If the target pane has requested DEC mouse tracking, wmux translates the
    event to pane-relative coordinates and sends it to that pane.
-2. Otherwise, if the application has enabled alternate scroll (`1007`) and its
+3. Otherwise, if the application has enabled alternate scroll (`1007`) and its
    alternate screen is active, wmux translates wheel input to cursor navigation
    and sends it to that pane.
-3. Otherwise, wheel-up moves that client's target-pane viewport five rows into
+4. Otherwise, wheel-up moves that client's target-pane viewport five rows into
    history.
-4. Wheel-down moves five rows toward the live bottom and leaves history view at
+5. Wheel-down moves five rows toward the live bottom and leaves history view at
    offset zero.
-5. In copy mode, wheel and left-drag events are consumed by the client's
+6. In copy mode, wheel and left-drag events are consumed by the client's
    server-owned copy state before application routing.
-6. When the application has not requested mouse tracking, a left press enters
+7. When the application has not requested mouse tracking, a left press enters
    server-owned copy selection at the clicked cell; drag extends the selection
    and release copies it.
-7. Other non-wheel events without application mouse mode or copy mode remain
+8. Other non-wheel events without application mouse mode or copy mode remain
    available for later UI routing.
 
 Supported application modes are X10 (`9`), normal (`1000`), button-event
