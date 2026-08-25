@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.5] - 2026-08-25
+
+### Fixed
+
+- Normal keyboard input and paste now return the originating client from wheel
+  scrollback to the live pane before the input is rendered, without changing
+  another client's independent viewport or exiting explicit copy mode.
+
 ## [1.0.4] - 2026-08-24
 
 ### Changed

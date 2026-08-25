@@ -2000,6 +2000,7 @@ impl ServerOwner {
                         self.handle_copy_mode_key(client, bytes);
                     }
                 } else if let Some(pane) = self.active_pane_for_client(client) {
+                    self.return_client_to_live_pane(client, pane);
                     self.runtime.write_pane_input(pane, input)?;
                 }
             }
@@ -2115,6 +2116,7 @@ impl ServerOwner {
         match route {
             InputRoute::PaneBytes(mut bytes) => {
                 if let Some(pane) = self.active_pane_for_client(client) {
+                    self.return_client_to_live_pane(client, pane);
                     if self
                         .runtime
                         .state
@@ -2847,6 +2849,16 @@ impl ServerOwner {
             .state
             .active_window_and_pane_for_client(client)
             .map(|(_, _, pane)| pane)
+    }
+
+    fn return_client_to_live_pane(&mut self, client: ClientId, pane: PaneId) {
+        let Some(view) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if view.scroll_offsets.remove(&pane).is_some() {
+            view.full_render = true;
+            view.request_immediate_render(Instant::now());
+        }
     }
 
     fn anchor_scrolled_views(&mut self) {
@@ -6114,6 +6126,70 @@ mod tests {
                 .unwrap_or(0)
                 < initial + 1
         );
+    }
+
+    #[test]
+    fn typing_after_wheel_scrollback_returns_only_that_client_to_live_view() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("scroll-input", 20, 3);
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        owner.runtime.take_history_growth();
+
+        let first = owner.runtime.state.add_client();
+        let second = owner.runtime.state.add_client();
+        for client in [first, second] {
+            owner
+                .runtime
+                .state
+                .attach_client(client, created.session)
+                .unwrap();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut view = ClientView::new(tx, TerminalCapabilities::default());
+            view.attached = true;
+            view.size = TerminalSize::new(20, 3);
+            owner.clients.insert(client, view);
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: mouse(MouseEventKind::ScrollUp, 1, 1),
+                })
+                .unwrap();
+        }
+
+        owner
+            .handle_wire_key_at(first, wire_char('x', WireKeyModifiers::NONE, b"x"), 0)
+            .unwrap();
+
+        assert!(!owner.clients[&first]
+            .scroll_offsets
+            .contains_key(&created.pane));
+        assert!(owner.clients[&second].scroll_offsets[&created.pane] > 0);
+        assert_eq!(owner.runtime.test_inputs, [(created.pane, b"x".to_vec())]);
+        assert!(owner.clients[&first].full_render);
+    }
+
+    #[test]
+    fn paste_after_wheel_scrollback_returns_that_client_to_live_view() {
+        let (mut owner, client, pane) = attached_owner();
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .scroll_offsets
+            .insert(pane, 5);
+
+        owner
+            .handle_event(ServerEvent::ClientInput {
+                client,
+                input: wmux_core::ClientInput::Paste(b"pasted".to_vec()),
+            })
+            .unwrap();
+
+        assert!(!owner.clients[&client].scroll_offsets.contains_key(&pane));
+        assert_eq!(owner.runtime.test_inputs, [(pane, b"pasted".to_vec())]);
+        assert!(owner.clients[&client].full_render);
     }
 
     #[test]

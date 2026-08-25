@@ -11,9 +11,9 @@ homepage.workspace = true
 publish.workspace = true
 
 [dependencies]
-wmux-core = { path = "../wmux-core", version = "=1.0.4" }
-wmux-platform = { path = "../wmux-platform", version = "=1.0.4" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.4" }
+wmux-core = { path = "../wmux-core", version = "=1.0.5" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.5" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.5" }
 
 [lints]
 workspace = true

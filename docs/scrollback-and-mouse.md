@@ -64,6 +64,12 @@ Mouse wheel input is therefore never translated into arrow keys or tied to a
 specific terminal emulator. Applications that request mouse input receive it;
 all other wheel input is multiplexer history navigation.
 
+Normal keyboard input and paste that are routed to a pane clear only the
+originating client's historical offset for that pane and request an immediate
+coherent render of the live view. Other attached clients retain their own
+offsets. Input handled by an explicit copy mode remains copy-mode input and
+does not reach the pane or force an exit from that mode.
+
 Copy-mode navigation, selection, search, and clipboard transfer are documented
 in `docs/copy-mode.md`.
 
