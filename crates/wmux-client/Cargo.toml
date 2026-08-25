@@ -27,18 +27,18 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio.workspace = true
-wmux-config = { path = "../wmux-config", version = "=1.0.5" }
-wmux-core = { path = "../wmux-core", version = "=1.0.5" }
-wmux-cli = { path = "../wmux-cli", version = "=1.0.5" }
-wmux-platform = { path = "../wmux-platform", version = "=1.0.5" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.5" }
-wmux-server = { path = "../wmux-server", version = "=1.0.5" }
+wmux-config = { path = "../wmux-config", version = "=1.0.6" }
+wmux-core = { path = "../wmux-core", version = "=1.0.6" }
+wmux-cli = { path = "../wmux-cli", version = "=1.0.6" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.6" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.6" }
+wmux-server = { path = "../wmux-server", version = "=1.0.6" }
 
 [target.'cfg(windows)'.dependencies]
-wmux-windows = { path = "../wmux-windows", version = "=1.0.5" }
+wmux-windows = { path = "../wmux-windows", version = "=1.0.6" }
 
 [target.'cfg(unix)'.dependencies]
-wmux-unix = { path = "../wmux-unix", version = "=1.0.5" }
+wmux-unix = { path = "../wmux-unix", version = "=1.0.6" }
 
 [lints]
 workspace = true

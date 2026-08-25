@@ -3066,6 +3066,17 @@ impl ServerOwner {
                 .write_pane_input(pane, ClientInput::Bytes(bytes));
         }
 
+        let alternate_scroll_input = self
+            .runtime
+            .state
+            .pane(pane)
+            .and_then(|pane| pane.screen.encode_alternate_scroll(event));
+        if let Some(bytes) = alternate_scroll_input {
+            return self
+                .runtime
+                .write_pane_input(pane, ClientInput::Bytes(bytes));
+        }
+
         if event.kind == MouseEventKind::Down && event.button == MouseButton::Left {
             self.enter_copy_mode(client).map_err(io::Error::other)?;
             return self.handle_client_mouse(client, event);
@@ -6226,6 +6237,47 @@ mod tests {
             .unwrap()
             .screen
             .application_mouse_enabled());
+    }
+
+    #[test]
+    fn alternate_screen_wheel_routes_as_application_navigation_when_requested() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner
+            .runtime
+            .state
+            .create_session("alternate-scroll", 20, 3);
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"\x1b[?1049h\x1b[?1007h");
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: mouse(kind, 1, 1),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            owner.runtime.test_inputs,
+            [
+                (created.pane, b"\x1b[A".to_vec()),
+                (created.pane, b"\x1b[B".to_vec()),
+            ]
+        );
+        assert!(owner.clients[&client].scroll_offsets.is_empty());
     }
 
     #[test]

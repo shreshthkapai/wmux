@@ -583,6 +583,7 @@ fn set_private_modes(screen: &mut Screen, params: &[u16], enabled: bool) {
             }
             1049 => {}
             9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 => screen.set_mouse_mode(*mode, enabled),
+            1007 => screen.set_alternate_scroll(enabled),
             2004 => screen.set_bracketed_paste(enabled),
             2026 => screen.set_synchronized_output(enabled),
             9001 => screen.set_win32_input_mode(enabled),

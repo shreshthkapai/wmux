@@ -42,16 +42,19 @@ The state owner hit-tests the event against the current structural scene:
 
 1. If the target pane has requested DEC mouse tracking, wmux translates the
    event to pane-relative coordinates and sends it to that pane.
-2. Otherwise, wheel-up moves that client's target-pane viewport five rows into
+2. Otherwise, if the application has enabled alternate scroll (`1007`) and its
+   alternate screen is active, wmux translates wheel input to cursor navigation
+   and sends it to that pane.
+3. Otherwise, wheel-up moves that client's target-pane viewport five rows into
    history.
-3. Wheel-down moves five rows toward the live bottom and leaves history view at
+4. Wheel-down moves five rows toward the live bottom and leaves history view at
    offset zero.
-4. In copy mode, wheel and left-drag events are consumed by the client's
+5. In copy mode, wheel and left-drag events are consumed by the client's
    server-owned copy state before application routing.
-5. When the application has not requested mouse tracking, a left press enters
+6. When the application has not requested mouse tracking, a left press enters
    server-owned copy selection at the clicked cell; drag extends the selection
    and release copies it.
-6. Other non-wheel events without application mouse mode or copy mode remain
+7. Other non-wheel events without application mouse mode or copy mode remain
    available for later UI routing.
 
 Supported application modes are X10 (`9`), normal (`1000`), button-event
@@ -60,9 +63,10 @@ urxvt (`1015`). Motion and release filtering follows the requested tracking
 level. SGR is preferred when requested, followed by urxvt, UTF-8, and legacy
 xterm encoding.
 
-Mouse wheel input is therefore never translated into arrow keys or tied to a
-specific terminal emulator. Applications that request mouse input receive it;
-all other wheel input is multiplexer history navigation.
+Mouse wheel input is translated into cursor navigation only when the
+application explicitly requests alternate scroll and its alternate screen is
+active. Applications that request mouse input receive it; remaining wheel input
+is multiplexer history navigation.
 
 Normal keyboard input and paste that are routed to a pane clear only the
 originating client's historical offset for that pane and request an immediate

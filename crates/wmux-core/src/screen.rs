@@ -164,6 +164,7 @@ pub struct Screen {
     damage_journal: VecDeque<DamageBatch>,
     bracketed_paste: bool,
     win32_input_mode: bool,
+    alternate_scroll: bool,
     mouse_modes: MouseModes,
     synchronized_output: bool,
     synchronized_output_epoch: u64,
@@ -195,6 +196,7 @@ impl Screen {
             damage_journal: VecDeque::with_capacity(DAMAGE_JOURNAL_CAPACITY),
             bracketed_paste: false,
             win32_input_mode: false,
+            alternate_scroll: false,
             mouse_modes: MouseModes::default(),
             synchronized_output: false,
             synchronized_output_epoch: 0,
@@ -281,6 +283,23 @@ impl Screen {
 
     pub(crate) fn set_win32_input_mode(&mut self, enabled: bool) {
         self.win32_input_mode = enabled;
+    }
+
+    pub(crate) fn set_alternate_scroll(&mut self, enabled: bool) {
+        self.alternate_scroll = enabled;
+    }
+
+    pub fn encode_alternate_scroll(&self, event: MouseEvent) -> Option<Vec<u8>> {
+        if !self.alternate_active || !self.alternate_scroll {
+            return None;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => Some(b"\x1b[A".to_vec()),
+            MouseEventKind::ScrollDown => Some(b"\x1b[B".to_vec()),
+            MouseEventKind::ScrollLeft => Some(b"\x1b[D".to_vec()),
+            MouseEventKind::ScrollRight => Some(b"\x1b[C".to_vec()),
+            _ => None,
+        }
     }
 
     pub fn set_mouse_mode(&mut self, mode: u16, enabled: bool) {

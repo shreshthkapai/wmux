@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.6] - 2026-08-25
+
+### Fixed
+
+- Applications that request alternate-screen wheel navigation now receive
+  cursor navigation input instead of losing wheel events in an alternate
+  buffer with no multiplexer scrollback.
+
 ## [1.0.5] - 2026-08-25
 
 ### Fixed
