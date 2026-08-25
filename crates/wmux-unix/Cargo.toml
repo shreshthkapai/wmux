@@ -19,15 +19,15 @@ crossterm.workspace = true
 libc.workspace = true
 nix.workspace = true
 tokio.workspace = true
-wmux-platform = { path = "../wmux-platform", version = "=1.0.8" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.9" }
 
 [target.'cfg(unix)'.dependencies]
 close_fds.workspace = true
 
 [dev-dependencies]
-wmux-config = { path = "../wmux-config", version = "=1.0.8" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.8" }
-wmux-server = { path = "../wmux-server", version = "=1.0.8" }
+wmux-config = { path = "../wmux-config", version = "=1.0.9" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.9" }
+wmux-server = { path = "../wmux-server", version = "=1.0.9" }
 
 [lints]
 workspace = true

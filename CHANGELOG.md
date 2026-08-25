@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.9] - 2026-08-25
+
+### Fixed
+
+- Plain pane clicks now change focus without entering copy mode or replacing
+  the pane application's cursor with a selection cursor. Mouse selection
+  remains available after explicitly entering copy mode.
+
 ## [1.0.8] - 2026-08-25
 
 ### Fixed

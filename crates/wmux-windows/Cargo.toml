@@ -18,12 +18,12 @@ path = "src/lib.rs"
 crossterm.workspace = true
 tokio.workspace = true
 windows-sys.workspace = true
-wmux-platform = { path = "../wmux-platform", version = "=1.0.8" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.9" }
 
 [dev-dependencies]
-wmux-config = { path = "../wmux-config", version = "=1.0.8" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.8" }
-wmux-server = { path = "../wmux-server", version = "=1.0.8" }
+wmux-config = { path = "../wmux-config", version = "=1.0.9" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.9" }
+wmux-server = { path = "../wmux-server", version = "=1.0.9" }
 
 [lints]
 workspace = true

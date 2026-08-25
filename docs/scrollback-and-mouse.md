@@ -51,13 +51,11 @@ The state owner hit-tests the event against the current structural scene:
    history.
 5. Wheel-down moves five rows toward the live bottom and leaves history view at
    offset zero.
-6. In copy mode, wheel and left-drag events are consumed by the client's
-   server-owned copy state before application routing.
-7. When the application has not requested mouse tracking, a left press enters
-   server-owned copy selection at the clicked cell; drag extends the selection
-   and release copies it.
-8. Other non-wheel events without application mouse mode or copy mode remain
-   available for later UI routing.
+6. In explicit copy mode, wheel and left press, drag, and release events are
+   consumed by the client's server-owned copy state before application routing.
+7. Other button events without application mouse mode or explicit copy mode do
+   not move the pane application's authoritative cursor. A plain left press
+   only performs the focus change in step 1.
 
 Supported application modes are X10 (`9`), normal (`1000`), button-event
 (`1002`), any-event (`1003`), UTF-8 coordinates (`1005`), SGR (`1006`), and

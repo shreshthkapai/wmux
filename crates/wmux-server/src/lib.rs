@@ -3088,11 +3088,6 @@ impl ServerOwner {
                 .write_pane_input(pane, ClientInput::Bytes(bytes));
         }
 
-        if event.kind == MouseEventKind::Down && event.button == MouseButton::Left {
-            self.enter_copy_mode(client).map_err(io::Error::other)?;
-            return self.handle_client_mouse(client, event);
-        }
-
         let delta = match event.kind {
             MouseEventKind::ScrollUp => 5_isize,
             MouseEventKind::ScrollDown => -5_isize,
@@ -6331,7 +6326,7 @@ mod tests {
     }
 
     #[test]
-    fn default_left_drag_starts_server_owned_text_selection() {
+    fn explicit_copy_mode_left_press_starts_server_owned_text_selection() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner.runtime.state.create_session("mouse-copy", 20, 3);
         owner
@@ -6348,6 +6343,7 @@ mod tests {
         view.attached = true;
         view.size = TerminalSize::new(20, 3);
         owner.clients.insert(client, view);
+        owner.enter_copy_mode(client).unwrap();
 
         owner
             .handle_event(ServerEvent::ClientMouse {
@@ -6371,9 +6367,10 @@ mod tests {
     }
 
     #[test]
-    fn left_press_focuses_an_inactive_pane_before_starting_selection() {
+    fn plain_left_press_focuses_inactive_pane_without_entering_copy_mode() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner.runtime.state.create_session("mouse-focus", 80, 24);
+        owner.runtime.apply_pty_output(created.pane, b"prompt>x");
         let second = owner
             .runtime
             .state
@@ -6398,6 +6395,16 @@ mod tests {
         owner.clients.insert(client, view);
 
         assert_eq!(owner.active_pane_for_client(client), Some(second));
+        assert_eq!(
+            owner
+                .runtime
+                .state
+                .pane(created.pane)
+                .unwrap()
+                .screen
+                .cursor(),
+            (0, 8)
+        );
 
         owner
             .handle_event(ServerEvent::ClientMouse {
@@ -6413,12 +6420,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.active_pane_for_client(client), Some(created.pane));
+        assert!(owner.clients[&client].copy_mode.is_none());
         assert_eq!(
-            owner.clients[&client]
-                .copy_mode
-                .as_ref()
-                .map(|mode| mode.pane),
-            Some(created.pane)
+            owner
+                .runtime
+                .state
+                .pane(created.pane)
+                .unwrap()
+                .screen
+                .cursor(),
+            (0, 8)
         );
         assert!(owner.clients[&client].scheduler.deadline.is_some());
     }
