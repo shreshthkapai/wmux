@@ -36,10 +36,17 @@ Search input is rendered in the pane's final row until Enter or Escape. Search,
 selection extraction, and viewport materialization all operate on the same
 canonical history lines used by scrollback; no raw PTY output is replayed.
 
+Outside explicit copy mode, a left press is held as a client-scoped pending
+gesture until the pointer moves. Dragging enters copy mode at the original
+press cell; releasing copies and exits. A click without movement never creates
+a selection. Shift forces this copy gesture when the pane application has
+requested mouse tracking. Right-click pastes the newest wmux buffer when
+application mouse routing is not active, and Shift plus right-click forces that
+paste override.
+
 ## Clipboard Boundary
 
 Copy completion emits a versioned `Clipboard` IPC message. The disposable
-client asks its platform backend to claim the system clipboard. On Windows this
-uses `CF_UNICODETEXT`; the server and core contain no Windows handles or
-clipboard APIs. Future Unix and macOS clients implement the same semantic
-message with their native clipboard integration.
+client asks its platform backend to claim the system clipboard. Windows uses
+`CF_UNICODETEXT`; Unix and macOS clients emit one bounded OSC 52 transaction.
+The server and core contain no platform clipboard APIs.

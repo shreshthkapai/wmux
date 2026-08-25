@@ -30,9 +30,9 @@ use wmux_core::{
 };
 use wmux_platform::{
     AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
-    MouseEventKind, PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent, PlatformJobId,
-    PlatformPaneId, PlatformRequest, PtyBackend, ServerPlatform, SpawnJob, SpawnPane, TerminalSize,
-    TerminationMode,
+    MouseEventKind, MouseModifiers, PeerIdentity, PlatformError, PlatformErrorKind, PlatformEvent,
+    PlatformJobId, PlatformPaneId, PlatformRequest, PtyBackend, ServerPlatform, SpawnJob,
+    SpawnPane, TerminalSize, TerminationMode,
 };
 use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
@@ -1329,9 +1329,17 @@ struct ClientView {
     capabilities: RenderCapabilities,
     scroll_offsets: BTreeMap<PaneId, usize>,
     copy_mode: Option<CopyMode>,
+    pending_mouse_selection: Option<PendingMouseSelection>,
     suppress_focus_mouse_gesture: bool,
     control: Option<ControlClient>,
     current_dir: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct PendingMouseSelection {
+    pane: PaneId,
+    terminal_column: u16,
+    terminal_row: u16,
 }
 
 struct ControlClient {
@@ -1376,6 +1384,7 @@ impl ClientView {
             },
             scroll_offsets: BTreeMap::new(),
             copy_mode: None,
+            pending_mouse_selection: None,
             suppress_focus_mouse_gesture: false,
             control: None,
             current_dir,
@@ -3035,11 +3044,15 @@ impl ServerOwner {
             if self.runtime.state.select_pane(window, pane).is_none() {
                 return Ok(());
             }
+            let shift_override = event.modifiers.contains(MouseModifiers::SHIFT);
             if let Some(view) = self.clients.get_mut(&client) {
-                view.suppress_focus_mouse_gesture = true;
+                view.pending_mouse_selection = None;
+                view.suppress_focus_mouse_gesture = !shift_override;
             }
             self.request_all_attached_renders(RenderCause::Structural);
-            return Ok(());
+            if !shift_override {
+                return Ok(());
+            }
         }
 
         if self
@@ -3092,6 +3105,81 @@ impl ServerOwner {
                 self.store_copy_and_update_clipboard(client, bytes);
             }
             return Ok(());
+        }
+
+        let application_mouse_enabled = self
+            .runtime
+            .state
+            .pane(pane)
+            .is_some_and(|pane| pane.screen.application_mouse_enabled());
+        let selection_override =
+            event.modifiers.contains(MouseModifiers::SHIFT) || !application_mouse_enabled;
+
+        if event.button == MouseButton::Left && selection_override {
+            match event.kind {
+                MouseEventKind::Down => {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.pending_mouse_selection = Some(PendingMouseSelection {
+                            pane,
+                            terminal_column: event.column,
+                            terminal_row: event.row,
+                        });
+                    }
+                    return Ok(());
+                }
+                MouseEventKind::Drag => {
+                    let pending = self
+                        .clients
+                        .get_mut(&client)
+                        .and_then(|view| view.pending_mouse_selection.take())
+                        .filter(|pending| pending.pane == pane);
+                    let Some(pending) = pending else {
+                        return Ok(());
+                    };
+                    self.enter_copy_mode(client).map_err(io::Error::other)?;
+                    self.handle_client_mouse(
+                        client,
+                        MouseEvent {
+                            kind: MouseEventKind::Down,
+                            button: MouseButton::Left,
+                            modifiers: event.modifiers,
+                            column: pending.terminal_column,
+                            row: pending.terminal_row,
+                        },
+                    )?;
+                    return self.handle_client_mouse(client, event);
+                }
+                MouseEventKind::Up => {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.pending_mouse_selection = None;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if event.button == MouseButton::Right && selection_override {
+            if event.kind == MouseEventKind::Down {
+                self.enqueue_command_list(
+                    client,
+                    CommandList::new(vec![Command::PasteBuffer {
+                        name: None,
+                        delete: false,
+                        bracketed: true,
+                        target: None,
+                    }])
+                    .expect("one mouse paste command is within the list bound"),
+                    CommandSource::KeyBinding,
+                );
+            }
+            return Ok(());
+        }
+
+        if event.kind == MouseEventKind::Down && event.button == MouseButton::Left {
+            if let Some(view) = self.clients.get_mut(&client) {
+                view.pending_mouse_selection = None;
+            }
         }
 
         let application_input = self
@@ -6392,6 +6480,145 @@ mod tests {
             .expect("left drag enters copy selection");
         assert!(selection.anchor().is_some());
         assert_eq!(selection.cursor().column, 1);
+    }
+
+    #[test]
+    fn normal_mouse_drag_copies_without_turning_a_plain_click_into_copy_mode() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("mouse-drag-copy", 20, 3);
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"alpha\r\nbeta\r\ngamma");
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        for (kind, column) in [
+            (MouseEventKind::Down, 0),
+            (MouseEventKind::Drag, 4),
+            (MouseEventKind::Up, 4),
+        ] {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: MouseEvent {
+                        kind,
+                        button: MouseButton::Left,
+                        modifiers: MouseModifiers::default(),
+                        column,
+                        row: 0,
+                    },
+                })
+                .unwrap();
+        }
+
+        assert!(owner.clients[&client].copy_mode.is_none());
+        assert_eq!(
+            owner.runtime.state.paste_buffers.get(None).unwrap().data(),
+            b"alpha"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Outbound::Message(wmux_protocol::Message::Clipboard(bytes)) if bytes == b"alpha"
+        ));
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 2,
+                    row: 1,
+                },
+            })
+            .unwrap();
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Up,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 2,
+                    row: 1,
+                },
+            })
+            .unwrap();
+        assert!(owner.clients[&client].copy_mode.is_none());
+    }
+
+    #[test]
+    fn shift_mouse_overrides_application_tracking_and_right_click_pastes_latest_buffer() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("mouse-override", 20, 3);
+        owner.runtime.apply_pty_output(
+            created.pane,
+            b"alpha\r\nbeta\r\ngamma\x1b[?1002h\x1b[?1006h",
+        );
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        for (kind, column) in [
+            (MouseEventKind::Down, 0),
+            (MouseEventKind::Drag, 4),
+            (MouseEventKind::Up, 4),
+        ] {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: MouseEvent {
+                        kind,
+                        button: MouseButton::Left,
+                        modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                        column,
+                        row: 0,
+                    },
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            owner.runtime.state.paste_buffers.get(None).unwrap().data(),
+            b"alpha"
+        );
+        assert!(owner.runtime.test_inputs.is_empty());
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Right,
+                    modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                    column: 1,
+                    row: 1,
+                },
+            })
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.process_pending_pastes());
+        assert_eq!(
+            owner.runtime.test_inputs,
+            [(created.pane, b"alpha".to_vec())]
+        );
     }
 
     #[test]

@@ -7,6 +7,20 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.11] - 2026-08-25
+
+### Fixed
+
+- Erasing saved terminal lines now removes canonical scrollback without
+  clearing the live screen, preventing cleared prompt history from being
+  reflowed into a pane after a layout or width change.
+- Attached clients now request report-all keyboard events and preserve
+  `Ctrl+Enter` and `Shift+Enter` as distinct CSI-u input for interactive
+  applications on every supported platform.
+- Mouse drag now starts server-owned selection only after movement, leaving
+  plain clicks available for pane focus. Shift overrides application mouse
+  tracking for selection, and right-click pastes the latest wmux buffer.
+
 ## [1.0.10] - 2026-08-25
 
 ### Fixed

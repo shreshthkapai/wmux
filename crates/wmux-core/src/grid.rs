@@ -760,6 +760,15 @@ impl Grid {
         }
     }
 
+    pub fn clear_history(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        self.history.clear();
+        self.history_rows = 0;
+        self.invalidate_history_cache();
+    }
+
     pub fn scroll_up_whole_screen(&mut self, count: u16) {
         for _ in 0..count.max(1) {
             if self.visible.is_empty() {

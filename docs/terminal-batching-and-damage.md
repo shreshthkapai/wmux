@@ -20,6 +20,11 @@ cell writes for non-ASCII text. Other callbacks become semantic operations for
 cursor movement, clears, scrolling, insertion/deletion, modes, styles, and
 saved cursor state.
 
+Erase-in-display mode 3 removes canonical saved lines without changing live
+screen cells or cursor position. Shell clear sequences that issue mode 2 and
+then mode 3 therefore clear both the viewport and scrollback, so erased wrapped
+history cannot return through a later reflow.
+
 `TerminalEngine` owns and reuses this batch workspace. Clearing a batch retains
 the text and operation capacities established by bounded PTY chunks, so
 sustained TUI output does not allocate a new parser workspace for every read.

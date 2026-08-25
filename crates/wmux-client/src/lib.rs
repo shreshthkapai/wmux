@@ -358,7 +358,7 @@ async fn attached_command(
 ) -> io::Result<()> {
     let _mode = terminal.enter().map_err(PlatformError::into_io)?;
     terminal
-        .write_output(b"\x1b[?1049h\x1b[?2004h\x1b[>1u\x1b[?1002h\x1b[?1006h\x1b[?25h\x1b[H\x1b[2J")
+        .write_output(b"\x1b[?1049h\x1b[?2004h\x1b[>9u\x1b[?1002h\x1b[?1006h\x1b[?25h\x1b[H\x1b[2J")
         .map_err(PlatformError::into_io)?;
 
     let result = attached_inner(pipe, command, capabilities, Arc::clone(&terminal)).await;
@@ -1390,7 +1390,7 @@ mod tests {
         server_task.await.unwrap();
 
         let writes = writes.lock().unwrap();
-        assert!(writes[0].windows(5).any(|bytes| bytes == b"\x1b[>1u"));
+        assert!(writes[0].windows(5).any(|bytes| bytes == b"\x1b[>9u"));
         assert!(writes[0].windows(8).any(|bytes| bytes == b"\x1b[?1002h"));
         assert!(!writes[0].windows(8).any(|bytes| bytes == b"\x1b[?1003h"));
         assert!(writes[1].windows(4).any(|bytes| bytes == b"\x1b[<u"));

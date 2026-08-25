@@ -26,12 +26,12 @@ authoritative bracketed-paste mode. It then emits either the payload or
 keeps terminal input decoding in the client while pane mode and PTY translation
 remain server concerns.
 
-During attachment, wmux requests the terminal keyboard disambiguation mode and
-restores the previous mode on exit. Plain Enter remains carriage return,
-Alt+Enter remains the legacy escape-plus-return sequence, Ctrl+J remains line
-feed, and other modified Enter events retain their identity through CSI-u
-encoding. This prevents terminal hosts from collapsing distinct modified keys
-before the server routes them to the pane.
+During attachment, wmux requests report-all keyboard events together with
+terminal keyboard disambiguation and restores the previous mode on exit. Plain
+Enter remains carriage return, Alt+Enter remains the legacy escape-plus-return
+sequence, Ctrl+J remains line feed, and other modified Enter events retain their
+identity through CSI-u encoding. This prevents terminal hosts from collapsing
+distinct modified keys before the server routes them to the pane.
 
 The pane screen also tracks private input mode `9001` as authoritative terminal
 state. When a pane enables that mode, the server translates each routed

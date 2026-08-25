@@ -245,6 +245,9 @@ impl KeyCode {
                 }
                 output.push(if control { 0x08 } else { 0x7f });
             }
+            BareKey::Enter if shift || control || modifiers.contains(KeyModifiers::SUPER) => {
+                append_csi_u_key(output, 13, special_modifiers);
+            }
             BareKey::Enter => append_simple_key(output, b'\r', alt),
             BareKey::Tab if shift => output.extend_from_slice(b"\x1b[Z"),
             BareKey::Tab => append_simple_key(output, b'\t', alt),
@@ -270,6 +273,14 @@ fn append_simple_key(output: &mut Vec<u8>, byte: u8, alt: bool) {
         output.push(0x1b);
     }
     output.push(byte);
+}
+
+fn append_csi_u_key(output: &mut Vec<u8>, codepoint: u8, modifiers: u8) {
+    output.extend_from_slice(b"\x1b[");
+    append_decimal(output, codepoint);
+    output.push(b';');
+    append_decimal(output, modifiers);
+    output.push(b'u');
 }
 
 fn control_byte(character: char) -> Option<u8> {
@@ -1360,6 +1371,8 @@ mod tests {
             ("M-x", b"\x1bx".as_slice()),
             ("Left", b"\x1b[D".as_slice()),
             ("C-Left", b"\x1b[1;5D".as_slice()),
+            ("S-Enter", b"\x1b[13;2u".as_slice()),
+            ("C-Enter", b"\x1b[13;5u".as_slice()),
             ("F12", b"\x1b[24~".as_slice()),
             ("S-F2", b"\x1b[1;2Q".as_slice()),
         ] {

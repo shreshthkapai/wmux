@@ -205,6 +205,13 @@ fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let mut bytes = match key.code {
         KeyCode::Backspace => vec![if control { 0x08 } else { 0x7f }],
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            modified_enter_bytes(key.modifiers)
+        }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -232,6 +239,15 @@ fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+fn modified_enter_bytes(modifiers: KeyModifiers) -> Vec<u8> {
+    let parameter = 1
+        + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL))
+        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER));
+    format!("\x1b[13;{parameter}u").into_bytes()
 }
 
 fn encode_control_character(ch: char) -> Option<Vec<u8>> {
@@ -465,7 +481,13 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
                 TerminalKeyCode::Enter,
                 TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT),
-                vec![b'\r'],
+                b"\x1b[13;2u".to_vec(),
+            ),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                TerminalKeyCode::Enter,
+                TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
+                b"\x1b[13;5u".to_vec(),
             ),
             (
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),

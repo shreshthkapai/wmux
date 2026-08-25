@@ -753,6 +753,39 @@ mod tests {
     }
 
     #[test]
+    fn erase_saved_lines_drops_scrollback_without_touching_the_live_screen() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(8, 2);
+        engine.feed(&mut screen, b"old-one\r\nold-two\r\nlive");
+        assert!(screen.grid().history_len() > 0);
+
+        engine.feed(&mut screen, b"\x1b[3J");
+
+        assert_eq!(screen.grid().history_len(), 0);
+        assert_eq!(screen.grid().line(0).unwrap().text(), "old-two");
+        assert_eq!(screen.grid().line(1).unwrap().text(), "live");
+        assert_eq!(screen.cursor(), (1, 4));
+    }
+
+    #[test]
+    fn shell_clear_sequence_cannot_reflow_erased_history_back_into_the_pane() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(10, 3);
+        engine.feed(
+            &mut screen,
+            b"stale-output-one\r\nstale-output-two\r\nold-prompt",
+        );
+
+        engine.feed(&mut screen, b"\x1b[H\x1b[2J\x1b[3Jnew-prompt");
+        screen.resize(6, 3);
+
+        assert_eq!(screen.grid().history_len(), 0);
+        assert_eq!(screen.grid().line(0).unwrap().text(), "new-pr");
+        assert_eq!(screen.grid().line(1).unwrap().text(), "ompt");
+        assert_eq!(screen.grid().line(2).unwrap().text(), "");
+    }
+
+    #[test]
     fn explicit_scroll_up_preserves_top_anchored_region_history() {
         let mut engine = TerminalEngine::new();
         let mut screen = Screen::new(20, 5);

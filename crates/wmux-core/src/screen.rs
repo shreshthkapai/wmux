@@ -810,7 +810,8 @@ impl Screen {
     pub fn clear_screen_mode(&mut self, mode: u16) {
         self.pending_wrap = false;
         match mode {
-            2 | 3 => self.clear_screen(),
+            2 => self.clear_screen(),
+            3 => self.grid_mut().clear_history(),
             1 => {
                 let row = self.cursor_row;
                 let col = self.cursor_col;

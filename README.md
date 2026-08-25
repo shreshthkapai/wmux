@@ -103,6 +103,11 @@ Run `wmux list-keys` for the authoritative table. See the
 [command and key model](docs/command-key-model.md) for command,
 target, repeat, prompt, and confirmation behavior.
 
+Mouse drag selects and copies once movement begins; a plain click only focuses
+a pane. Shift overrides application mouse tracking for selection, and
+right-click pastes the latest wmux buffer. `Ctrl+Enter` and `Shift+Enter` remain
+distinct for multiline terminal applications that support CSI-u input.
+
 ## Configuration
 
 ```sh
