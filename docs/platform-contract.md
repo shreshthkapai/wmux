@@ -89,8 +89,13 @@ The reader and direct-child waiter report independently. The adapter coalesces
 their results into the same portable ordering used by ConPTY: all queued output,
 at most one `PtyExited`, then exactly one `PtyClosed`. The terminal guard saves
 the exact original termios state, applies raw mode, and restores the saved state
-on every drop path. Detached daemon startup creates a new session and disconnects
-standard streams without invoking a shell.
+on every drop path. Unix terminal input uses the dependency's level-triggered
+`/dev/tty` event source so a read that fills its 1,024-byte scratch buffer cannot
+strand the unread tail of a keyboard, paste, or mouse burst until another byte
+arrives. A real controlling-PTY regression sends 100 complete SGR mouse reports
+in one 1,200-byte write and requires all 100 semantic events without a wake-up
+write. Detached daemon startup creates a new session and disconnects standard
+streams without invoking a shell.
 
 ## Conformance and change rule
 

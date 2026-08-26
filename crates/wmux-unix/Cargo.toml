@@ -15,7 +15,7 @@ name = "wmux_unix"
 path = "src/lib.rs"
 
 [dependencies]
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["use-dev-tty"] }
 libc.workspace = true
 nix.workspace = true
 tokio.workspace = true
