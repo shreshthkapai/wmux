@@ -83,16 +83,19 @@ fn one_large_terminal_write_delivers_every_complete_event() {
     let flags = OFlag::from_bits_truncate(
         fcntl(&master, FcntlArg::F_GETFL).expect("master flags are readable"),
     );
-    fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        .expect("master becomes nonblocking");
+    let nonblocking_flags = flags | OFlag::O_NONBLOCK;
+    fcntl(&master, FcntlArg::F_SETFL(nonblocking_flags)).expect("master becomes nonblocking");
 
     let mut output = Vec::new();
     wait_for_marker(&mut master, &mut output, READY, &mut child);
     let report = b"\x1b[<64;10;10M";
-    assert_eq!(report.len() * 100, 1_200);
-    master
-        .write_all(&report.repeat(100))
-        .expect("one large terminal write succeeds");
+    let burst = report.repeat(100);
+    assert_eq!(burst.len(), 1_200);
+    fcntl(&master, FcntlArg::F_SETFL(flags)).expect("master becomes blocking for one write");
+    let written = master.write(&burst).expect("one terminal write succeeds");
+    assert_eq!(written, burst.len(), "one terminal write accepts the burst");
+    fcntl(&master, FcntlArg::F_SETFL(nonblocking_flags))
+        .expect("master returns to nonblocking reads");
     wait_for_marker(&mut master, &mut output, COMPLETE, &mut child);
 
     let status = child.wait().expect("PTY child exits");
