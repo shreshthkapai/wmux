@@ -48,16 +48,18 @@ The state owner hit-tests the event against the current structural scene:
    until movement. A release without movement is a plain click; the first drag
    enters server-owned copy mode at the original press cell. Release copies the
    selection and returns to the live pane.
-3. Shift plus left drag takes the same selection path even when the application
-   requested mouse tracking. Shift plus right-click, or an ordinary right-click
-   without application tracking, queues the newest wmux buffer for bracketed
-   paste.
+3. Alt or Shift plus left drag takes the same selection path even when the
+   application requested mouse tracking. Alt or Shift plus right-click, or an
+   ordinary right-click without application tracking, queues the newest wmux
+   buffer for bracketed paste.
 4. Outside those multiplexer gestures, if the target pane has requested DEC
    mouse tracking, wmux translates the event to pane-relative coordinates and
    sends it to that pane.
 5. Otherwise, if the application has enabled alternate scroll (`1007`) and its
-   alternate screen is active, wmux translates wheel input to cursor navigation
-   and sends it to that pane.
+   alternate screen is active, wmux translates each vertical wheel event to
+   three cursor-navigation steps and sends the batch to that pane in one PTY
+   write. This keeps full-screen and inline TUIs responsive without multiplying
+   IPC or backend writes.
 6. Otherwise, wheel-up moves that client's target-pane viewport five rows into
    history.
 7. Wheel-down moves five rows toward the live bottom and leaves history view at

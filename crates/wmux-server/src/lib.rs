@@ -3044,13 +3044,14 @@ impl ServerOwner {
             if self.runtime.state.select_pane(window, pane).is_none() {
                 return Ok(());
             }
-            let shift_override = event.modifiers.contains(MouseModifiers::SHIFT);
+            let selection_override = event.modifiers.contains(MouseModifiers::SHIFT)
+                || event.modifiers.contains(MouseModifiers::ALT);
             if let Some(view) = self.clients.get_mut(&client) {
                 view.pending_mouse_selection = None;
-                view.suppress_focus_mouse_gesture = !shift_override;
+                view.suppress_focus_mouse_gesture = !selection_override;
             }
             self.request_all_attached_renders(RenderCause::Structural);
-            if !shift_override {
+            if !selection_override {
                 return Ok(());
             }
         }
@@ -3112,8 +3113,9 @@ impl ServerOwner {
             .state
             .pane(pane)
             .is_some_and(|pane| pane.screen.application_mouse_enabled());
-        let selection_override =
-            event.modifiers.contains(MouseModifiers::SHIFT) || !application_mouse_enabled;
+        let selection_override = event.modifiers.contains(MouseModifiers::SHIFT)
+            || event.modifiers.contains(MouseModifiers::ALT)
+            || !application_mouse_enabled;
 
         if event.button == MouseButton::Left && selection_override {
             match event.kind {
@@ -4101,12 +4103,12 @@ fn text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pane_events, handshake, read_async_message, render_full_for_client,
-        run_with_platform_and_config, write_async_message, write_outbound_messages,
-        ClientRenderSpec, ClientView, FrameScheduler, Outbound, OutputBudget, RenderCause, Runtime,
-        ServerOwner, TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle,
-        COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME,
-        THEME_PROVIDER_OUTPUT_BYTES,
+        collect_pane_events, handshake, pane_viewports_for_client, read_async_message,
+        render_full_for_client, run_with_platform_and_config, write_async_message,
+        write_outbound_messages, ClientRenderSpec, ClientView, FrameScheduler, Outbound,
+        OutputBudget, RenderCause, Runtime, ServerOwner, TestJobBackend, TestJobHandle,
+        TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
+        PER_PANE_OUTPUT_TIME, THEME_PROVIDER_OUTPUT_BYTES,
     };
     use crate::theme_runtime::ThemeLoader;
     use std::{
@@ -6434,8 +6436,8 @@ mod tests {
         assert_eq!(
             owner.runtime.test_inputs,
             [
-                (created.pane, b"\x1b[A".to_vec()),
-                (created.pane, b"\x1b[B".to_vec()),
+                (created.pane, b"\x1b[A\x1b[A\x1b[A".to_vec()),
+                (created.pane, b"\x1b[B\x1b[B\x1b[B".to_vec()),
             ]
         );
         assert!(owner.clients[&client].scroll_offsets.is_empty());
@@ -6610,6 +6612,103 @@ mod tests {
                     modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
                     column: 1,
                     row: 1,
+                },
+            })
+            .unwrap();
+        assert!(owner.process_command_queue(COMMANDS_PER_TURN));
+        assert!(owner.process_pending_pastes());
+        assert_eq!(
+            owner.runtime.test_inputs,
+            [(created.pane, b"alpha".to_vec())]
+        );
+    }
+
+    #[test]
+    fn alt_drag_overrides_application_tracking_and_renders_the_selection() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("alt-mouse-copy", 20, 3);
+        owner.runtime.apply_pty_output(
+            created.pane,
+            b"alpha\r\nbeta\r\ngamma\x1b[?1002h\x1b[?1006h",
+        );
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        for (kind, column) in [(MouseEventKind::Down, 0), (MouseEventKind::Drag, 4)] {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: MouseEvent {
+                        kind,
+                        button: MouseButton::Left,
+                        modifiers: MouseModifiers::new(MouseModifiers::ALT),
+                        column,
+                        row: 0,
+                    },
+                })
+                .unwrap();
+        }
+
+        let mut offsets = owner.clients[&client].scroll_offsets.clone();
+        let copy_mode = owner.clients[&client]
+            .copy_mode
+            .clone()
+            .expect("Alt-drag enters server-owned selection");
+        let viewports =
+            pane_viewports_for_client(&mut owner.runtime, client, &mut offsets, Some(&copy_mode));
+        let selected_line = viewports
+            .iter()
+            .find(|viewport| viewport.pane == created.pane)
+            .and_then(|viewport| viewport.lines.first())
+            .expect("selected pane has a visible first line");
+        assert!(
+            selected_line
+                .cells()
+                .iter()
+                .take(5)
+                .all(|cell| cell.style().reverse),
+            "Alt-drag selection is visibly highlighted"
+        );
+        assert!(owner.runtime.test_inputs.is_empty());
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Up,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::new(MouseModifiers::ALT),
+                    column: 4,
+                    row: 0,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            owner.runtime.state.paste_buffers.get(None).unwrap().data(),
+            b"alpha"
+        );
+        assert!(owner.clients[&client].copy_mode.is_none());
+        assert!(owner.runtime.test_inputs.is_empty());
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Right,
+                    modifiers: MouseModifiers::new(MouseModifiers::ALT),
+                    column: 4,
+                    row: 0,
                 },
             })
             .unwrap();

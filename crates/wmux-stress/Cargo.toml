@@ -12,8 +12,8 @@ publish.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-wmux-config = { path = "../wmux-config", version = "=1.0.11" }
-wmux-core = { path = "../wmux-core", version = "=1.0.11" }
-wmux-platform = { path = "../wmux-platform", version = "=1.0.11" }
-wmux-protocol = { path = "../wmux-protocol", version = "=1.0.11" }
-wmux-server = { path = "../wmux-server", version = "=1.0.11" }
+wmux-config = { path = "../wmux-config", version = "=1.0.12" }
+wmux-core = { path = "../wmux-core", version = "=1.0.12" }
+wmux-platform = { path = "../wmux-platform", version = "=1.0.12" }
+wmux-protocol = { path = "../wmux-protocol", version = "=1.0.12" }
+wmux-server = { path = "../wmux-server", version = "=1.0.12" }

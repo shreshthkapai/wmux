@@ -39,10 +39,10 @@ canonical history lines used by scrollback; no raw PTY output is replayed.
 Outside explicit copy mode, a left press is held as a client-scoped pending
 gesture until the pointer moves. Dragging enters copy mode at the original
 press cell; releasing copies and exits. A click without movement never creates
-a selection. Shift forces this copy gesture when the pane application has
-requested mouse tracking. Right-click pastes the newest wmux buffer when
-application mouse routing is not active, and Shift plus right-click forces that
-paste override.
+a selection. Alt or Shift forces this copy gesture when the pane application
+has requested mouse tracking. Right-click pastes the newest wmux buffer when
+application mouse routing is not active, and Alt or Shift plus right-click
+forces that paste override.
 
 ## Clipboard Boundary
 

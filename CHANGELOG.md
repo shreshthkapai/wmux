@@ -7,6 +7,16 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.12] - 2026-08-26
+
+### Fixed
+
+- Alternate-screen wheel navigation now batches three cursor steps into one
+  pane write, making coding-agent and full-screen TUI scrolling faster without
+  multiplying IPC or PTY operations.
+- Alt-drag now joins Shift-drag as an application-mouse override, with visible
+  server-owned highlighting and clipboard copy in mouse-aware terminal apps.
+
 ## [1.0.11] - 2026-08-25
 
 ### Fixed

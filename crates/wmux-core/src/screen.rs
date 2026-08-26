@@ -294,8 +294,8 @@ impl Screen {
             return None;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => Some(b"\x1b[A".to_vec()),
-            MouseEventKind::ScrollDown => Some(b"\x1b[B".to_vec()),
+            MouseEventKind::ScrollUp => Some(b"\x1b[A\x1b[A\x1b[A".to_vec()),
+            MouseEventKind::ScrollDown => Some(b"\x1b[B\x1b[B\x1b[B".to_vec()),
             MouseEventKind::ScrollLeft => Some(b"\x1b[D".to_vec()),
             MouseEventKind::ScrollRight => Some(b"\x1b[C".to_vec()),
             _ => None,
