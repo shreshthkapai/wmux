@@ -66,7 +66,11 @@ fn one_large_terminal_write_delivers_every_complete_event() {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) == -1 {
+            #[cfg(target_os = "macos")]
+            let set_controlling_terminal = libc::c_ulong::from(libc::TIOCSCTTY);
+            #[cfg(not(target_os = "macos"))]
+            let set_controlling_terminal = libc::TIOCSCTTY;
+            if libc::ioctl(0, set_controlling_terminal, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
