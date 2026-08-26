@@ -7,6 +7,27 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.13] - 2026-08-26
+
+### Changed
+
+- Interactive output is published immediately after keyboard or mouse input,
+  paced application frames use a one-millisecond coalescing window, and
+  equivalent attached clients share immutable per-turn scene metadata.
+- Windows starts the persistent server through bounded in-process WMI, avoiding
+  the cold command-interpreter path while preserving the existing provider-owned
+  lifetime contract and compatibility fallback.
+- The complete release performance gate now runs on Windows, Linux, and macOS.
+
+### Fixed
+
+- Client command arguments now retain empty values, whitespace, quotes,
+  backslashes, control characters, and Unicode across IPC.
+- Unix terminal clients now drain complete keyboard, paste, and mouse bursts
+  even when one read fills the dependency's internal buffer.
+- Clients send their physical terminal size before attaching, and resize
+  publication waits at most four milliseconds for unsynchronized output.
+
 ## [1.0.12] - 2026-08-26
 
 ### Fixed

@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "wmux"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "tokio",
  "wmux-cli",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-bench"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -803,14 +803,14 @@ dependencies = [
 
 [[package]]
 name = "wmux-cli"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "wmux-core",
 ]
 
 [[package]]
 name = "wmux-config"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-conformance"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-core"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -839,14 +839,14 @@ dependencies = [
 
 [[package]]
 name = "wmux-platform"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "wmux-protocol"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "wmux-core",
  "wmux-platform",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-server"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "tokio",
  "wmux-config",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-stress"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "tokio",
  "wmux-config",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-unix"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "close_fds",
  "crossterm",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "wmux-windows"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "crossterm",
  "tokio",
