@@ -51,8 +51,11 @@ const IDLE_FRAME_THRESHOLD: Duration = Duration::from_millis(12);
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(4);
 const MAX_FRAME_DELAY: Duration = Duration::from_millis(8);
 const INPUT_PRIORITY_WINDOW: Duration = Duration::from_millis(50);
+const INPUT_BURST_INTERVAL: Duration = Duration::from_millis(3);
+const PACED_OUTPUT_MIN_INTERVAL: Duration = Duration::from_millis(3);
+const PACED_FRAME_DELAY: Duration = Duration::from_millis(1);
 const REDRAW_CYCLE_DELAY: Duration = Duration::from_millis(1);
-const RESIZE_REPAINT_QUIET: Duration = Duration::from_millis(16);
+const RESIZE_REPAINT_QUIET: Duration = Duration::from_millis(4);
 const RESIZE_REPAINT_MAX: Duration = Duration::from_millis(120);
 const CONTROL_EVENTS_PER_TURN: usize = 256;
 const COMMANDS_PER_TURN: usize = 64;
@@ -1258,7 +1261,10 @@ enum RenderCause {
 struct FrameScheduler {
     deadline: Option<Instant>,
     last_publish: Option<Instant>,
+    last_output_request: Option<Instant>,
+    last_input: Option<Instant>,
     burst_frames: u8,
+    input_burst: u8,
     input_priority_until: Option<Instant>,
 }
 
@@ -1267,12 +1273,24 @@ impl FrameScheduler {
         Self {
             deadline: None,
             last_publish: None,
+            last_output_request: None,
+            last_input: None,
             burst_frames: 0,
+            input_burst: 0,
             input_priority_until: None,
         }
     }
 
     fn note_input(&mut self, now: Instant) {
+        if self
+            .last_input
+            .is_some_and(|last| now.saturating_duration_since(last) < INPUT_BURST_INTERVAL)
+        {
+            self.input_burst = self.input_burst.saturating_add(1);
+        } else {
+            self.input_burst = 0;
+        }
+        self.last_input = Some(now);
         self.input_priority_until = Some(now + INPUT_PRIORITY_WINDOW);
     }
 
@@ -1281,16 +1299,36 @@ impl FrameScheduler {
         let idle = self
             .last_publish
             .is_none_or(|last| now.saturating_duration_since(last) >= IDLE_FRAME_THRESHOLD);
-        let deadline = if matches!(cause, RenderCause::Structural) {
+        let paced_output = matches!(cause, RenderCause::Output)
+            && self.last_output_request.is_some_and(|last| {
+                let interval = now.saturating_duration_since(last);
+                interval >= PACED_OUTPUT_MIN_INTERVAL && interval < IDLE_FRAME_THRESHOLD
+            });
+        if matches!(cause, RenderCause::Output) {
+            self.last_output_request = Some(now);
+        }
+        let deadline = if matches!(
+            cause,
+            RenderCause::Structural | RenderCause::SynchronizedCommit
+        ) {
             now
-        } else if input_priority || matches!(cause, RenderCause::SynchronizedCommit) {
-            now + REDRAW_CYCLE_DELAY
+        } else if input_priority {
+            if self.input_burst == 0 {
+                now
+            } else {
+                now + REDRAW_CYCLE_DELAY
+            }
         } else if idle {
             now
+        } else if paced_output {
+            now + PACED_FRAME_DELAY
         } else {
             let extra = u64::from((self.burst_frames / 4).min(4));
             now + (MIN_FRAME_DELAY + Duration::from_millis(extra)).min(MAX_FRAME_DELAY)
         };
+        if matches!(cause, RenderCause::Output) && input_priority {
+            self.input_priority_until = None;
+        }
         self.deadline = Some(
             self.deadline
                 .map_or(deadline, |pending| pending.min(deadline)),
@@ -2994,6 +3032,9 @@ impl ServerOwner {
     }
 
     fn handle_client_mouse(&mut self, client: ClientId, event: MouseEvent) -> io::Result<()> {
+        if let Some(view) = self.clients.get_mut(&client) {
+            view.scheduler.note_input(Instant::now());
+        }
         if self
             .clients
             .get(&client)
@@ -6193,10 +6234,57 @@ mod tests {
         scheduler.deadline = None;
         scheduler.note_input(sustained);
         scheduler.request(sustained, RenderCause::Output);
+        assert_eq!(scheduler.deadline, Some(sustained));
+    }
+
+    #[test]
+    fn paced_application_frames_use_a_short_coalescing_delay() {
+        let mut scheduler = FrameScheduler::new();
+        let start = Instant::now();
+        scheduler.request(start, RenderCause::Output);
+        scheduler.published(start);
+
+        let first_paced = start + Duration::from_millis(5);
+        scheduler.request(first_paced, RenderCause::Output);
         assert_eq!(
             scheduler.deadline,
-            Some(sustained + super::REDRAW_CYCLE_DELAY)
+            Some(first_paced + Duration::from_millis(1))
         );
+
+        scheduler.published(first_paced + Duration::from_millis(1));
+        let second_paced = start + Duration::from_millis(10);
+        scheduler.request(second_paced, RenderCause::Output);
+        assert_eq!(
+            scheduler.deadline,
+            Some(second_paced + Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn application_mouse_input_primes_an_immediate_response_frame() {
+        let (mut owner, client, pane) = attached_owner();
+        owner
+            .runtime
+            .apply_pty_output(pane, b"\x1b[?1000h\x1b[?1006h");
+        let published = Instant::now();
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .scheduler
+            .published(published);
+
+        owner
+            .handle_event(ServerEvent::ClientMouse {
+                client,
+                event: mouse(MouseEventKind::ScrollUp, 1, 1),
+            })
+            .unwrap();
+        let response = Instant::now();
+        let scheduler = &mut owner.clients.get_mut(&client).unwrap().scheduler;
+        scheduler.request(response, RenderCause::Output);
+
+        assert_eq!(scheduler.deadline, Some(response));
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -7368,6 +7456,20 @@ mod tests {
             .damage_journal()
             .back()
             .is_some_and(|batch| batch.operations.contains(&wmux_core::DamageOperation::Full)));
+    }
+
+    #[test]
+    fn resize_publication_quiet_budget_is_at_most_four_milliseconds() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("test", 80, 24);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
+        runtime.state.resize_window(created.window, 79, 24).unwrap();
+        runtime.apply_pending_pane_resizes().unwrap();
+
+        let hold = &runtime.resize_repaint_holds[&created.pane];
+        let started = hold.max_until - super::RESIZE_REPAINT_MAX;
+
+        assert!(hold.quiet_until.duration_since(started) <= Duration::from_millis(4));
     }
 
     #[test]

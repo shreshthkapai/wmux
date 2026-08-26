@@ -90,6 +90,17 @@ The existing client-scoped cell baseline remains the final correctness check
 for terminal output diffing. Generations avoid unnecessary scene work and
 detect journal gaps; they do not replace the authoritative grid.
 
+## Frame Scheduling
+
+Redraw deadlines reflect why a scene changed. Structural changes, synchronized
+commits, the first frame after an idle interval, and the first application
+response to keyboard or mouse input are eligible immediately. A rapid input
+burst is coalesced for at most one millisecond. Application output already
+paced into distinct frames receives the same short coalescing delay, while
+unpaced bulk output keeps the adaptive four-to-eight millisecond batching
+window. This preserves throughput without imposing the bulk-output delay on
+interactive work.
+
 ## Correctness Gates
 
 The benchmark crate retains the previous parser model under `cfg(test)` only.

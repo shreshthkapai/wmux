@@ -381,6 +381,17 @@ async fn attached_inner(
     capabilities: TerminalCapabilities,
     terminal: Arc<dyn TerminalBackend>,
 ) -> io::Result<()> {
+    let initial_size = terminal
+        .size()
+        .unwrap_or(wmux_platform::TerminalSize::new(80, 24));
+    write_async_message(
+        &mut pipe,
+        Message::Resize {
+            cols: initial_size.cols,
+            rows: initial_size.rows,
+        },
+    )
+    .await?;
     write_async_message(&mut pipe, Message::Command(command)).await?;
     match read_async_message(&mut pipe).await? {
         Some(Message::CommandOk(_)) => {}
@@ -399,17 +410,6 @@ async fn attached_inner(
         }
     }
 
-    let initial_size = terminal
-        .size()
-        .unwrap_or(wmux_platform::TerminalSize::new(80, 24));
-    write_async_message(
-        &mut pipe,
-        Message::Resize {
-            cols: initial_size.cols,
-            rows: initial_size.rows,
-        },
-    )
-    .await?;
     let done = Arc::new(AtomicBool::new(false));
 
     let (input_tx, input_rx) = async_mpsc::channel(1024);
@@ -1003,11 +1003,11 @@ fn terminal_capabilities() -> TerminalCapabilities {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_io_loop, attached_command, classify_attached_inbound, client_current_dir_text,
-        connect_with_startup_policy, control_io_loop, encode_command_argv, escape_control_bytes,
-        format_control_record, format_effective_config, handshake_read_error, no_server_message,
-        protocol_error, read_async_message, read_inbound_messages, retry_delays, send_key,
-        wire_key_event, write_async_message, AttachedInbound,
+        attach_io_loop, attached_command, attached_inner, classify_attached_inbound,
+        client_current_dir_text, connect_with_startup_policy, control_io_loop, encode_command_argv,
+        escape_control_bytes, format_control_record, format_effective_config, handshake_read_error,
+        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
+        send_key, wire_key_event, write_async_message, AttachedInbound,
     };
     use std::{
         cell::Cell,
@@ -1128,6 +1128,7 @@ mod tests {
 
     struct RecordingTerminal {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        size: TerminalSize,
     }
 
     impl TerminalBackend for RecordingTerminal {
@@ -1157,7 +1158,7 @@ mod tests {
         }
 
         fn size(&self) -> PlatformResult<TerminalSize> {
-            Ok(TerminalSize::new(80, 24))
+            Ok(self.size)
         }
     }
 
@@ -1347,6 +1348,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_client_sends_physical_size_before_attach_command() {
+        let expected = TerminalSize::new(137, 43);
+        let (client, mut server) = tokio::io::duplex(256);
+        let terminal = Arc::new(RecordingTerminal {
+            writes: Arc::new(Mutex::new(Vec::new())),
+            size: expected,
+        });
+
+        let client_task = tokio::spawn(attached_inner(
+            Box::new(client),
+            "attach-session".to_string(),
+            TerminalCapabilities::default(),
+            terminal,
+        ));
+        let first = read_async_message(&mut server).await.unwrap();
+        drop(server);
+        let _ = client_task.await.unwrap();
+
+        assert_eq!(
+            first,
+            Some(Message::Resize {
+                cols: expected.cols,
+                rows: expected.rows,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn attach_io_error_signals_the_terminal_input_thread_to_stop() {
         let (mut writer, _reader) = tokio::io::duplex(64);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
@@ -1400,8 +1429,13 @@ mod tests {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let terminal = Arc::new(RecordingTerminal {
             writes: Arc::clone(&writes),
+            size: TerminalSize::new(80, 24),
         });
         let server_task = tokio::spawn(async move {
+            assert!(matches!(
+                read_async_message(&mut server).await.unwrap(),
+                Some(Message::Resize { .. })
+            ));
             assert!(matches!(
                 read_async_message(&mut server).await.unwrap(),
                 Some(Message::Command(_))

@@ -63,3 +63,8 @@ forever. Releasing a hold marks the authoritative pane fully damaged, so every
 client independently transitions from its retained frame to the latest stable
 grid. Client-capable terminals wrap that transition in synchronized output.
 No intermediate application clear/blank frame is published.
+
+The unsynchronized quiet interval is four milliseconds. A client sends its
+physical terminal size before its attach command, so the initial authoritative
+layout is built at the real dimensions instead of rendering a default-sized
+scene and immediately replacing it.
