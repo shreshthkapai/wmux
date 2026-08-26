@@ -7,6 +7,17 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.14] - 2026-08-27
+
+### Fixed
+
+- Ctrl+Enter now produces the cross-platform line-feed default expected by
+  multiline terminal applications, while other modified Enter events remain
+  distinguishable when the terminal host reports them.
+- Split cursor hide, repaint, and show sequences retain each client's previous
+  complete frame for at most eight milliseconds, reducing cursor flicker during
+  animated terminal updates without delaying intentionally hidden cursors.
+
 ## [1.0.13] - 2026-08-26
 
 ### Changed

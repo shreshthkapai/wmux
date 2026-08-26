@@ -9,8 +9,8 @@ an explicit maintainer decision.
 
 - Initial release: `1.0.0`
 - Initial tag: `v1.0.0`
-- Current release: `1.0.13`
-- Current tag: `v1.0.13`
+- Current release: `1.0.14`
+- Current tag: `v1.0.14`
 - GitHub repository: `https://github.com/shreshthkapai/wmux`
 - Release type: normal GitHub release, not a prerelease
 - Release tool: dist 0.32.0
@@ -34,7 +34,7 @@ git diff --check
 Confirm the workspace version and changelog agree:
 
 ```powershell
-$version = "1.0.13"
+$version = "1.0.14"
 $tag = "v$version"
 Select-String -Path Cargo.toml -Pattern "version = `"$version`""
 Select-String -Path CHANGELOG.md -Pattern "^## \[$version\]"
@@ -159,7 +159,7 @@ required build jobs succeed. `dispatch-releases = true` also permits a failed
 pre-publication run to be retried without moving or replacing a tag.
 
 Never move a pushed release tag or replace a published immutable asset. Fixes
-receive a new patch version such as `1.0.13`.
+receive a new patch version such as `1.0.14`.
 
 ## 8. Validate published assets
 
