@@ -91,7 +91,13 @@ exit marker.
 ## Windows ownership rules
 
 - The daemon process is created by the local WMI provider in the calling user's
-  security context and is not a child lifetime of the terminal tab.
+  security context and is not a child lifetime of the terminal tab. The normal
+  path invokes `Win32_Process.Create` through in-process COM, avoiding a cold
+  command-interpreter startup. The COM call and fallback both have a five-second
+  caller deadline. If COM or WMI metadata cannot be initialized before the
+  create call, the bounded Windows PowerShell bootstrap remains a compatibility
+  fallback. An ambiguous or failed create call is never retried, preventing
+  duplicate daemons.
 - The daemon owns the named-pipe listener, server lock, state-owner thread, and
   all pane backends.
 - Each pane owns one kill-on-close Job Object. Pane, window, session, and server
@@ -133,3 +139,5 @@ trigger speculative implementation changes.
   <https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects>
 - Microsoft, Win32_ProcessStartup:
   <https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processstartup>
+- Microsoft, Win32_Process.Create:
+  <https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/create-method-in-class-win32-process>

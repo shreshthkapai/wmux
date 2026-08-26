@@ -28,6 +28,33 @@ pub struct DaemonSpec {
     pub current_dir: PathBuf,
 }
 
+pub(crate) struct DaemonStartupProperties {
+    pub(crate) command_line: String,
+    pub(crate) current_dir: String,
+    pub(crate) environment: Vec<String>,
+    pub(crate) create_flags: u32,
+}
+
+pub(crate) fn daemon_startup_properties(spec: &DaemonSpec) -> DaemonStartupProperties {
+    let command_line = std::iter::once(quote_windows_argument(spec.executable.as_os_str()))
+        .chain(
+            spec.arguments
+                .iter()
+                .map(|argument| quote_windows_argument(argument)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let environment = std::env::vars_os()
+        .map(|(name, value)| format!("{}={}", os_text(&name), os_text(&value)))
+        .collect();
+    DaemonStartupProperties {
+        command_line,
+        current_dir: path_text(&spec.current_dir),
+        environment,
+        create_flags: WMI_CREATE_FLAGS,
+    }
+}
+
 /// Quotes one argument according to the Windows command-line parsing rules.
 pub fn quote_windows_argument(argument: &OsStr) -> String {
     let argument = String::from_utf16_lossy(&argument.encode_wide().collect::<Vec<_>>());
@@ -68,6 +95,145 @@ pub fn quote_windows_argument(argument: &OsStr) -> String {
 /// creation relationship. This is necessary because terminal hosts can use
 /// kill-on-close Job Objects that deny normal child-process breakaway.
 pub fn spawn_user_daemon(spec: &DaemonSpec) -> io::Result<u32> {
+    match spawn_user_daemon_via_wmi_bounded(spec) {
+        Ok(pid) => Ok(pid),
+        Err(WmiLaunchError::BeforeLaunch(primary)) => {
+            spawn_user_daemon_via_powershell(spec).map_err(|fallback| {
+                io::Error::other(format!(
+                    "in-process WMI bootstrap failed ({primary}); PowerShell fallback failed: {fallback}"
+                ))
+            })
+        }
+        Err(WmiLaunchError::DuringLaunch(error)) => Err(error),
+    }
+}
+
+enum WmiLaunchError {
+    BeforeLaunch(io::Error),
+    DuringLaunch(io::Error),
+}
+
+fn spawn_user_daemon_via_wmi_bounded(spec: &DaemonSpec) -> Result<u32, WmiLaunchError> {
+    let spec = spec.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = result_tx.send(spawn_user_daemon_via_wmi(&spec));
+    });
+    match result_rx.recv_timeout(BOOTSTRAP_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(WmiLaunchError::DuringLaunch(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "in-process WMI daemon bootstrap timed out after {} ms",
+                    BOOTSTRAP_TIMEOUT.as_millis()
+                ),
+            )))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(WmiLaunchError::DuringLaunch(
+            io::Error::other("in-process WMI daemon bootstrap worker stopped unexpectedly"),
+        )),
+    }
+}
+
+fn spawn_user_daemon_via_wmi(spec: &DaemonSpec) -> Result<u32, WmiLaunchError> {
+    let properties = daemon_startup_properties(spec);
+    let connection = wmi::WMIConnection::new().map_err(|error| {
+        WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+            "initialize local WMI connection: {error}"
+        )))
+    })?;
+    let startup = connection
+        .get_object("Win32_ProcessStartup")
+        .and_then(|class| class.spawn_instance())
+        .map_err(|error| {
+            WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+                "create Win32_ProcessStartup parameters: {error}"
+            )))
+        })?;
+    startup
+        .put_property("ShowWindow", 0_u16)
+        .and_then(|()| startup.put_property("CreateFlags", properties.create_flags))
+        .and_then(|()| startup.put_property("EnvironmentVariables", properties.environment.clone()))
+        .map_err(|error| {
+            WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+                "configure Win32_ProcessStartup parameters: {error}"
+            )))
+        })?;
+
+    let process = connection.get_object("Win32_Process").map_err(|error| {
+        WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+            "load Win32_Process metadata: {error}"
+        )))
+    })?;
+    let method = process
+        .get_method("Create")
+        .map_err(|error| {
+            WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+                "load Win32_Process.Create metadata: {error}"
+            )))
+        })?
+        .ok_or_else(|| {
+            WmiLaunchError::BeforeLaunch(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Win32_Process.Create metadata is unavailable",
+            ))
+        })?;
+    let input = method.spawn_instance().map_err(|error| {
+        WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+            "create Win32_Process.Create parameters: {error}"
+        )))
+    })?;
+    input
+        .put_property("CommandLine", properties.command_line)
+        .and_then(|()| input.put_property("CurrentDirectory", properties.current_dir))
+        .and_then(|()| input.put_property("ProcessStartupInformation", startup))
+        .map_err(|error| {
+            WmiLaunchError::BeforeLaunch(io::Error::other(format!(
+                "configure Win32_Process.Create parameters: {error}"
+            )))
+        })?;
+
+    let output = connection
+        .exec_method("Win32_Process", "Create", Some(&input))
+        .map_err(|error| {
+            WmiLaunchError::DuringLaunch(io::Error::other(format!(
+                "invoke Win32_Process.Create: {error}"
+            )))
+        })?
+        .ok_or_else(|| {
+            WmiLaunchError::DuringLaunch(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Win32_Process.Create returned no result",
+            ))
+        })?;
+    let return_value =
+        wmi_u32_property(&output, "ReturnValue").map_err(WmiLaunchError::DuringLaunch)?;
+    if return_value != 0 {
+        return Err(WmiLaunchError::DuringLaunch(io::Error::other(format!(
+            "Win32_Process.Create failed: {return_value}"
+        ))));
+    }
+    let pid = wmi_u32_property(&output, "ProcessId").map_err(WmiLaunchError::DuringLaunch)?;
+    if pid == 0 {
+        return Err(WmiLaunchError::DuringLaunch(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Win32_Process.Create returned process ID zero",
+        )));
+    }
+    Ok(pid)
+}
+
+fn wmi_u32_property(output: &wmi::IWbemClassWrapper, name: &str) -> io::Result<u32> {
+    let value = output
+        .get_property(name)
+        .map_err(|error| io::Error::other(format!("read WMI property {name}: {error}")))?;
+    value
+        .try_into()
+        .map_err(|error| io::Error::other(format!("decode WMI property {name}: {error}")))
+}
+
+fn spawn_user_daemon_via_powershell(spec: &DaemonSpec) -> io::Result<u32> {
     let powershell = windows_powershell_path()?;
     let encoded_command = encode_powershell_command(&bootstrap_script(spec));
     let mut command = Command::new(powershell);
@@ -131,15 +297,7 @@ fn windows_powershell_path() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn bootstrap_script(spec: &DaemonSpec) -> String {
-    let command_line = std::iter::once(quote_windows_argument(spec.executable.as_os_str()))
-        .chain(
-            spec.arguments
-                .iter()
-                .map(|argument| quote_windows_argument(argument)),
-        )
-        .collect::<Vec<_>>()
-        .join(" ");
-    let current_dir = path_text(&spec.current_dir);
+    let properties = daemon_startup_properties(spec);
     format!(
         r#"$startupClass = Get-CimClass -ClassName Win32_ProcessStartup
 $startup = New-CimInstance -CimClass $startupClass -ClientOnly -Property @{{
@@ -155,8 +313,8 @@ $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Argument
 }}
 if ($result.ReturnValue -ne 0) {{ throw "Win32_Process.Create failed: $($result.ReturnValue)" }}
 [Console]::Out.Write($result.ProcessId)"#,
-        powershell_literal(&command_line),
-        powershell_literal(&current_dir),
+        powershell_literal(&properties.command_line),
+        powershell_literal(&properties.current_dir),
     )
 }
 
@@ -165,7 +323,11 @@ pub(crate) fn powershell_literal(value: &str) -> String {
 }
 
 fn path_text(path: &Path) -> String {
-    String::from_utf16_lossy(&path.as_os_str().encode_wide().collect::<Vec<_>>())
+    os_text(path.as_os_str())
+}
+
+fn os_text(value: &OsStr) -> String {
+    String::from_utf16_lossy(&value.encode_wide().collect::<Vec<_>>())
 }
 
 pub(crate) fn encode_powershell_command(script: &str) -> String {

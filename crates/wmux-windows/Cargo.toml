@@ -20,6 +20,9 @@ tokio.workspace = true
 windows-sys.workspace = true
 wmux-platform = { path = "../wmux-platform", version = "=1.0.12" }
 
+[target.'cfg(windows)'.dependencies]
+wmi = { version = "0.18.4", default-features = false }
+
 [dev-dependencies]
 wmux-config = { path = "../wmux-config", version = "=1.0.12" }
 wmux-protocol = { path = "../wmux-protocol", version = "=1.0.12" }

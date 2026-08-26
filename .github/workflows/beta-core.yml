@@ -208,8 +208,13 @@ jobs:
           retention-days: 14
 
   performance:
-    name: Windows release performance
-    runs-on: windows-latest
+    name: Release performance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust 1.96.0

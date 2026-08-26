@@ -13,9 +13,9 @@ mod platform_contract_tests;
 #[cfg(test)]
 mod daemon_tests {
     use crate::daemon::{
-        bootstrap_script, encode_powershell_command, powershell_literal, quote_windows_argument,
-        run_bounded_command, run_bounded_command_with_injected_drain_error, spawn_user_daemon,
-        DaemonSpec,
+        bootstrap_script, daemon_startup_properties, encode_powershell_command, powershell_literal,
+        quote_windows_argument, run_bounded_command, run_bounded_command_with_injected_drain_error,
+        spawn_user_daemon, DaemonSpec,
     };
     use std::{
         ffi::OsString,
@@ -226,6 +226,28 @@ mod daemon_tests {
     fn wait_for_pid(path: &std::path::Path) -> u32 {
         wait_for_pid_until(path, Instant::now() + Duration::from_secs(10))
             .expect("descendant PID was not written")
+    }
+
+    #[test]
+    fn daemon_in_process_wmi_properties_preserve_the_launch_contract() {
+        let spec = DaemonSpec {
+            executable: PathBuf::from(r"C:\Program Files\wmux\wmux-server.exe"),
+            arguments: vec![OsString::from("new-session"), OsString::from("two words")],
+            current_dir: PathBuf::from(r"C:\Users\O'Brien\work"),
+        };
+
+        let properties = daemon_startup_properties(&spec);
+
+        assert_eq!(properties.create_flags, 134_219_264);
+        assert_eq!(
+            properties.command_line,
+            r#""C:\Program Files\wmux\wmux-server.exe" new-session "two words""#
+        );
+        assert_eq!(properties.current_dir, r"C:\Users\O'Brien\work");
+        assert!(properties
+            .environment
+            .iter()
+            .all(|entry| entry.contains('=')));
     }
 
     fn wait_for_pid_until(path: &std::path::Path, deadline: Instant) -> Option<u32> {

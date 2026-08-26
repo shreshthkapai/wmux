@@ -26,8 +26,10 @@ The command exits nonzero if a required scenario is absent or any gate fails.
 
 Parser throughput for both Codex and Claude fixtures must remain above 40 MB/s.
 The thresholds are intentionally conservative enough for shared CI runners but
-strict enough to catch architectural regressions. Machine-specific benchmark
-baselines remain useful for optimization work and are recorded separately in
+strict enough to catch architectural regressions. The complete gate runs on
+Windows, Linux, and macOS so a native release cannot rely on performance
+evidence from only one operating system. Machine-specific benchmark baselines
+remain useful for optimization work and are recorded separately in
 `performance.md`.
 
 The performance command is not the only gate. Server tests enforce fixed pane
