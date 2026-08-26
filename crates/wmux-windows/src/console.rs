@@ -305,6 +305,9 @@ fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 vec![0x7f]
             }
         }
+        KeyCode::Enter if ctrl && !alt && !key.modifiers.contains(KeyModifiers::SUPER) => {
+            vec![b'\n']
+        }
         KeyCode::Enter
             if key
                 .modifiers
@@ -611,7 +614,7 @@ mod tests {
                 key(KeyCode::Enter, KeyModifiers::CONTROL),
                 TerminalKeyCode::Enter,
                 TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
-                b"\x1b[13;5u".to_vec(),
+                vec![b'\n'],
             ),
             (
                 key(KeyCode::Char(' '), KeyModifiers::CONTROL),

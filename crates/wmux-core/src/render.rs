@@ -760,20 +760,38 @@ pub fn build_window_scene_with_theme(
             .viewports
             .iter()
             .find(|viewport| viewport.pane == pane_id);
+        let use_previous_frame = viewport.is_none()
+            && retained.is_none()
+            && overrides.previous_frame_panes.contains(&pane_id)
+            && overrides
+                .previous
+                .is_some_and(|previous| previous.matches_size(cols, rows));
         if let Some(viewport) = viewport {
             draw_viewport(&mut lines, viewport, rect);
         } else if let Some(retained) = retained {
             draw_retained_frame(&mut lines, retained, rect);
-        } else if overrides.previous_frame_panes.contains(&pane_id)
-            && overrides
-                .previous
-                .is_some_and(|previous| previous.matches_size(cols, rows))
-        {
+        } else if use_previous_frame {
             copy_previous_rect(&mut lines, rect, overrides.previous.expect("checked above"));
         } else {
             draw_pane(&mut lines, pane_id, rect, state);
         }
         if pane_id == structure.active_pane {
+            let previous_cursor_belongs_to_pane = use_previous_frame
+                && overrides.previous.is_some_and(|previous| {
+                    let (row, column) = previous.cursor;
+                    column >= rect.x
+                        && column < rect.x.saturating_add(rect.cols)
+                        && row >= rect.y
+                        && row < rect.y.saturating_add(rect.rows)
+                });
+            if previous_cursor_belongs_to_pane {
+                let previous = overrides.previous.expect("checked above");
+                cursor = previous.cursor;
+                bracketed_paste = previous.bracketed_paste;
+                cursor_visible = previous.cursor_visible;
+                cursor_style = previous.cursor_style;
+                continue;
+            }
             let (row, col) = viewport
                 .and_then(|viewport| viewport.cursor)
                 .unwrap_or_else(|| {
@@ -2273,6 +2291,74 @@ mod tests {
         )
         .unwrap();
         assert!(String::from_utf8(committed).unwrap().contains("partial"));
+    }
+
+    #[test]
+    fn previous_frame_pane_preserves_its_cursor_state() {
+        let mut server = ServerState::new();
+        let created = server.create_session("held", 12, 3);
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"ready");
+        let initial = build_window_scene(&server, created.session, 12, 3).unwrap();
+        let mut previous = RenderState::new(12, 3);
+        let _ = super::render_full_scene(&initial, &mut previous);
+
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal
+            .feed(&mut pane.screen, b"\x1b[?25l\x1b[2;8Hpartial");
+        let held = build_window_scene_with_retained_panes(
+            &server,
+            created.session,
+            12,
+            3,
+            &[created.pane],
+            &[],
+            &previous,
+        )
+        .unwrap();
+
+        assert_eq!(held.lines, initial.lines);
+        assert_eq!(held.cursor, initial.cursor);
+        assert_eq!(held.cursor_visible, initial.cursor_visible);
+        assert_eq!(held.cursor_style, initial.cursor_style);
+    }
+
+    #[test]
+    fn previous_frame_does_not_reuse_another_active_panes_cursor() {
+        let mut server = ServerState::new();
+        let created = server.create_session("held", 20, 3);
+        let second = server
+            .split_pane(
+                created.window,
+                Some(created.pane),
+                SplitDirection::LeftRight,
+                20,
+                3,
+            )
+            .unwrap();
+        let pane = server.pane_mut(second).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"right");
+        let initial = build_window_scene(&server, created.session, 20, 3).unwrap();
+        let mut previous = RenderState::new(20, 3);
+        let _ = super::render_full_scene(&initial, &mut previous);
+
+        server.select_pane(created.window, created.pane).unwrap();
+        let pane = server.pane_mut(created.pane).unwrap();
+        pane.terminal.feed(&mut pane.screen, b"left\x1b[?25l");
+        let live = build_window_scene(&server, created.session, 20, 3).unwrap();
+        let held = build_window_scene_with_retained_panes(
+            &server,
+            created.session,
+            20,
+            3,
+            &[created.pane],
+            &[],
+            &previous,
+        )
+        .unwrap();
+
+        assert_eq!(held.cursor, live.cursor);
+        assert_eq!(held.cursor_visible, live.cursor_visible);
     }
 
     #[test]

@@ -110,6 +110,14 @@ emits only a real visibility change. Position, DECSCUSR shape, and final
 visibility remain post-render state. An application visibility change is never
 published before the content update it accompanies.
 
+Applications without an explicit synchronized-output transaction may split a
+single hide, repaint, and show sequence across multiple PTY reads. A visible to
+hidden transition therefore holds that pane against each client's previous
+complete baseline for at most 8 ms. Restoring the cursor releases the completed
+frame immediately; reaching the deadline publishes an intentionally hidden
+cursor. Parsing and input continue throughout the hold, and another pane's
+redraw cannot expose the intermediate cursor state.
+
 ## Adaptive scheduling
 
 There is no fixed repaint tick.

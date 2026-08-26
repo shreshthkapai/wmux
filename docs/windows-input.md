@@ -29,9 +29,10 @@ remain server concerns.
 During attachment, wmux requests report-all keyboard events together with
 terminal keyboard disambiguation and restores the previous mode on exit. Plain
 Enter remains carriage return, Alt+Enter remains the legacy escape-plus-return
-sequence, Ctrl+J remains line feed, and other modified Enter events retain their
-identity through CSI-u encoding. This prevents terminal hosts from collapsing
-distinct modified keys before the server routes them to the pane.
+sequence, and both Ctrl+J and Ctrl+Enter produce line feed. This gives
+multiline terminal applications the same default chord across native Windows
+and Unix attach clients. Shift+Enter and other modified Enter events retain
+their identity through CSI-u encoding when the terminal host reports them.
 
 The pane screen also tracks private input mode `9001` as authoritative terminal
 state. When a pane enables that mode, the server translates each routed

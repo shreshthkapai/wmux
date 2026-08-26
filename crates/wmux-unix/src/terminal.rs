@@ -206,6 +206,14 @@ fn encode_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let mut bytes = match key.code {
         KeyCode::Backspace => vec![if control { 0x08 } else { 0x7f }],
         KeyCode::Enter
+            if control
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            vec![b'\n']
+        }
+        KeyCode::Enter
             if key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
@@ -487,7 +495,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
                 TerminalKeyCode::Enter,
                 TerminalKeyModifiers::new(TerminalKeyModifiers::CONTROL),
-                b"\x1b[13;5u".to_vec(),
+                vec![b'\n'],
             ),
             (
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),

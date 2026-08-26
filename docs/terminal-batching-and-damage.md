@@ -101,6 +101,12 @@ unpaced bulk output keeps the adaptive four-to-eight millisecond batching
 window. This preserves throughput without imposing the bulk-output delay on
 interactive work.
 
+A non-synchronized cursor hide starts a bounded repaint transaction. The
+server keeps each client's previous complete pane baseline until the cursor is
+restored or the 8 ms ceiling expires. This coalesces split hide/draw/show reads
+without delaying PTY parsing, application input, or a deliberately hidden
+cursor beyond the ceiling.
+
 ## Correctness Gates
 
 The benchmark crate retains the previous parser model under `cfg(test)` only.

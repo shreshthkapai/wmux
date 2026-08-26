@@ -105,8 +105,9 @@ target, repeat, prompt, and confirmation behavior.
 
 Mouse drag selects and copies once movement begins; a plain click only focuses
 a pane. Alt or Shift overrides application mouse tracking for selection, and
-right-click pastes the latest wmux buffer. `Ctrl+Enter` and `Shift+Enter` remain
-distinct for multiline terminal applications that support CSI-u input.
+right-click pastes the latest wmux buffer. `Ctrl+Enter` emits line feed as the
+cross-OS multiline default. `Shift+Enter` remains distinct for applications
+and terminal hosts that support CSI-u input.
 
 ## Configuration
 

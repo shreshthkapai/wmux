@@ -55,6 +55,7 @@ const INPUT_BURST_INTERVAL: Duration = Duration::from_millis(3);
 const PACED_OUTPUT_MIN_INTERVAL: Duration = Duration::from_millis(3);
 const PACED_FRAME_DELAY: Duration = Duration::from_millis(1);
 const REDRAW_CYCLE_DELAY: Duration = Duration::from_millis(1);
+const CURSOR_REPAINT_MAX: Duration = Duration::from_millis(8);
 const RESIZE_REPAINT_QUIET: Duration = Duration::from_millis(4);
 const RESIZE_REPAINT_MAX: Duration = Duration::from_millis(120);
 const CONTROL_EVENTS_PER_TURN: usize = 256;
@@ -561,6 +562,7 @@ struct Runtime {
     platform_panes: BTreeMap<PaneId, PlatformPane>,
     output_ring: VecDeque<PaneId>,
     sync_started_at: BTreeMap<PaneId, Instant>,
+    cursor_repaint_holds: BTreeMap<PaneId, Instant>,
     resize_repaint_holds: BTreeMap<PaneId, ResizeRepaintHold>,
     history_growth: Vec<(PaneId, u64)>,
     published_output: Vec<(PaneId, Vec<u8>)>,
@@ -741,6 +743,7 @@ impl Runtime {
             platform_panes: BTreeMap::new(),
             output_ring: VecDeque::new(),
             sync_started_at: BTreeMap::new(),
+            cursor_repaint_holds: BTreeMap::new(),
             resize_repaint_holds: BTreeMap::new(),
             history_growth: Vec::new(),
             published_output: Vec::new(),
@@ -923,6 +926,8 @@ impl Runtime {
         }
         self.sync_started_at
             .retain(|pane, _| self.state.panes.contains_key(pane));
+        self.cursor_repaint_holds
+            .retain(|pane, _| self.state.panes.contains_key(pane));
         self.resize_repaint_holds
             .retain(|pane, _| self.state.panes.contains_key(pane));
     }
@@ -937,6 +942,7 @@ impl Runtime {
         self.platform_panes.clear();
         self.output_ring.clear();
         self.sync_started_at.clear();
+        self.cursor_repaint_holds.clear();
         self.resize_repaint_holds.clear();
         self.history_growth.clear();
     }
@@ -976,16 +982,24 @@ impl Runtime {
             return OutputResult::default();
         };
         let was_synchronized = pane.screen.synchronized_output();
+        let cursor_was_visible = pane.screen.cursor_visible();
         let history_before = pane.screen.history_added();
         let synchronized_epoch = pane.screen.synchronized_output_epoch();
         let generation = pane.terminal.feed(&mut pane.screen, bytes);
         let is_synchronized = pane.screen.synchronized_output();
+        let cursor_is_visible = pane.screen.cursor_visible();
         if is_synchronized && !was_synchronized {
             self.sync_started_at.insert(pane_id, Instant::now());
         } else if !is_synchronized && was_synchronized {
             self.sync_started_at.remove(&pane_id);
         }
         let synchronized_commit = pane.screen.synchronized_output_epoch() != synchronized_epoch;
+        if synchronized_commit || cursor_is_visible {
+            self.cursor_repaint_holds.remove(&pane_id);
+        } else if cursor_was_visible && !is_synchronized {
+            self.cursor_repaint_holds
+                .insert(pane_id, Instant::now() + CURSOR_REPAINT_MAX);
+        }
         let history_added = pane.screen.history_added().wrapping_sub(history_before);
         if history_added > 0 {
             self.history_growth.push((pane_id, history_added));
@@ -995,7 +1009,8 @@ impl Runtime {
         } else {
             self.extend_resize_repaint_hold(pane_id);
         }
-        let held = self.resize_repaint_holds.contains_key(&pane_id);
+        let held = self.resize_repaint_holds.contains_key(&pane_id)
+            || self.cursor_repaint_holds.contains_key(&pane_id);
         OutputResult {
             changed: generation.is_some(),
             publishable: generation.is_some() && !is_synchronized && !held,
@@ -1057,7 +1072,15 @@ impl Runtime {
         !expired.is_empty()
     }
 
-    fn expire_resize_repaint_holds(&mut self, now: Instant) -> bool {
+    fn expire_repaint_holds(&mut self, now: Instant) -> bool {
+        let expired_cursor = self
+            .cursor_repaint_holds
+            .iter()
+            .filter_map(|(pane, deadline)| (now >= *deadline).then_some(*pane))
+            .collect::<Vec<_>>();
+        for pane_id in &expired_cursor {
+            self.cursor_repaint_holds.remove(pane_id);
+        }
         let expired = self
             .resize_repaint_holds
             .iter()
@@ -1073,7 +1096,7 @@ impl Runtime {
         for pane_id in &expired {
             self.release_resize_repaint_hold(*pane_id);
         }
-        !expired.is_empty()
+        !expired_cursor.is_empty() || !expired.is_empty()
     }
 
     fn process_output_round(&mut self, budget: OutputBudget) -> OutputResult {
@@ -1137,7 +1160,8 @@ impl Runtime {
             if completed {
                 self.platform_panes.remove(&pane_id);
                 self.sync_started_at.remove(&pane_id);
-                let deferred_final_frame = self.resize_repaint_holds.remove(&pane_id).is_some();
+                let deferred_final_frame = self.cursor_repaint_holds.remove(&pane_id).is_some()
+                    || self.resize_repaint_holds.remove(&pane_id).is_some();
                 if deferred_final_frame && result.changed {
                     result.publishable = true;
                 }
@@ -1848,7 +1872,7 @@ impl ServerOwner {
                 did_work = true;
             }
             if self.runtime.expire_synchronized_output(now)
-                || self.runtime.expire_resize_repaint_holds(now)
+                || self.runtime.expire_repaint_holds(now)
             {
                 self.request_all_attached_renders(RenderCause::SynchronizedCommit);
                 did_work = true;
@@ -1905,6 +1929,7 @@ impl ServerOwner {
             .values()
             .map(|started| *started + SYNC_OUTPUT_TIMEOUT)
             .min();
+        let cursor_repaint = self.runtime.cursor_repaint_holds.values().copied().min();
         let resize = self
             .runtime
             .resize_repaint_holds
@@ -1922,10 +1947,17 @@ impl ServerOwner {
                 }
             })
             .min();
-        [render, animation, provider, synchronized_output, resize]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            render,
+            animation,
+            provider,
+            synchronized_output,
+            cursor_repaint,
+            resize,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn handle_owner_message(&mut self, message: OwnerMessage) {
@@ -3473,7 +3505,10 @@ impl ServerOwner {
                     view.copy_mode.as_ref(),
                     render,
                 )
-            } else if self.runtime.resize_repaint_holds.is_empty()
+            } else if structure
+                .pane_ids()
+                .all(|pane| !self.runtime.cursor_repaint_holds.contains_key(&pane))
+                && self.runtime.resize_repaint_holds.is_empty()
                 && view.scroll_offsets.is_empty()
                 && view.copy_mode.is_none()
                 && !overlay_active
@@ -3537,6 +3572,7 @@ impl ServerOwner {
                         .state
                         .pane(*pane)
                         .is_some_and(|pane| !pane.screen.synchronized_output())
+                        && !self.runtime.cursor_repaint_holds.contains_key(pane)
                         && !self.runtime.resize_repaint_holds.contains_key(pane)
                     {
                         view.consumed_generations.insert(*pane, *generation);
@@ -4126,6 +4162,10 @@ fn retained_panes_for_client(
             .state
             .pane(pane_id)
             .is_some_and(|pane| pane.screen.synchronized_output())
+            || runtime
+                .cursor_repaint_holds
+                .get(&pane_id)
+                .is_some_and(|deadline| now < *deadline)
         {
             previous_frame_panes.push(pane_id);
         }
@@ -4192,11 +4232,11 @@ fn text(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         collect_pane_events, handshake, pane_viewports_for_client, read_async_message,
-        render_full_for_client, run_with_platform_and_config, write_async_message,
-        write_outbound_messages, ClientRenderSpec, ClientView, FrameScheduler, Outbound,
-        OutputBudget, RenderCause, RenderSnapshotCache, Runtime, ServerOwner, TestJobBackend,
-        TestJobHandle, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
-        PER_PANE_OUTPUT_TIME, THEME_PROVIDER_OUTPUT_BYTES,
+        render_full_for_client, retained_panes_for_client, run_with_platform_and_config,
+        write_async_message, write_outbound_messages, ClientRenderSpec, ClientView, FrameScheduler,
+        Outbound, OutputBudget, RenderCause, RenderSnapshotCache, Runtime, ServerOwner,
+        TestJobBackend, TestJobHandle, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN,
+        CONTROL_EVENTS_PER_TURN, PER_PANE_OUTPUT_TIME, THEME_PROVIDER_OUTPUT_BYTES,
     };
     use crate::theme_runtime::ThemeLoader;
     use std::{
@@ -7516,6 +7556,117 @@ mod tests {
     }
 
     #[test]
+    fn split_cursor_repaint_is_staged_until_cursor_is_restored() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("test", 80, 24);
+
+        let hidden = runtime.apply_pty_output(created.pane, b"\x1b[?25lframe");
+
+        assert!(hidden.changed);
+        assert!(!hidden.publishable);
+        assert!(!runtime
+            .state
+            .pane(created.pane)
+            .unwrap()
+            .screen
+            .cursor_visible());
+
+        let restored = runtime.apply_pty_output(created.pane, b" complete\x1b[?25h");
+
+        assert!(restored.changed);
+        assert!(restored.publishable);
+        assert!(runtime
+            .state
+            .pane(created.pane)
+            .unwrap()
+            .screen
+            .cursor_visible());
+    }
+
+    #[test]
+    fn cursor_repaint_hold_expires_at_its_bounded_deadline() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("test", 80, 24);
+
+        let hidden = runtime.apply_pty_output(created.pane, b"\x1b[?25l");
+        assert!(!hidden.publishable);
+        let deadline = runtime.cursor_repaint_holds[&created.pane];
+
+        assert!(!runtime.expire_repaint_holds(deadline - Duration::from_nanos(1)));
+        assert!(runtime.cursor_repaint_holds.contains_key(&created.pane));
+        assert!(runtime.expire_repaint_holds(deadline));
+        assert!(!runtime.cursor_repaint_holds.contains_key(&created.pane));
+    }
+
+    #[test]
+    fn cursor_repaint_hold_sets_the_server_wakeup_deadline() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("test", 80, 24);
+
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"\x1b[?25lframe");
+        let deadline = owner.runtime.cursor_repaint_holds[&created.pane];
+
+        assert_eq!(owner.next_deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn cursor_repaint_hold_keeps_the_previous_client_frame() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let client = runtime.state.add_client();
+        let created = runtime.state.create_session("test", 80, 24);
+        runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+
+        runtime.apply_pty_output(created.pane, b"\x1b[?25lframe");
+        let (previous_frame_panes, retained_frames) = retained_panes_for_client(&runtime, client);
+
+        assert_eq!(previous_frame_panes, vec![created.pane]);
+        assert!(retained_frames.is_empty());
+    }
+
+    #[test]
+    fn unrelated_render_cannot_publish_cursor_held_pane_damage() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("test", 80, 24);
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+        let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.request_immediate_render(Instant::now());
+        owner.clients.insert(client, view);
+
+        assert!(owner.render_due_clients(Instant::now()));
+        let baseline = outbound_rx.try_recv().unwrap();
+        owner
+            .clients
+            .get_mut(&client)
+            .unwrap()
+            .drained(baseline.wire_len());
+        let consumed = owner.clients[&client].consumed_generations[&created.pane];
+
+        owner
+            .runtime
+            .apply_pty_output(created.pane, b"\x1b[?25lpartial");
+        owner.request_all_attached_renders(RenderCause::Output);
+
+        assert!(!owner.render_due_clients(Instant::now() + Duration::from_millis(10)));
+        assert!(outbound_rx.try_recv().is_err());
+        assert_eq!(
+            owner.clients[&client].consumed_generations[&created.pane],
+            consumed
+        );
+    }
+
+    #[test]
     fn resized_pane_output_is_staged_until_quiet_deadline() {
         let mut runtime = Runtime::with_config(WmuxConfig::default());
         let created = runtime.state.create_session("test", 80, 24);
@@ -7532,8 +7683,8 @@ mod tests {
             .unwrap()
             .quiet_until;
 
-        assert!(!runtime.expire_resize_repaint_holds(quiet_until - Duration::from_nanos(1)));
-        assert!(runtime.expire_resize_repaint_holds(quiet_until));
+        assert!(!runtime.expire_repaint_holds(quiet_until - Duration::from_nanos(1)));
+        assert!(runtime.expire_repaint_holds(quiet_until));
         assert!(!runtime.resize_repaint_holds.contains_key(&created.pane));
         assert!(runtime
             .state
