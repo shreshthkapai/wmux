@@ -66,7 +66,7 @@ fn one_large_terminal_write_delivers_every_complete_event() {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
