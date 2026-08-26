@@ -1352,6 +1352,75 @@ impl FrameScheduler {
     }
 }
 
+#[derive(Clone)]
+struct RenderSnapshot {
+    structure: Arc<StructuralScene>,
+    pane_generations: Arc<BTreeMap<PaneId, u64>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RenderSnapshotKey {
+    session: wmux_core::SessionId,
+    cols: u16,
+    rows: u16,
+    frame_identity: usize,
+}
+
+struct RenderSnapshotCache {
+    snapshots: Vec<(RenderSnapshotKey, RenderSnapshot)>,
+}
+
+impl RenderSnapshotCache {
+    const fn new() -> Self {
+        Self {
+            snapshots: Vec::new(),
+        }
+    }
+
+    fn get_or_build(
+        &mut self,
+        runtime: &Runtime,
+        session: wmux_core::SessionId,
+        size: TerminalSize,
+        frame: &UiFrame,
+    ) -> Option<RenderSnapshot> {
+        let key = RenderSnapshotKey {
+            session,
+            cols: size.cols,
+            rows: size.rows,
+            frame_identity: std::ptr::from_ref(frame).addr(),
+        };
+        if let Some((_, snapshot)) = self.snapshots.iter().find(|(cached, _)| *cached == key) {
+            return Some(snapshot.clone());
+        }
+
+        let structure = Arc::new(build_window_structure_with_theme(
+            &runtime.state,
+            session,
+            size.cols,
+            size.rows,
+            frame,
+        )?);
+        let pane_generations = Arc::new(
+            structure
+                .pane_ids()
+                .filter_map(|pane_id| {
+                    runtime
+                        .state
+                        .pane(pane_id)
+                        .map(|pane| (pane_id, pane.generation()))
+                })
+                .collect(),
+        );
+        let snapshot = RenderSnapshot {
+            structure,
+            pane_generations,
+        };
+        self.snapshots.push((key, snapshot.clone()));
+        Some(snapshot)
+    }
+}
+
 struct ClientView {
     outbound: async_mpsc::Sender<Outbound>,
     queued_bytes: usize,
@@ -1363,7 +1432,7 @@ struct ClientView {
     scheduler: FrameScheduler,
     theme_state: ClientThemeState,
     consumed_generations: BTreeMap<PaneId, u64>,
-    structure: Option<StructuralScene>,
+    structure: Option<Arc<StructuralScene>>,
     capabilities: RenderCapabilities,
     scroll_offsets: BTreeMap<PaneId, usize>,
     copy_mode: Option<CopyMode>,
@@ -3334,12 +3403,12 @@ impl ServerOwner {
             })
             .collect::<Vec<_>>();
         let mut rendered = false;
+        let mut snapshots = RenderSnapshotCache::new();
         for client in due {
             let Some(mut view) = self.clients.remove(&client) else {
                 continue;
             };
             view.scheduler.deadline = None;
-            let pane_generations = pane_generations_for_client(&self.runtime, client);
             let Some((session, _, _)) =
                 self.runtime.state.active_window_and_pane_for_client(client)
             else {
@@ -3355,17 +3424,14 @@ impl ServerOwner {
             let (frame, _) =
                 view.theme_state
                     .select(self.theme.active(), self.theme.generation(), now);
-            let Some(structure) = build_window_structure_with_theme(
-                &self.runtime.state,
-                session,
-                view.size.cols,
-                view.size.rows,
-                frame,
-            ) else {
+            let Some(snapshot) = snapshots.get_or_build(&self.runtime, session, view.size, frame)
+            else {
                 self.clients.insert(client, view);
                 continue;
             };
-            if view.structure.as_ref() != Some(&structure) {
+            let structure = snapshot.structure;
+            let pane_generations = snapshot.pane_generations;
+            if view.structure.as_deref() != Some(structure.as_ref()) {
                 view.full_render = true;
             }
             if !view.full_render
@@ -3414,7 +3480,7 @@ impl ServerOwner {
             {
                 render_damage_from_structure(
                     &self.runtime.state,
-                    &structure,
+                    structure.as_ref(),
                     &view.consumed_generations,
                     &mut candidate,
                     view.capabilities,
@@ -3463,17 +3529,17 @@ impl ServerOwner {
             };
             if delivered {
                 view.render_state = candidate;
-                view.structure = Some(structure);
+                view.structure = Some(Arc::clone(&structure));
                 view.full_render = false;
-                for (pane, generation) in pane_generations {
+                for (pane, generation) in pane_generations.iter() {
                     if self
                         .runtime
                         .state
-                        .pane(pane)
+                        .pane(*pane)
                         .is_some_and(|pane| !pane.screen.synchronized_output())
-                        && !self.runtime.resize_repaint_holds.contains_key(&pane)
+                        && !self.runtime.resize_repaint_holds.contains_key(pane)
                     {
-                        view.consumed_generations.insert(pane, generation);
+                        view.consumed_generations.insert(*pane, *generation);
                     }
                 }
                 view.scheduler.published(now);
@@ -4042,25 +4108,6 @@ fn pane_viewports_for_client(
     viewports
 }
 
-fn pane_generations_for_client(runtime: &Runtime, client: ClientId) -> BTreeMap<PaneId, u64> {
-    let Some((_, window_id, _)) = runtime.state.active_window_and_pane_for_client(client) else {
-        return BTreeMap::new();
-    };
-    let Some(window) = runtime.state.window(window_id) else {
-        return BTreeMap::new();
-    };
-    window
-        .panes
-        .iter()
-        .filter_map(|pane_id| {
-            runtime
-                .state
-                .pane(*pane_id)
-                .map(|pane| (*pane_id, pane.generation()))
-        })
-        .collect()
-}
-
 fn retained_panes_for_client(
     runtime: &Runtime,
     client: ClientId,
@@ -4147,8 +4194,8 @@ mod tests {
         collect_pane_events, handshake, pane_viewports_for_client, read_async_message,
         render_full_for_client, run_with_platform_and_config, write_async_message,
         write_outbound_messages, ClientRenderSpec, ClientView, FrameScheduler, Outbound,
-        OutputBudget, RenderCause, Runtime, ServerOwner, TestJobBackend, TestJobHandle,
-        TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
+        OutputBudget, RenderCause, RenderSnapshotCache, Runtime, ServerOwner, TestJobBackend,
+        TestJobHandle, TestPtyBackend, TestPtyHandle, COMMANDS_PER_TURN, CONTROL_EVENTS_PER_TURN,
         PER_PANE_OUTPUT_TIME, THEME_PROVIDER_OUTPUT_BYTES,
     };
     use crate::theme_runtime::ThemeLoader;
@@ -5447,6 +5494,46 @@ mod tests {
             .runtime
             .add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         (owner, client, created.pane)
+    }
+
+    #[test]
+    fn equivalent_clients_share_one_immutable_render_snapshot() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("shared", 120, 40);
+        let frame = wmux_core::UiFrame::default();
+        let mut cache = RenderSnapshotCache::new();
+
+        let first = cache
+            .get_or_build(
+                &runtime,
+                created.session,
+                TerminalSize::new(120, 40),
+                &frame,
+            )
+            .unwrap();
+        let second = cache
+            .get_or_build(
+                &runtime,
+                created.session,
+                TerminalSize::new(120, 40),
+                &frame,
+            )
+            .unwrap();
+        let different_size = cache
+            .get_or_build(
+                &runtime,
+                created.session,
+                TerminalSize::new(100, 30),
+                &frame,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first.structure, &second.structure));
+        assert!(Arc::ptr_eq(
+            &first.pane_generations,
+            &second.pane_generations
+        ));
+        assert!(!Arc::ptr_eq(&first.structure, &different_size.structure));
     }
 
     #[test]
@@ -7649,6 +7736,10 @@ mod tests {
             owner.clients[&second].consumed_generations[&created.pane],
             first_generation
         );
+        assert!(Arc::ptr_eq(
+            owner.clients[&first].structure.as_ref().unwrap(),
+            owner.clients[&second].structure.as_ref().unwrap()
+        ));
 
         {
             let pane = owner.runtime.state.pane_mut(created.pane).unwrap();

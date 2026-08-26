@@ -17,6 +17,12 @@ for that client yet. Once the writer reports the completed byte count, all
 accumulated damage is rendered as one current frame. Other clients continue
 against their own baselines and generation cursors.
 
+Clients due in the same owner turn share one immutable structural snapshot and
+pane-generation map when their session, physical size, and selected theme frame
+match. Terminal diff baselines, scroll offsets, copy state, capabilities, and
+outboxes remain client-owned. The cache exists only for that render turn, so a
+later state mutation cannot reuse stale structure.
+
 Control replies are allowed into the same byte-accounted outbox. A client that
 cannot accept a critical reply within the bound is disconnected. Pane processes
 and sessions remain alive.
