@@ -19,7 +19,7 @@ use tokio::{
 };
 use wmux_cli::{ConfigAction, Invocation, ServerInvocation, StartupPolicy};
 use wmux_config::{config_path, WmuxConfig};
-use wmux_core::{ControlNotification, ControlRecord};
+use wmux_core::{quote_argument, ControlNotification, ControlRecord};
 use wmux_platform::{
     BoxedIpcStream, ClientTransport, DaemonSpec, PlatformError, PlatformErrorKind, PlatformResult,
     TerminalBackend, TerminalInput, TerminalKeyCode, TerminalKeyEvent,
@@ -138,12 +138,19 @@ async fn run_server_invocation(
 ) -> io::Result<()> {
     let capabilities = terminal_capabilities();
     let pipe = connect_for_invocation(&invocation, capabilities, transport).await?;
-    let command = invocation.argv.join(" ");
+    let command = encode_command_argv(&invocation.argv);
     if invocation.attached {
         attached_command(pipe, command, capabilities, terminal).await
     } else {
         send_command(pipe, command).await
     }
+}
+
+fn encode_command_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn send_command(mut pipe: BoxedIpcStream, command: String) -> io::Result<()> {
@@ -997,10 +1004,10 @@ fn terminal_capabilities() -> TerminalCapabilities {
 mod tests {
     use super::{
         attach_io_loop, attached_command, classify_attached_inbound, client_current_dir_text,
-        connect_with_startup_policy, control_io_loop, escape_control_bytes, format_control_record,
-        format_effective_config, handshake_read_error, no_server_message, protocol_error,
-        read_async_message, read_inbound_messages, retry_delays, send_key, wire_key_event,
-        write_async_message, AttachedInbound,
+        connect_with_startup_policy, control_io_loop, encode_command_argv, escape_control_bytes,
+        format_control_record, format_effective_config, handshake_read_error, no_server_message,
+        protocol_error, read_async_message, read_inbound_messages, retry_delays, send_key,
+        wire_key_event, write_async_message, AttachedInbound,
     };
     use std::{
         cell::Cell,
@@ -1012,7 +1019,7 @@ mod tests {
         },
     };
     use wmux_cli::StartupPolicy;
-    use wmux_core::{ControlRecord, PaneId};
+    use wmux_core::{parse_command_text, Command, ControlRecord, PaneId};
     use wmux_platform::{
         PlatformError, PlatformErrorKind, PlatformResult, TerminalBackend, TerminalInput,
         TerminalModeGuard, TerminalSize,
@@ -1036,6 +1043,30 @@ mod tests {
                 .kind(),
             PlatformErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn command_argv_transport_preserves_every_argument_byte() {
+        for name in [
+            "",
+            "two words",
+            "semi;colon",
+            "#literal",
+            "single'quote",
+            "double\"quote",
+            r"C:\project directory\wmux",
+            "line\nbreak",
+            "tab\tvalue",
+            "lambda-λ",
+        ] {
+            let wire = encode_command_argv(&["rename-window".to_string(), name.to_string()]);
+            let parsed = parse_command_text(&wire).expect("encoded argv remains valid");
+
+            assert!(
+                matches!(&parsed[0], Command::RenameWindow { name: actual, .. } if actual == name),
+                "argument {name:?} changed in transit as {wire:?}"
+            );
+        }
     }
 
     #[test]
