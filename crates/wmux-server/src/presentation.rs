@@ -28,7 +28,7 @@ impl PresentationGate {
     }
 
     pub(crate) const fn ready(&self) -> bool {
-        self.in_flight.is_none()
+        self.in_flight().is_none()
     }
 
     pub(crate) fn begin(&mut self) -> Result<u64, PresentationError> {

@@ -202,7 +202,10 @@ async fn wait_for_command_ok(stream: &mut BoxedIpcStream) -> String {
             match read_message(stream).await {
                 Some(Message::CommandOk(message)) => return message,
                 Some(Message::CommandErr(error)) => panic!("command failed: {error}"),
-                Some(Message::Output { .. } | Message::Clipboard(_)) => {}
+                Some(Message::Output { sequence, .. }) => {
+                    write_message(stream, Message::OutputAck { sequence }).await;
+                }
+                Some(Message::Clipboard(_)) => {}
                 Some(message) => panic!("unexpected command response: {message:?}"),
                 None => panic!("server closed before command completion"),
             }
@@ -217,7 +220,8 @@ async fn wait_for_output(stream: &mut BoxedIpcStream, marker: &[u8]) {
     let outcome = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match read_message(stream).await {
-                Some(Message::Output { bytes, .. }) => {
+                Some(Message::Output { sequence, bytes }) => {
+                    write_message(stream, Message::OutputAck { sequence }).await;
                     output.extend_from_slice(&bytes);
                     if output.windows(marker.len()).any(|window| window == marker) {
                         return;
@@ -245,7 +249,8 @@ async fn wait_for_pid_marker(stream: &mut BoxedIpcStream, marker: &[u8]) -> u32 
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match read_message(stream).await {
-                Some(Message::Output { bytes, .. }) => {
+                Some(Message::Output { sequence, bytes }) => {
+                    write_message(stream, Message::OutputAck { sequence }).await;
                     output.extend_from_slice(&bytes);
                     if let Some(pid) = parse_pid_marker(&output, marker) {
                         return pid;
@@ -290,7 +295,10 @@ async fn wait_for_shutdown(stream: &mut BoxedIpcStream) {
         loop {
             match read_message(stream).await {
                 Some(Message::Shutdown) | None => return,
-                Some(Message::Output { .. } | Message::Clipboard(_) | Message::CommandOk(_)) => {}
+                Some(Message::Output { sequence, .. }) => {
+                    write_message(stream, Message::OutputAck { sequence }).await;
+                }
+                Some(Message::Clipboard(_) | Message::CommandOk(_)) => {}
                 Some(Message::CommandErr(error)) => panic!("shutdown command failed: {error}"),
                 Some(message) => panic!("unexpected shutdown message: {message:?}"),
             }

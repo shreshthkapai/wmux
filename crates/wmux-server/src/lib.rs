@@ -242,6 +242,10 @@ enum OwnerMessage {
         client: ClientId,
         bytes: usize,
     },
+    OutputPresented {
+        client: ClientId,
+        sequence: u64,
+    },
     PlatformReady,
     Stop,
 }
@@ -427,6 +431,9 @@ fn protocol_event(client: ClientId, message: Message) -> Option<OwnerMessage> {
             client,
             input: ClientInput::Paste(bytes),
         },
+        Message::OutputAck { sequence } => {
+            return Some(OwnerMessage::OutputPresented { client, sequence });
+        }
         Message::Mouse(event) => ServerEvent::ClientMouse { client, event },
         Message::Resize { cols, rows } => ServerEvent::ClientResize { client, cols, rows },
         Message::Detach => {
@@ -1919,13 +1926,18 @@ impl ServerOwner {
         let render = self
             .clients
             .values()
-            .filter(|view| !view.blocked)
+            .filter(|view| !view.blocked && view.presentation.ready())
             .filter_map(|view| view.scheduler.deadline)
             .min();
         let animation = self
             .clients
             .values()
-            .filter(|view| view.attached && !view.blocked && view.queued_bytes == 0)
+            .filter(|view| {
+                view.attached
+                    && !view.blocked
+                    && view.queued_bytes == 0
+                    && view.presentation.ready()
+            })
             .filter_map(|view| view.theme_state.next_deadline(self.theme.active()))
             .min();
         let provider = self.theme.provider_deadline();
@@ -2020,6 +2032,19 @@ impl ServerOwner {
                         view.blocked = false;
                         view.request_immediate_render(Instant::now());
                     }
+                }
+            }
+            OwnerMessage::OutputPresented { client, sequence } => {
+                let acknowledged = self
+                    .clients
+                    .get_mut(&client)
+                    .is_some_and(|view| view.presentation.acknowledge(sequence).is_ok());
+                if acknowledged {
+                    if let Some(view) = self.clients.get_mut(&client) {
+                        view.request_immediate_render(Instant::now());
+                    }
+                } else if self.clients.contains_key(&client) {
+                    self.disconnect_client(client, true);
                 }
             }
             OwnerMessage::PlatformReady => {}
@@ -3429,6 +3454,7 @@ impl ServerOwner {
                 (view.attached
                     && !view.blocked
                     && view.queued_bytes == 0
+                    && view.presentation.ready()
                     && (view
                         .scheduler
                         .deadline
@@ -3549,12 +3575,21 @@ impl ServerOwner {
             let delivered = if bytes.is_empty() {
                 true
             } else {
-                match view.try_enqueue(Outbound::Message(Message::Output { sequence: 0, bytes })) {
+                let sequence = match view.presentation.begin() {
+                    Ok(sequence) => sequence,
+                    Err(_) => {
+                        self.runtime.state.remove_client(client);
+                        continue;
+                    }
+                };
+                match view.try_enqueue(Outbound::Message(Message::Output { sequence, bytes })) {
                     Ok(()) => {
                         rendered = true;
                         true
                     }
                     Err(TrySendError::Full(_)) => {
+                        let cancelled = view.presentation.cancel(sequence);
+                        debug_assert!(cancelled);
                         if view.queued_bytes == 0 {
                             self.runtime.state.remove_client(client);
                             continue;
@@ -3563,6 +3598,8 @@ impl ServerOwner {
                         false
                     }
                     Err(TrySendError::Closed(_)) => {
+                        let cancelled = view.presentation.cancel(sequence);
+                        debug_assert!(cancelled);
                         self.runtime.state.remove_client(client);
                         continue;
                     }
@@ -5358,7 +5395,12 @@ mod tests {
             match message {
                 Some(Message::CommandOk(_)) => return output,
                 Some(Message::CommandErr(error)) => panic!("command {command:?} failed: {error}"),
-                Some(Message::Output { bytes, .. }) => output.extend(bytes),
+                Some(Message::Output { sequence, bytes }) => {
+                    write_async_message(stream, Message::OutputAck { sequence })
+                        .await
+                        .unwrap();
+                    output.extend(bytes);
+                }
                 Some(other) => panic!("command {command:?} returned {other:?}"),
                 None => panic!("server closed while running {command:?}"),
             }
@@ -5379,10 +5421,18 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match read_async_message(stream).await.unwrap() {
-                    Some(Message::Output { bytes, .. })
+                    Some(Message::Output { sequence, bytes })
                         if bytes.windows(needle.len()).any(|w| w == needle) =>
                     {
+                        write_async_message(stream, Message::OutputAck { sequence })
+                            .await
+                            .unwrap();
                         return;
+                    }
+                    Some(Message::Output { sequence, .. }) => {
+                        write_async_message(stream, Message::OutputAck { sequence })
+                            .await
+                            .unwrap();
                     }
                     Some(_) => {}
                     None => panic!("server closed before authoritative background output rendered"),
@@ -5485,7 +5535,11 @@ mod tests {
                 .unwrap()
             {
                 Some(Message::CommandOk(_)) => break,
-                Some(Message::Output { .. }) => {}
+                Some(Message::Output { sequence, .. }) => {
+                    write_async_message(&mut client, Message::OutputAck { sequence })
+                        .await
+                        .unwrap();
+                }
                 other => panic!("unexpected detach response: {other:?}"),
             }
         }
@@ -5540,6 +5594,18 @@ mod tests {
             .runtime
             .add_test_platform_pane(created.pane, TerminalSize::new(80, 24));
         (owner, client, created.pane)
+    }
+
+    fn acknowledge_output(owner: &mut ServerOwner, client: ClientId, output: &Outbound) {
+        let sequence = match output {
+            Outbound::Message(Message::Output { sequence, .. }) => *sequence,
+            _ => panic!("expected output transaction"),
+        };
+        owner.handle_owner_message(super::OwnerMessage::OutboundDrained {
+            client,
+            bytes: output.wire_len(),
+        });
+        owner.handle_owner_message(super::OwnerMessage::OutputPresented { client, sequence });
     }
 
     #[test]
@@ -5733,11 +5799,7 @@ mod tests {
             owner.runtime.state.panes[&killed].screen.render_line(23),
             Some(&authoritative_last_line)
         );
-        owner
-            .clients
-            .get_mut(&client)
-            .unwrap()
-            .drained(prompt_frame.wire_len());
+        acknowledge_output(&mut owner, client, &prompt_frame);
 
         owner
             .handle_wire_key_at(client, wire_char('n', WireKeyModifiers::NONE, b"n"), 1)
@@ -5801,11 +5863,7 @@ mod tests {
             panic!("expected rename prompt render");
         };
         assert!(String::from_utf8_lossy(bytes).contains("rename-window: shell"));
-        owner
-            .clients
-            .get_mut(&client)
-            .unwrap()
-            .drained(prompt_frame.wire_len());
+        acknowledge_output(&mut owner, client, &prompt_frame);
 
         owner
             .handle_wire_key_at(
@@ -5877,11 +5935,7 @@ mod tests {
             panic!("expected rename prompt render");
         };
         assert!(String::from_utf8_lossy(bytes).contains("rename-session: work"));
-        owner
-            .clients
-            .get_mut(&client)
-            .unwrap()
-            .drained(prompt_frame.wire_len());
+        acknowledge_output(&mut owner, client, &prompt_frame);
 
         owner
             .handle_wire_key_at(
@@ -5943,11 +5997,7 @@ mod tests {
 
         assert!(owner.render_due_clients(Instant::now()));
         let baseline = outbound_rx.try_recv().unwrap();
-        owner
-            .clients
-            .get_mut(&client)
-            .unwrap()
-            .drained(baseline.wire_len());
+        acknowledge_output(&mut owner, client, &baseline);
 
         owner
             .handle_wire_key_at(
@@ -7659,11 +7709,7 @@ mod tests {
 
         assert!(owner.render_due_clients(Instant::now()));
         let baseline = outbound_rx.try_recv().unwrap();
-        owner
-            .clients
-            .get_mut(&client)
-            .unwrap()
-            .drained(baseline.wire_len());
+        acknowledge_output(&mut owner, client, &baseline);
         let consumed = owner.clients[&client].consumed_generations[&created.pane];
 
         owner
@@ -7890,11 +7936,7 @@ mod tests {
         assert!(owner.render_due_clients(Instant::now()));
         let first_frame = first_rx.try_recv().unwrap();
         let _second_frame = second_rx.try_recv().unwrap();
-        owner
-            .clients
-            .get_mut(&first)
-            .unwrap()
-            .drained(first_frame.wire_len());
+        acknowledge_output(&mut owner, first, &first_frame);
         let first_generation = owner.clients[&first].consumed_generations[&created.pane];
         assert_eq!(
             owner.clients[&second].consumed_generations[&created.pane],
@@ -7939,7 +7981,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_render_coalesces_damage_until_the_client_drains() {
+    fn pending_render_coalesces_damage_until_physical_presentation_is_acknowledged() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner.runtime.state.create_session("coalesce", 80, 24);
         let client = owner.runtime.state.add_client();
@@ -7956,6 +7998,10 @@ mod tests {
 
         assert!(owner.render_due_clients(Instant::now()));
         let first = outbound_rx.try_recv().unwrap();
+        let first_sequence = match &first {
+            Outbound::Message(Message::Output { sequence, .. }) => *sequence,
+            _ => panic!("expected output transaction"),
+        };
         let first_generation = owner.clients[&client].consumed_generations[&created.pane];
 
         for bytes in [b"one".as_slice(), b"two", b"three"] {
@@ -7973,9 +8019,82 @@ mod tests {
             client,
             bytes: first.wire_len(),
         });
+        assert!(!owner.render_due_clients(Instant::now() + Duration::from_millis(20)));
+        assert_eq!(owner.next_deadline(), None);
+        assert!(outbound_rx.is_empty());
+
+        owner.handle_owner_message(super::OwnerMessage::OutputPresented {
+            client,
+            sequence: first_sequence,
+        });
         assert!(owner.render_due_clients(Instant::now()));
         assert_eq!(outbound_rx.len(), 1);
         assert!(owner.clients[&client].consumed_generations[&created.pane] > first_generation);
+    }
+
+    #[test]
+    fn invalid_presentation_acknowledgement_disconnects_only_its_client() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("ack", 80, 24);
+        let first = owner.runtime.state.add_client();
+        let second = owner.runtime.state.add_client();
+        let mut receivers = Vec::new();
+        for client in [first, second] {
+            owner
+                .runtime
+                .state
+                .attach_client(client, created.session)
+                .unwrap();
+            let (outbound, receiver) = mpsc::channel(4);
+            receivers.push(receiver);
+            let mut view = ClientView::new(outbound, TerminalCapabilities::default());
+            view.attached = true;
+            owner.clients.insert(client, view);
+        }
+
+        owner
+            .clients
+            .get_mut(&first)
+            .unwrap()
+            .request_immediate_render(Instant::now());
+        assert!(owner.render_due_clients(Instant::now()));
+        assert_eq!(receivers.len(), 2);
+        let expected = owner.clients[&first].presentation.in_flight().unwrap();
+
+        owner.handle_owner_message(super::OwnerMessage::OutputPresented {
+            client: first,
+            sequence: expected + 1,
+        });
+
+        assert!(!owner.clients.contains_key(&first));
+        assert!(!owner.runtime.state.clients.contains_key(&first));
+        assert!(owner.clients.contains_key(&second));
+        assert!(owner.runtime.state.clients.contains_key(&second));
+    }
+
+    #[test]
+    fn empty_diff_does_not_reserve_a_presentation_sequence() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("empty-diff", 80, 24);
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (outbound, mut receiver) = mpsc::channel(4);
+        let mut view = ClientView::new(outbound, TerminalCapabilities::default());
+        view.attached = true;
+        view.request_immediate_render(Instant::now());
+        owner.clients.insert(client, view);
+
+        assert!(owner.render_due_clients(Instant::now()));
+        let baseline = receiver.try_recv().unwrap();
+        acknowledge_output(&mut owner, client, &baseline);
+
+        assert!(!owner.render_due_clients(Instant::now()));
+        assert!(owner.clients[&client].presentation.ready());
+        assert!(receiver.is_empty());
     }
 
     #[test]
