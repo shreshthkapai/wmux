@@ -895,7 +895,6 @@ pub fn render_damage_from_structure(
 
     let mut out = Vec::new();
     let mut touched = false;
-    let mut erase = Vec::new();
     for span in &structure.panes {
         let pane = state.pane(span.pane)?;
         if pane.screen.synchronized_output() {
@@ -941,11 +940,10 @@ pub fn render_damage_from_structure(
                 out.extend_from_slice(b"\x1b[0m");
                 touched = true;
             }
-            render_changed_span(target_row, &previous, &wanted, &mut out, &mut erase);
+            render_changed_row(target_row, &previous, &wanted, &mut out);
             render_state.lines[target_row as usize] = wanted;
         }
     }
-    out.extend_from_slice(&erase);
 
     let active = state.pane(structure.active_pane)?;
     if active.screen.synchronized_output() {
@@ -1136,7 +1134,6 @@ pub fn render_diff_scene_with_capabilities(
         state.bracketed_paste = scene.bracketed_paste;
     }
     let mut touched = false;
-    let mut erase = Vec::new();
     for row in 0..scene.rows {
         let Some(wanted) = scene.lines.get(row as usize) else {
             state.invalidate();
@@ -1156,10 +1153,9 @@ pub fn render_diff_scene_with_capabilities(
             out.extend_from_slice(b"\x1b[0m");
             touched = true;
         }
-        render_changed_span(row, previous, wanted, &mut out, &mut erase);
+        render_changed_row(row, previous, wanted, &mut out);
         *previous = wanted.clone();
     }
-    out.extend_from_slice(&erase);
 
     let visibility_changed = state.cursor_visible != scene.cursor_visible;
     let style_changed = state.cursor_style != scene.cursor_style;
@@ -1237,13 +1233,7 @@ fn render_line_then_clear_tail(line: &Line, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[K");
 }
 
-fn render_changed_span(
-    row: u16,
-    previous: &Line,
-    wanted: &Line,
-    paint: &mut Vec<u8>,
-    erase: &mut Vec<u8>,
-) {
+fn render_changed_row(row: u16, previous: &Line, wanted: &Line, out: &mut Vec<u8>) {
     let Some((start, end)) = changed_span(previous, wanted) else {
         return;
     };
@@ -1257,17 +1247,17 @@ fn render_changed_span(
                         .is_none_or(Cell::is_blank_default)
                 })
                 .count();
-            erase.extend_from_slice(b"\x1b[0m");
-            push_cursor_position(erase, row, index as u16);
+            out.extend_from_slice(b"\x1b[0m");
+            push_cursor_position(out, row, index as u16);
             if (index..wanted.cols() as usize).all(|offset| {
                 wanted
                     .cell(offset as u16)
                     .is_none_or(Cell::is_blank_default)
             }) {
-                erase.extend_from_slice(b"\x1b[K");
+                out.extend_from_slice(b"\x1b[K");
                 break;
             }
-            push_csi_number(erase, run, b'X');
+            push_csi_number(out, run, b'X');
             index += run;
             continue;
         }
@@ -1279,9 +1269,9 @@ fn render_changed_span(
                     .is_some_and(|cell| !cell.is_blank_default())
             })
             .count();
-        paint.extend_from_slice(b"\x1b[0m");
-        push_cursor_position(paint, row, index as u16);
-        render_cells_exact(wanted, index, index + run, paint);
+        out.extend_from_slice(b"\x1b[0m");
+        push_cursor_position(out, row, index as u16);
+        render_cells_exact(wanted, index, index + run, out);
         index += run;
     }
 }
@@ -1765,6 +1755,42 @@ mod tests {
 
         for update in updates {
             source_engine.feed(&mut source, update);
+            let frame = render_diff(&source, &mut render_state);
+            host_engine.feed(&mut host, &frame);
+            assert_host_matches_screen(&host, &source);
+        }
+    }
+
+    #[test]
+    fn deterministic_mixed_updates_replay_to_the_authoritative_grid_and_cursor() {
+        let mut source = Screen::new(32, 8);
+        let mut source_engine = TerminalEngine::new();
+        let mut host = Screen::new(32, 8);
+        let mut host_engine = TerminalEngine::new();
+        let mut render_state = RenderState::new(32, 8);
+        let mut seed = 0x776d_7578_7265_6e64_u64;
+
+        for iteration in 0..512 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let row = seed as u16 % 8 + 1;
+            let column = (seed >> 8) as u16 % 23 + 1;
+            let update = match (seed >> 16) % 9 {
+                0 => format!("\x1b[{row};{column}Halpha"),
+                1 => format!("\x1b[{row};{column}H\x1b[K"),
+                2 => format!("\x1b[{row};{column}H\x1b[5X"),
+                3 => format!("\x1b[{row};1H\x1b[2Krow-{iteration}"),
+                4 => format!("\x1b[{row};{column}H\x1b[1;35mstyled\x1b[0m"),
+                5 => format!("\x1b[{row};{column}H\u{754c}"),
+                6 => format!("\x1b[{row};{column}He\u{301}"),
+                7 if iteration % 2 == 0 => "\x1b[?25l\x1b[3 q".to_string(),
+                7 => "\x1b[?25h\x1b[5 q".to_string(),
+                _ if iteration % 2 == 0 => "\x1b[?2004h".to_string(),
+                _ => "\x1b[?2004l".to_string(),
+            };
+
+            source_engine.feed(&mut source, update.as_bytes());
             let frame = render_diff(&source, &mut render_state);
             host_engine.feed(&mut host, &frame);
             assert_host_matches_screen(&host, &source);
@@ -2454,8 +2480,50 @@ mod tests {
         let show = frame.rfind("\x1b[?25h").unwrap();
 
         assert!(frame.starts_with("\x1b[?25l"));
+        assert_eq!(frame.matches("\x1b[?25l").count(), 1);
+        assert_eq!(frame.matches("\x1b[?25h").count(), 1);
         assert!(erase < shape);
         assert!(shape < show);
+    }
+
+    #[test]
+    fn direct_damage_completes_each_changed_row_before_starting_the_next() {
+        let mut server = ServerState::new();
+        let created = server.create_session("damage-rows", 12, 3);
+        {
+            let pane = server.pane_mut(created.pane).unwrap();
+            pane.terminal.feed(&mut pane.screen, b"oldold\r\noldold");
+        }
+        let structure = build_window_structure(&server, created.session, 12, 3).unwrap();
+        let scene = build_window_scene(&server, created.session, 12, 3).unwrap();
+        let mut render_state = RenderState::new(12, 3);
+        let capabilities = RenderCapabilities {
+            scroll_region: true,
+            synchronized_output: false,
+        };
+        let _ = render_full_scene_with_capabilities(&scene, &mut render_state, capabilities);
+        let consumed = server.pane(created.pane).unwrap().generation();
+
+        {
+            let pane = server.pane_mut(created.pane).unwrap();
+            pane.terminal
+                .feed(&mut pane.screen, b"\x1b[1;1Hnew\x1b[K\x1b[2;1Hnewer");
+        }
+        let frame = render_damage_from_structure(
+            &server,
+            &structure,
+            &BTreeMap::from([(created.pane, consumed)]),
+            &mut render_state,
+            capabilities,
+        )
+        .unwrap();
+        let frame = String::from_utf8(frame).unwrap();
+        let paint_first = frame.find("\x1b[1;1Hnew").unwrap();
+        let clear_first = frame.find("\x1b[1;4H\x1b[K").unwrap();
+        let paint_second = frame.find("\x1b[2;1Hnewer").unwrap();
+
+        assert!(paint_first < clear_first);
+        assert!(clear_first < paint_second);
     }
 
     #[test]
@@ -2503,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_paints_visible_cells_before_destructive_erases() {
+    fn diff_completes_each_changed_row_before_starting_the_next() {
         let mut screen = Screen::new(12, 3);
         let mut engine = TerminalEngine::new();
         let mut state = RenderState::new(12, 3);
@@ -2518,7 +2586,7 @@ mod tests {
         let paint_second = diff.find("\x1b[2;1Hnewer").unwrap();
         let clear_first = diff.find("\x1b[1;4H\x1b[K").unwrap();
         assert!(paint_first < clear_first);
-        assert!(paint_second < clear_first);
+        assert!(clear_first < paint_second);
     }
 
     #[test]
