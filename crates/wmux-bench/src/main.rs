@@ -13,11 +13,11 @@ use std::{
 };
 use wmux_core::{
     build_window_scene, build_window_scene_with_theme, build_window_structure, parse_command_text,
-    render_damage_from_structure, render_diff, render_diff_scene, render_full_scene, route_key,
-    AnimationSpec, AnimationTarget, ClientId, Color, Command, CommandList, CommandQueue,
+    render_damage_from_structure, render_diff, render_diff_scene, render_full, render_full_scene,
+    route_key, AnimationSpec, AnimationTarget, ClientId, Color, Command, CommandList, CommandQueue,
     CommandSource, InputMode, InputRoute, KeyCode, KeyEvent, KeyModifiers, PaneSceneOverrides,
-    Playback, RenderCapabilities, RenderState, Screen, ServerState, SplitDirection, TerminalEngine,
-    UiFrame,
+    Playback, RenderCapabilities, RenderState, Screen, ServerState, SessionId, SplitDirection,
+    TerminalEngine, UiFrame,
 };
 use wmux_platform::{
     PlatformEvent, PlatformPaneId, PlatformRequest, PlatformResult, PtyBackend, TerminalSize,
@@ -115,6 +115,10 @@ struct RawResult {
     violations: usize,
     client_write: Duration,
     checksum: u64,
+    generated_generations: u64,
+    presented_frames: u64,
+    coalesced_generations: u64,
+    input_progress: u64,
 }
 
 #[derive(Debug)]
@@ -147,6 +151,7 @@ const SCENARIOS: &[&str] = &[
     "hybrid-frame-claude",
     "scene-frame-codex",
     "animated-ui",
+    "physical-presentation",
     "idle-input-render",
     "damage-proportional",
     "large-paste",
@@ -222,6 +227,12 @@ fn main() {
         &options,
         "animated-ui",
         || animated_ui_workload(config, options.suite),
+        &mut reports,
+    );
+    run_selected(
+        &options,
+        "physical-presentation",
+        || physical_presentation_workload(options.suite),
         &mut reports,
     );
     run_selected(
@@ -772,6 +783,176 @@ fn animated_ui_workload(config: WorkloadConfig, suite: Suite) -> Report {
             ..RawResult::default()
         }
     })
+}
+
+const PHYSICAL_PRESENTATION_GENERATIONS: usize = 1_000;
+const PHYSICAL_PRESENTATION_ACK_INTERVAL: usize = 16;
+
+fn queue_physical_presentation(
+    state: &ServerState,
+    session: SessionId,
+    render_state: &mut RenderState,
+    sink: &mut CountingSink,
+    sequence: u64,
+) -> (u64, Vec<u8>) {
+    let scene = build_window_scene(state, session, COLS, ROWS)
+        .expect("physical presentation scene remains available");
+    let bytes = render_diff_scene(&scene, render_state);
+    assert!(
+        !bytes.is_empty(),
+        "authoritative generation must produce damage"
+    );
+    let message = Message::Output { sequence, bytes };
+    write_message(sink, &message).expect("encode physical presentation output");
+    match message {
+        Message::Output { sequence, bytes } => (sequence, bytes),
+        _ => unreachable!("constructed an output message"),
+    }
+}
+
+fn present_physical_frame(
+    frame: (u64, Vec<u8>),
+    engine: &mut TerminalEngine,
+    screen: &mut Screen,
+    sink: &mut CountingSink,
+) {
+    let (sequence, bytes) = frame;
+    engine.feed(screen, &bytes);
+    write_message(sink, &Message::OutputAck { sequence })
+        .expect("encode physical presentation acknowledgement");
+}
+
+fn physical_presentation_workload(suite: Suite) -> Report {
+    let first_bytes = tui_frame(TuiFlavor::Codex, 0, COLS, ROWS).len() as u64;
+    let remaining_bytes = tui_frame(TuiFlavor::Codex, 1, COLS, ROWS).len() as u64;
+    let input_bytes =
+        first_bytes + remaining_bytes.saturating_mul(PHYSICAL_PRESENTATION_GENERATIONS as u64 - 1);
+
+    measure(
+        "physical-presentation",
+        suite,
+        input_bytes,
+        PHYSICAL_PRESENTATION_GENERATIONS as u64,
+        move || {
+            let mut state = ServerState::new();
+            let created = state.create_session("physical-presentation", COLS, ROWS);
+            let client = state.add_client();
+            state
+                .attach_client(client, created.session)
+                .expect("benchmark client attaches");
+            let mut render_state = RenderState::new(COLS, ROWS);
+            let mut physical_engine = TerminalEngine::new();
+            let mut physical_screen = Screen::new(COLS, ROWS);
+            let mut sink = CountingSink::default();
+            let mut in_flight = None;
+            let mut next_sequence = 1_u64;
+            let mut last_queued_generation = 0_u64;
+            let mut generated_generations = 0_u64;
+            let mut presented_frames = 0_u64;
+            let mut input_progress = 0_u64;
+            let mut max_queue_depth = 0_usize;
+            let mut latencies_ns = Vec::with_capacity(PHYSICAL_PRESENTATION_GENERATIONS);
+
+            for generation in 0..PHYSICAL_PRESENTATION_GENERATIONS {
+                let started = Instant::now();
+                let pane = state.pane_mut(created.pane).expect("benchmark pane exists");
+                let frame = tui_frame(TuiFlavor::Codex, generation, COLS, ROWS);
+                pane.terminal.feed(&mut pane.screen, &frame);
+                generated_generations += 1;
+
+                let input =
+                    KeyEvent::new(KeyCode::character('x', KeyModifiers::NONE), b"x".to_vec());
+                if matches!(
+                    route_key(&mut state, client, InputMode::Normal, input, generation as u64),
+                    InputRoute::PaneBytes(bytes) if bytes == b"x"
+                ) {
+                    input_progress += 1;
+                }
+
+                if in_flight.is_none() {
+                    in_flight = Some(queue_physical_presentation(
+                        &state,
+                        created.session,
+                        &mut render_state,
+                        &mut sink,
+                        next_sequence,
+                    ));
+                    next_sequence += 1;
+                    last_queued_generation = generated_generations;
+                }
+                max_queue_depth = max_queue_depth.max(usize::from(in_flight.is_some()));
+
+                if (generation + 1) % PHYSICAL_PRESENTATION_ACK_INTERVAL == 0 {
+                    let frame = in_flight.take().expect("one presentation is in flight");
+                    present_physical_frame(
+                        frame,
+                        &mut physical_engine,
+                        &mut physical_screen,
+                        &mut sink,
+                    );
+                    presented_frames += 1;
+                }
+                latencies_ns.push(nanos(started.elapsed()));
+            }
+
+            if let Some(frame) = in_flight.take() {
+                present_physical_frame(
+                    frame,
+                    &mut physical_engine,
+                    &mut physical_screen,
+                    &mut sink,
+                );
+                presented_frames += 1;
+            }
+            if last_queued_generation < generated_generations {
+                let frame = queue_physical_presentation(
+                    &state,
+                    created.session,
+                    &mut render_state,
+                    &mut sink,
+                    next_sequence,
+                );
+                max_queue_depth = max_queue_depth.max(1);
+                present_physical_frame(
+                    frame,
+                    &mut physical_engine,
+                    &mut physical_screen,
+                    &mut sink,
+                );
+                presented_frames += 1;
+            }
+
+            let authoritative = build_window_scene(&state, created.session, COLS, ROWS)
+                .expect("final authoritative scene remains available");
+            let expected = render_full_scene(&authoritative, &mut RenderState::new(COLS, ROWS));
+            let presented = render_full(&physical_screen, &mut RenderState::new(COLS, ROWS));
+            let mut expected_engine = TerminalEngine::new();
+            let mut expected_screen = Screen::new(COLS, ROWS);
+            expected_engine.feed(&mut expected_screen, &expected);
+            let coalesced_generations = generated_generations.saturating_sub(presented_frames);
+            let final_queue_depth = usize::from(in_flight.is_some());
+            let violations = usize::from(max_queue_depth != 1)
+                + usize::from(presented_frames >= generated_generations)
+                + usize::from(coalesced_generations == 0)
+                + usize::from(input_progress != generated_generations)
+                + usize::from(final_queue_depth != 0)
+                + usize::from(!screens_match(&physical_screen, &expected_screen));
+
+            RawResult {
+                latencies_ns,
+                ipc_bytes: sink.bytes,
+                max_queue_depth,
+                final_queue_depth,
+                violations,
+                checksum: hash_pair(&presented, &expected) ^ sink.checksum,
+                generated_generations,
+                presented_frames,
+                coalesced_generations,
+                input_progress,
+                ..RawResult::default()
+            }
+        },
+    )
 }
 
 fn paste_workload(config: WorkloadConfig, suite: Suite) -> Report {
@@ -1331,6 +1512,17 @@ fn checksum_screen(screen: &Screen) -> u64 {
         ^ ((screen.rows() as u64) << 16)
 }
 
+fn screens_match(first: &Screen, second: &Screen) -> bool {
+    first.cols() == second.cols()
+        && first.rows() == second.rows()
+        && first.cursor() == second.cursor()
+        && first.cursor_visible() == second.cursor_visible()
+        && first.cursor_style() == second.cursor_style()
+        && first.bracketed_paste() == second.bracketed_paste()
+        && (0..first.rows())
+            .all(|row| first.render_line_cells(row) == second.render_line_cells(row))
+}
+
 fn nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
@@ -1404,6 +1596,7 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
         "parser-codex",
         "parser-claude",
         "animated-ui",
+        "physical-presentation",
         "idle-input-render",
         "damage-proportional",
         "history-resize-100k",
@@ -1520,6 +1713,35 @@ fn evaluate_performance_gate(options: &Options, reports: &[Report]) -> Result<()
     }
     if animated.raw.final_queue_depth != 0 {
         failures.push("animated-ui left a frame queued after rendering".to_owned());
+    }
+
+    let presentation = find("physical-presentation").expect("required report");
+    if presentation.raw.max_queue_depth != 1 {
+        failures.push(format!(
+            "physical presentation reached {} outstanding frames instead of one",
+            presentation.raw.max_queue_depth
+        ));
+    }
+    if presentation.raw.presented_frames >= presentation.raw.generated_generations {
+        failures.push("physical presentation did not coalesce scene generations".to_owned());
+    }
+    if presentation.raw.coalesced_generations == 0 {
+        failures.push("physical presentation recorded no coalesced generations".to_owned());
+    }
+    if presentation.raw.input_progress != presentation.raw.generated_generations {
+        failures.push(format!(
+            "physical presentation processed {} of {} injected input events",
+            presentation.raw.input_progress, presentation.raw.generated_generations
+        ));
+    }
+    if presentation.raw.final_queue_depth != 0 {
+        failures.push("physical presentation left a frame outstanding".to_owned());
+    }
+    if presentation.raw.violations != 0 {
+        failures.push(format!(
+            "physical presentation recorded {} invariant violations",
+            presentation.raw.violations
+        ));
     }
 
     let resize = find("history-resize-100k").expect("required report");
@@ -1640,7 +1862,8 @@ fn print_json(report: &Report) {
             "\"allocations\":{},\"allocated_bytes\":{},\"peak_live_bytes\":{},",
             "\"ipc_bytes\":{},\"reference_bytes\":{},\"max_queue_depth\":{},",
             "\"final_queue_depth\":{},\"violations\":{},\"client_write_ns\":{},",
-            "\"checksum\":{}}}"
+            "\"checksum\":{},\"generated_generations\":{},\"presented_frames\":{},",
+            "\"coalesced_generations\":{},\"input_progress\":{}}}"
         ),
         report.scenario,
         report.suite,
@@ -1663,14 +1886,18 @@ fn print_json(report: &Report) {
         report.raw.violations,
         nanos(report.raw.client_write),
         report.raw.checksum,
+        report.raw.generated_generations,
+        report.raw.presented_frames,
+        report.raw.coalesced_generations,
+        report.raw.input_progress,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_bytes, platform_dispatch_workload, tui_frame, tui_frames, Suite, TuiFlavor,
-        SCENARIOS,
+        deterministic_bytes, physical_presentation_workload, platform_dispatch_workload, tui_frame,
+        tui_frames, Suite, TuiFlavor, SCENARIOS,
     };
     use crate::legacy_terminal::LegacyTerminalEngine;
     use wmux_core::{Screen, TerminalEngine};
@@ -1708,6 +1935,20 @@ mod tests {
     #[test]
     fn animated_ui_workload_is_registered() {
         assert!(SCENARIOS.contains(&"animated-ui"));
+    }
+
+    #[test]
+    fn physical_presentation_coalesces_without_blocking_input_or_losing_the_latest_scene() {
+        assert!(SCENARIOS.contains(&"physical-presentation"));
+        let report = physical_presentation_workload(Suite::Smoke);
+
+        assert_eq!(report.raw.generated_generations, 1_000);
+        assert_eq!(report.raw.max_queue_depth, 1);
+        assert!(report.raw.presented_frames < report.raw.generated_generations);
+        assert!(report.raw.coalesced_generations > 0);
+        assert_eq!(report.raw.input_progress, 1_000);
+        assert_eq!(report.raw.final_queue_depth, 0);
+        assert_eq!(report.raw.violations, 0);
     }
 
     #[test]
