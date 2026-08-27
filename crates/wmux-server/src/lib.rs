@@ -3543,7 +3543,7 @@ impl ServerOwner {
             let delivered = if bytes.is_empty() {
                 true
             } else {
-                match view.try_enqueue(Outbound::Message(Message::Output(bytes))) {
+                match view.try_enqueue(Outbound::Message(Message::Output { sequence: 0, bytes })) {
                     Ok(()) => {
                         rendered = true;
                         true
@@ -4502,7 +4502,7 @@ mod tests {
         assert!(!owner.render_due_clients(late));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(Outbound::Message(Message::Output(_)))
+            Ok(Outbound::Message(Message::Output { .. }))
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -5352,7 +5352,7 @@ mod tests {
             match message {
                 Some(Message::CommandOk(_)) => return output,
                 Some(Message::CommandErr(error)) => panic!("command {command:?} failed: {error}"),
-                Some(Message::Output(bytes)) => output.extend(bytes),
+                Some(Message::Output { bytes, .. }) => output.extend(bytes),
                 Some(other) => panic!("command {command:?} returned {other:?}"),
                 None => panic!("server closed while running {command:?}"),
             }
@@ -5373,7 +5373,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match read_async_message(stream).await.unwrap() {
-                    Some(Message::Output(bytes))
+                    Some(Message::Output { bytes, .. })
                         if bytes.windows(needle.len()).any(|w| w == needle) =>
                     {
                         return;
@@ -5479,7 +5479,7 @@ mod tests {
                 .unwrap()
             {
                 Some(Message::CommandOk(_)) => break,
-                Some(Message::Output(_)) => {}
+                Some(Message::Output { .. }) => {}
                 other => panic!("unexpected detach response: {other:?}"),
             }
         }
@@ -5719,7 +5719,7 @@ mod tests {
         assert!(owner.runtime.state.clients[&client].confirmation.is_some());
         assert!(owner.render_due_clients(Instant::now()));
         let prompt_frame = outbound_rx.try_recv().unwrap();
-        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+        let Outbound::Message(Message::Output { bytes, .. }) = &prompt_frame else {
             panic!("expected confirmation render");
         };
         assert!(String::from_utf8_lossy(bytes).contains("kill-pane? (y/n)"));
@@ -5791,7 +5791,7 @@ mod tests {
         assert!(owner.process_command_queue(COMMANDS_PER_TURN));
         assert!(owner.render_due_clients(Instant::now()));
         let prompt_frame = outbound_rx.try_recv().unwrap();
-        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+        let Outbound::Message(Message::Output { bytes, .. }) = &prompt_frame else {
             panic!("expected rename prompt render");
         };
         assert!(String::from_utf8_lossy(bytes).contains("rename-window: shell"));
@@ -5867,7 +5867,7 @@ mod tests {
         assert!(owner.process_command_queue(COMMANDS_PER_TURN));
         assert!(owner.render_due_clients(Instant::now()));
         let prompt_frame = outbound_rx.try_recv().unwrap();
-        let Outbound::Message(Message::Output(bytes)) = &prompt_frame else {
+        let Outbound::Message(Message::Output { bytes, .. }) = &prompt_frame else {
             panic!("expected rename prompt render");
         };
         assert!(String::from_utf8_lossy(bytes).contains("rename-session: work"));
@@ -5956,7 +5956,8 @@ mod tests {
         assert!(owner.process_command_queue(COMMANDS_PER_TURN));
 
         assert!(owner.render_due_clients(Instant::now()));
-        let Outbound::Message(Message::Output(bytes)) = outbound_rx.try_recv().unwrap() else {
+        let Outbound::Message(Message::Output { bytes, .. }) = outbound_rx.try_recv().unwrap()
+        else {
             panic!("expected editing prompt frame");
         };
         let frame = String::from_utf8_lossy(&bytes);
@@ -7249,8 +7250,11 @@ mod tests {
             .unwrap();
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
         let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
-        view.try_enqueue(Outbound::Message(wmux_protocol::Message::Output(vec![1])))
-            .unwrap();
+        view.try_enqueue(Outbound::Message(wmux_protocol::Message::Output {
+            sequence: 0,
+            bytes: vec![1],
+        }))
+        .unwrap();
         view.attached = true;
         view.request_immediate_render(Instant::now());
         owner.clients.insert(client, view);
@@ -7266,7 +7270,10 @@ mod tests {
     async fn async_ipc_codec_handles_fragmented_frames() {
         use tokio::io::AsyncWriteExt;
 
-        let message = wmux_protocol::Message::Output(vec![b'x'; 32 * 1024]);
+        let message = wmux_protocol::Message::Output {
+            sequence: 0,
+            bytes: vec![b'x'; 32 * 1024],
+        };
         let frame = wmux_protocol::encode_frame(&message);
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
         let write = tokio::spawn(async move {
@@ -7910,13 +7917,16 @@ mod tests {
     fn client_outbox_enforces_a_byte_budget_not_only_a_message_count() {
         let (outbound_tx, _outbound_rx) = mpsc::channel(64);
         let mut view = ClientView::new(outbound_tx, TerminalCapabilities::default());
-        let first = Outbound::Message(wmux_protocol::Message::Output(vec![0; 3 * 1024 * 1024]));
+        let first = Outbound::Message(wmux_protocol::Message::Output {
+            sequence: 0,
+            bytes: vec![0; 3 * 1024 * 1024],
+        });
         assert!(view.try_enqueue(first).is_ok());
         assert!(matches!(
-            view.try_enqueue(Outbound::Message(wmux_protocol::Message::Output(vec![
-                0;
-                2 * 1024 * 1024
-            ]))),
+            view.try_enqueue(Outbound::Message(wmux_protocol::Message::Output {
+                sequence: 1,
+                bytes: vec![0; 2 * 1024 * 1024],
+            })),
             Err(mpsc::error::TrySendError::Full(_))
         ));
         assert!(view.queued_bytes <= super::CLIENT_OUTPUT_BYTES);

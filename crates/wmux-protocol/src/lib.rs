@@ -5,12 +5,13 @@ use wmux_core::{
 };
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
-pub const VERSION: u32 = 8;
-pub const MAGIC: [u8; 4] = *b"WMX8";
+pub const VERSION: u32 = 9;
+pub const MAGIC: [u8; 4] = *b"WMX9";
 pub const FRAME_HEADER_LEN: usize = 9;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_CLIENT_CWD_BYTES: usize = 64 * 1024;
 const KEY_PREFIX_LEN: usize = 6;
+const OUTPUT_PREFIX_LEN: usize = 8;
 const CONTROL_OUTPUT_PREFIX_LEN: usize = 9;
 const ENCODED_HEADER_LEN: usize = FRAME_HEADER_LEN + CONTROL_OUTPUT_PREFIX_LEN;
 
@@ -124,7 +125,13 @@ pub enum Message {
     Key(WireKeyEvent),
     Paste(Vec<u8>),
     Mouse(MouseEvent),
-    Output(Vec<u8>),
+    Output {
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    OutputAck {
+        sequence: u64,
+    },
     Clipboard(Vec<u8>),
     EnterControl,
     ControlCommand {
@@ -149,7 +156,7 @@ impl Message {
             Self::CommandOk(_) => 4,
             Self::CommandErr(_) => 5,
             Self::Input(_) => 6,
-            Self::Output(_) => 7,
+            Self::Output { .. } => 7,
             Self::Resize { .. } => 8,
             Self::Detach => 9,
             Self::Shutdown => 10,
@@ -160,6 +167,7 @@ impl Message {
             Self::EnterControl => 15,
             Self::ControlCommand { .. } => 16,
             Self::ControlRecord(_) => 17,
+            Self::OutputAck { .. } => 18,
         }
     }
 
@@ -186,6 +194,18 @@ enum EncodedPayload {
 impl EncodedFrame {
     pub fn from_message(message: Message) -> Self {
         match message {
+            Message::Output { sequence, bytes } => {
+                let mut header = [0; ENCODED_HEADER_LEN];
+                header[..FRAME_HEADER_LEN]
+                    .copy_from_slice(&frame_header(7, OUTPUT_PREFIX_LEN + bytes.len()));
+                header[FRAME_HEADER_LEN..FRAME_HEADER_LEN + OUTPUT_PREFIX_LEN]
+                    .copy_from_slice(&sequence.to_le_bytes());
+                Self {
+                    header,
+                    header_len: FRAME_HEADER_LEN + OUTPUT_PREFIX_LEN,
+                    payload: EncodedPayload::Owned(bytes),
+                }
+            }
             Message::Key(event) => {
                 let mut header = [0; ENCODED_HEADER_LEN];
                 header[..FRAME_HEADER_LEN]
@@ -280,11 +300,17 @@ impl EncodedPayload {
                 encode_control_record(&record, &mut bytes);
                 Self::Owned(bytes)
             }
-            Message::Input(bytes)
-            | Message::Paste(bytes)
-            | Message::Output(bytes)
-            | Message::Clipboard(bytes) => Self::Owned(bytes),
-            Message::Key(_) => unreachable!("key events use a split owned payload"),
+            Message::Input(bytes) | Message::Paste(bytes) | Message::Clipboard(bytes) => {
+                Self::Owned(bytes)
+            }
+            Message::Output { .. } | Message::Key(_) => {
+                unreachable!("split-payload messages are handled above")
+            }
+            Message::OutputAck { sequence } => {
+                let mut bytes = [0; 12];
+                bytes[..8].copy_from_slice(&sequence.to_le_bytes());
+                Self::Inline { bytes, len: 8 }
+            }
             Message::Resize { cols, rows } => {
                 let mut bytes = [0; 12];
                 bytes[..2].copy_from_slice(&cols.to_le_bytes());
@@ -312,6 +338,18 @@ impl EncodedPayload {
 }
 
 pub fn write_message(mut writer: impl Write, message: &Message) -> io::Result<()> {
+    if let Message::Output { sequence, bytes } = message {
+        let mut header = [0; ENCODED_HEADER_LEN];
+        header[..FRAME_HEADER_LEN]
+            .copy_from_slice(&frame_header(7, OUTPUT_PREFIX_LEN + bytes.len()));
+        header[FRAME_HEADER_LEN..FRAME_HEADER_LEN + OUTPUT_PREFIX_LEN]
+            .copy_from_slice(&sequence.to_le_bytes());
+        return write_vectored_all(
+            &mut writer,
+            &header[..FRAME_HEADER_LEN + OUTPUT_PREFIX_LEN],
+            bytes,
+        );
+    }
     if let Message::Key(event) = message {
         let mut header = [0; ENCODED_HEADER_LEN];
         header[..FRAME_HEADER_LEN]
@@ -390,11 +428,14 @@ fn borrowed_payload<'a>(message: &'a Message, fixed: &'a mut [u8; 12]) -> &'a [u
         Message::ControlCommand { .. } | Message::ControlRecord(_) => {
             unreachable!("structured control messages use an owned payload")
         }
-        Message::Input(bytes)
-        | Message::Paste(bytes)
-        | Message::Output(bytes)
-        | Message::Clipboard(bytes) => bytes,
-        Message::Key(_) => unreachable!("key events use a split borrowed payload"),
+        Message::Input(bytes) | Message::Paste(bytes) | Message::Clipboard(bytes) => bytes,
+        Message::Output { .. } | Message::Key(_) => {
+            unreachable!("split-payload messages use specialized writers")
+        }
+        Message::OutputAck { sequence } => {
+            fixed[..8].copy_from_slice(&sequence.to_le_bytes());
+            &fixed[..8]
+        }
         Message::Resize { cols, rows } => {
             fixed[..2].copy_from_slice(&cols.to_le_bytes());
             fixed[2..4].copy_from_slice(&rows.to_le_bytes());
@@ -499,10 +540,9 @@ fn payload_len(message: &Message) -> usize {
         Message::Command(text) | Message::CommandOk(text) | Message::CommandErr(text) => text.len(),
         Message::ControlCommand { command, .. } => 8 + command.len(),
         Message::ControlRecord(record) => control_record_len(record),
-        Message::Input(bytes)
-        | Message::Paste(bytes)
-        | Message::Output(bytes)
-        | Message::Clipboard(bytes) => bytes.len(),
+        Message::Input(bytes) | Message::Paste(bytes) | Message::Clipboard(bytes) => bytes.len(),
+        Message::Output { bytes, .. } => OUTPUT_PREFIX_LEN + bytes.len(),
+        Message::OutputAck { .. } => 8,
         Message::Key(event) => KEY_PREFIX_LEN + event.raw.len(),
         Message::Resize { .. } => 4,
         Message::Mouse(_) => 7,
@@ -541,11 +581,15 @@ fn encode_payload_into(message: &Message, out: &mut Vec<u8>) {
             out.extend_from_slice(command.as_bytes());
         }
         Message::ControlRecord(record) => encode_control_record(record, out),
-        Message::Input(bytes)
-        | Message::Paste(bytes)
-        | Message::Output(bytes)
-        | Message::Clipboard(bytes) => {
+        Message::Input(bytes) | Message::Paste(bytes) | Message::Clipboard(bytes) => {
             out.extend_from_slice(bytes);
+        }
+        Message::Output { sequence, bytes } => {
+            out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        Message::OutputAck { sequence } => {
+            out.extend_from_slice(&sequence.to_le_bytes());
         }
         Message::Key(event) => {
             let start = out.len();
@@ -589,7 +633,23 @@ fn decode_payload_owned(tag: u8, payload: Vec<u8>) -> io::Result<Message> {
         4 => Ok(Message::CommandOk(string_payload(payload)?)),
         5 => Ok(Message::CommandErr(string_payload(payload)?)),
         6 => Ok(Message::Input(payload)),
-        7 => Ok(Message::Output(payload)),
+        7 => {
+            if payload.len() < OUTPUT_PREFIX_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad output transaction",
+                ));
+            }
+            let sequence = u64::from_le_bytes(
+                payload[..OUTPUT_PREFIX_LEN]
+                    .try_into()
+                    .expect("output prefix length was checked"),
+            );
+            let mut bytes = payload;
+            bytes.copy_within(OUTPUT_PREFIX_LEN.., 0);
+            bytes.truncate(bytes.len() - OUTPUT_PREFIX_LEN);
+            Ok(Message::Output { sequence, bytes })
+        }
         8 => {
             if payload.len() != 4 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad resize"));
@@ -617,6 +677,22 @@ fn decode_payload_owned(tag: u8, payload: Vec<u8>) -> io::Result<Message> {
         }
         16 => decode_control_command(payload),
         17 => decode_control_record(&payload).map(Message::ControlRecord),
+        18 => {
+            if payload.len() != 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad output acknowledgement",
+                ));
+            }
+            Ok(Message::OutputAck {
+                sequence: u64::from_le_bytes(
+                    payload
+                        .as_slice()
+                        .try_into()
+                        .expect("output acknowledgement length was checked"),
+                ),
+            })
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
     }
 }
@@ -1120,7 +1196,7 @@ mod tests {
 
     #[test]
     fn roundtrips_all_basics() {
-        assert_eq!(MAGIC, *b"WMX8");
+        assert_eq!(MAGIC, *b"WMX9");
         let messages = [
             Message::Hello {
                 version: VERSION,
@@ -1143,6 +1219,11 @@ mod tests {
                 column: 120,
                 row: 40,
             }),
+            Message::Output {
+                sequence: 42,
+                bytes: b"frame".to_vec(),
+            },
+            Message::OutputAck { sequence: 42 },
             Message::Clipboard(b"selected text".to_vec()),
             Message::EnterControl,
             Message::ControlCommand {
@@ -1163,7 +1244,10 @@ mod tests {
 
     #[test]
     fn async_transport_primitives_preserve_the_wire_format() {
-        let message = Message::Output(vec![0, 1, 2, 0xff]);
+        let message = Message::Output {
+            sequence: 42,
+            bytes: vec![0, 1, 2, 0xff],
+        };
         let frame = encode_frame(&message);
         let header: [u8; FRAME_HEADER_LEN] = frame[..FRAME_HEADER_LEN].try_into().unwrap();
         let (tag, payload_len) = decode_frame_header(&header).unwrap();
@@ -1176,17 +1260,25 @@ mod tests {
 
     #[test]
     fn owned_codec_transfers_variable_payload_without_reallocation() {
-        let payload = vec![b'x'; 4096];
+        let mut payload = Vec::with_capacity(8 + 4096);
+        payload.extend_from_slice(&42_u64.to_le_bytes());
+        payload.extend(std::iter::repeat_n(b'x', 4096));
         let pointer = payload.as_ptr();
         let decoded = decode_frame_payload_owned(7, payload).unwrap();
-        assert!(
-            matches!(decoded, Message::Output(bytes) if bytes.len() == 4096 && bytes.as_ptr() == pointer)
-        );
+        assert!(matches!(
+            decoded,
+            Message::Output { sequence: 42, bytes }
+                if bytes.len() == 4096 && bytes.as_ptr() == pointer
+        ));
 
         let payload = vec![b'y'; 4096];
         let pointer = payload.as_ptr();
-        let frame = EncodedFrame::from_message(Message::Output(payload));
+        let frame = EncodedFrame::from_message(Message::Output {
+            sequence: 43,
+            bytes: payload,
+        });
         assert_eq!(frame.payload().as_ptr(), pointer);
+        assert_eq!(&frame.header()[FRAME_HEADER_LEN..], &43_u64.to_le_bytes());
 
         let mut raw = Vec::with_capacity(4_096);
         raw.extend_from_slice(b"key");
@@ -1227,6 +1319,28 @@ mod tests {
     fn fixed_empty_messages_reject_trailing_payload() {
         assert_eq!(
             decode_frame_payload_owned(9, vec![1]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn presentation_messages_reject_truncated_fixed_prefixes() {
+        assert_eq!(
+            decode_frame_payload_owned(7, vec![0; 7])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_frame_payload_owned(18, vec![0; 7])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode_frame_payload_owned(18, vec![0; 9])
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -1275,8 +1389,8 @@ mod tests {
 
     #[test]
     fn protocol_documentation_matches_wire_constants() {
-        assert_eq!(VERSION, 8);
-        assert_eq!(MAGIC, *b"WMX8");
+        assert_eq!(VERSION, 9);
+        assert_eq!(MAGIC, *b"WMX9");
         let documentation = include_str!("../../../docs/ipc-protocol.md");
         assert!(documentation
             .lines()
@@ -1297,7 +1411,7 @@ mod tests {
             raw: "\u{3bb}".as_bytes().to_vec(),
         });
         let frame = encode_frame(&message);
-        assert_eq!(frame, b"WMX8\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
+        assert_eq!(frame, b"WMX9\x0b\x08\0\0\0\0\x06\xbb\x03\0\0\xce\xbb");
         assert_eq!(read_message(frame.as_slice()).unwrap(), Some(message));
     }
 

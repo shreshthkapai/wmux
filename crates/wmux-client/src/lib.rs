@@ -487,7 +487,7 @@ async fn attach_io_loop(
                     "terminal IPC reader stopped unexpectedly",
                 ))??;
                 match classify_attached_inbound(inbound) {
-                    AttachedInbound::Output(bytes) => {
+                    AttachedInbound::Output { sequence: _, bytes } => {
                         terminal.write_render_transaction(
                             &bytes,
                             capabilities.contains(TerminalCapabilities::SYNCHRONIZED_OUTPUT),
@@ -598,7 +598,7 @@ async fn read_inbound_messages(
 
 #[derive(Debug, Eq, PartialEq)]
 enum AttachedInbound {
-    Output(Vec<u8>),
+    Output { sequence: u64, bytes: Vec<u8> },
     Clipboard(Vec<u8>),
     CommandComplete,
     CommandError(String),
@@ -607,7 +607,7 @@ enum AttachedInbound {
 
 fn classify_attached_inbound(message: Option<Message>) -> AttachedInbound {
     match message {
-        Some(Message::Output(bytes)) => AttachedInbound::Output(bytes),
+        Some(Message::Output { sequence, bytes }) => AttachedInbound::Output { sequence, bytes },
         Some(Message::Clipboard(bytes)) => AttachedInbound::Clipboard(bytes),
         Some(Message::CommandOk(_)) => AttachedInbound::CommandComplete,
         Some(Message::CommandErr(message)) => AttachedInbound::CommandError(message),
@@ -710,7 +710,8 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Key(_) => "key",
         Message::Paste(_) => "paste",
         Message::Mouse(_) => "mouse",
-        Message::Output(_) => "output",
+        Message::Output { .. } => "output",
+        Message::OutputAck { .. } => "output-ack",
         Message::Clipboard(_) => "clipboard",
         Message::EnterControl => "enter-control",
         Message::ControlCommand { .. } => "control-command",
@@ -1489,7 +1490,10 @@ mod tests {
             for sequence in 0..FRAMES {
                 write_async_message(
                     &mut writer,
-                    Message::Output((sequence as u64).to_le_bytes().to_vec()),
+                    Message::Output {
+                        sequence: sequence as u64,
+                        bytes: (sequence as u64).to_le_bytes().to_vec(),
+                    },
                 )
                 .await
                 .unwrap();
@@ -1503,7 +1507,10 @@ mod tests {
             let message = inbound_rx.recv().await.unwrap().unwrap().unwrap();
             assert_eq!(
                 message,
-                Message::Output((expected as u64).to_le_bytes().to_vec())
+                Message::Output {
+                    sequence: expected as u64,
+                    bytes: (expected as u64).to_le_bytes().to_vec(),
+                }
             );
         }
 

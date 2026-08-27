@@ -451,10 +451,13 @@ fn frame_workload(config: WorkloadConfig, suite: Suite, flavor: TuiFlavor) -> Re
                 engine.feed(&mut screen, frame);
                 let rendered = render_diff(&screen, &mut render_state);
                 latencies.push(nanos(frame_started.elapsed()));
-                let message = Message::Output(rendered);
+                let message = Message::Output {
+                    sequence: 0,
+                    bytes: rendered,
+                };
                 write_message(&mut ipc_sink, &message).expect("encode output message");
                 let write_started = Instant::now();
-                let Message::Output(bytes) = &message else {
+                let Message::Output { bytes, .. } = &message else {
                     unreachable!("constructed output message");
                 };
                 client_sink.write_all(bytes).expect("counting sink write");
@@ -516,10 +519,13 @@ fn hybrid_frame_workload(config: WorkloadConfig, suite: Suite, flavor: TuiFlavor
                     state.pane(created.pane).expect("hybrid pane").generation(),
                 );
                 latencies.push(nanos(frame_started.elapsed()));
-                let message = Message::Output(rendered);
+                let message = Message::Output {
+                    sequence: 0,
+                    bytes: rendered,
+                };
                 write_message(&mut ipc_sink, &message).expect("encode hybrid output");
                 let write_started = Instant::now();
-                let Message::Output(bytes) = &message else {
+                let Message::Output { bytes, .. } = &message else {
                     unreachable!("constructed output message");
                 };
                 client_sink.write_all(bytes).expect("counting sink write");
@@ -655,7 +661,14 @@ fn scene_frame_workload(config: WorkloadConfig, suite: Suite) -> Report {
                 let scene = build_window_scene(&state, created.session, COLS, ROWS)
                     .expect("authoritative scene");
                 let rendered = render_diff_scene(&scene, &mut render_state);
-                write_message(&mut sink, &Message::Output(rendered)).expect("encode scene output");
+                write_message(
+                    &mut sink,
+                    &Message::Output {
+                        sequence: 0,
+                        bytes: rendered,
+                    },
+                )
+                .expect("encode scene output");
                 latencies.push(nanos(started.elapsed()));
             }
             RawResult {
@@ -740,7 +753,14 @@ fn animated_ui_workload(config: WorkloadConfig, suite: Suite) -> Report {
             )
             .expect("animated scene");
             let rendered = render_diff_scene(&scene, &mut render_state);
-            write_message(&mut sink, &Message::Output(rendered)).expect("encode animated output");
+            write_message(
+                &mut sink,
+                &Message::Output {
+                    sequence: 0,
+                    bytes: rendered,
+                },
+            )
+            .expect("encode animated output");
             latencies.push(nanos(started.elapsed()));
         }
         RawResult {
@@ -853,8 +873,14 @@ fn split_storm_workload(config: WorkloadConfig, suite: Suite) -> Report {
                     build_window_scene(&state, created.session, COLS, ROWS).expect("split scene");
                 let rendered = render_diff_scene(&scene, &mut render_state);
                 violations += usize::from(contains_blank_frame(&rendered));
-                write_message(&mut ipc_sink, &Message::Output(rendered))
-                    .expect("encode split output");
+                write_message(
+                    &mut ipc_sink,
+                    &Message::Output {
+                        sequence: 0,
+                        bytes: rendered,
+                    },
+                )
+                .expect("encode split output");
                 latencies.push(nanos(started.elapsed()));
 
                 let started = Instant::now();
@@ -863,8 +889,14 @@ fn split_storm_workload(config: WorkloadConfig, suite: Suite) -> Report {
                     build_window_scene(&state, created.session, COLS, ROWS).expect("joined scene");
                 let rendered = render_diff_scene(&scene, &mut render_state);
                 violations += usize::from(contains_blank_frame(&rendered));
-                write_message(&mut ipc_sink, &Message::Output(rendered))
-                    .expect("encode joined output");
+                write_message(
+                    &mut ipc_sink,
+                    &Message::Output {
+                        sequence: 0,
+                        bytes: rendered,
+                    },
+                )
+                .expect("encode joined output");
                 latencies.push(nanos(started.elapsed()));
             }
             RawResult {
@@ -918,8 +950,14 @@ fn detach_backlog_workload(config: WorkloadConfig, suite: Suite) -> Report {
             let mut render_state = RenderState::new(COLS, ROWS);
             let rendered = render_diff(&screen, &mut render_state);
             let mut ipc_sink = CountingSink::default();
-            write_message(&mut ipc_sink, &Message::Output(rendered))
-                .expect("encode backlog output");
+            write_message(
+                &mut ipc_sink,
+                &Message::Output {
+                    sequence: 0,
+                    bytes: rendered,
+                },
+            )
+            .expect("encode backlog output");
             RawResult {
                 ipc_bytes: ipc_sink.bytes,
                 max_queue_depth,
@@ -952,8 +990,14 @@ fn multiple_clients_workload(config: WorkloadConfig, suite: Suite) -> Report {
                 engine.feed(&mut screen, frame);
                 for client in &mut clients {
                     let rendered = render_diff(&screen, client);
-                    write_message(&mut ipc_sink, &Message::Output(rendered))
-                        .expect("encode multi-client output");
+                    write_message(
+                        &mut ipc_sink,
+                        &Message::Output {
+                            sequence: 0,
+                            bytes: rendered,
+                        },
+                    )
+                    .expect("encode multi-client output");
                 }
                 latencies.push(nanos(started.elapsed()));
             }

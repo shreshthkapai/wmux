@@ -754,7 +754,7 @@ async fn command(stream: &mut DuplexStream, text: &str) -> Result<CommandReply, 
                     "command {text:?} failed: {error}"
                 )))
             }
-            Ok(Ok(Some(Message::Output(bytes)))) => output.extend(bytes),
+            Ok(Ok(Some(Message::Output { bytes, .. }))) => output.extend(bytes),
             Ok(Ok(Some(Message::Clipboard(_) | Message::ControlRecord(_)))) => {}
             Ok(Ok(Some(other))) => {
                 return Err(StressError::new(format!(
@@ -782,7 +782,7 @@ async fn detach(stream: &mut DuplexStream) -> Result<(), StressError> {
         }
         match tokio::time::timeout(remaining, read_message(stream)).await {
             Ok(Ok(Some(Message::CommandOk(_)))) => return Ok(()),
-            Ok(Ok(Some(Message::Output(_) | Message::Clipboard(_)))) => {}
+            Ok(Ok(Some(Message::Output { .. } | Message::Clipboard(_)))) => {}
             Ok(Ok(Some(other))) => {
                 return Err(StressError::new(format!(
                     "detach returned unexpected {other:?}"
@@ -818,7 +818,7 @@ async fn wait_for_output(stream: &mut DuplexStream, marker: &[u8]) -> Result<(),
             )));
         }
         match tokio::time::timeout(remaining, read_message(stream)).await {
-            Ok(Ok(Some(Message::Output(bytes)))) => {
+            Ok(Ok(Some(Message::Output { bytes, .. }))) => {
                 output.extend(bytes);
                 if contains(&output, marker) {
                     return Ok(());
@@ -849,7 +849,7 @@ async fn wait_for_output_or_shutdown(
             return Err(StressError::new("pane exit output marker timed out"));
         }
         match tokio::time::timeout(remaining, read_message(stream)).await {
-            Ok(Ok(Some(Message::Output(bytes)))) => {
+            Ok(Ok(Some(Message::Output { bytes, .. }))) => {
                 output.extend(bytes);
                 if contains(&output, marker) {
                     return Ok(());

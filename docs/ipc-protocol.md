@@ -1,7 +1,7 @@
 # IPC Protocol
 
-Protocol version: 8
-Wire magic: WMX8
+Protocol version: 9
+Wire magic: WMX9
 Maximum frame payload: 16777216 bytes
 
 wmux IPC is a versioned, framed byte protocol between disposable clients and
@@ -15,7 +15,7 @@ Every frame has a 9-byte header followed by the declared payload:
 
 | Offset | Size | Field | Encoding |
 | --- | ---: | --- | --- |
-| 0 | 4 | magic | ASCII `WMX8` |
+| 0 | 4 | magic | ASCII `WMX9` |
 | 4 | 1 | message tag | unsigned byte |
 | 5 | 4 | payload length | little-endian `u32` |
 
@@ -33,7 +33,7 @@ output, paste, key raw bytes, and clipboard payloads may contain any byte.
 | 4 | `CommandOk` | UTF-8 result text |
 | 5 | `CommandErr` | UTF-8 error text |
 | 6 | `Input` | opaque terminal input bytes |
-| 7 | `Output` | opaque rendered terminal output bytes |
+| 7 | `Output` | sequence `u64`, opaque rendered terminal output bytes |
 | 8 | `Resize` | columns `u16`, rows `u16` |
 | 9 | `Detach` | empty |
 | 10 | `Shutdown` | empty |
@@ -44,12 +44,14 @@ output, paste, key raw bytes, and clipboard payloads may contain any byte.
 | 15 | `EnterControl` | empty |
 | 16 | `ControlCommand` | sequence `u64`, UTF-8 command text |
 | 17 | `ControlRecord` | structured record tag and record payload |
+| 18 | `OutputAck` | sequence `u64` |
 
 `HelloOk` payloads are exactly 12 bytes. `Hello` has a 16-byte fixed prefix and
 an exact length-prefixed client working directory limited to 65,536 bytes.
 Capability bit 0 means synchronized output and bit 1 means scroll-region
 support; unknown bits are preserved but do not grant behavior the receiver
 does not implement. Mouse payloads are exactly 7 bytes. `Resize` is exactly 4
+bytes. `Output` requires an 8-byte sequence prefix and `OutputAck` is exactly 8
 bytes. `Detach` and `Shutdown` reject non-empty payloads.
 
 ### Semantic key payload
@@ -76,7 +78,7 @@ the protocol and may be empty.
 
 ## Handshake and identity
 
-The first client frame must be `Hello` with version 8. A compatible server
+The first client frame must be `Hello` with version 9. A compatible server
 answers `HelloOk` before accepting commands. A numeric mismatch returns a
 protocol-version error naming both versions. Invalid magic means an
 incompatible service owns the endpoint; the client reports that condition and
