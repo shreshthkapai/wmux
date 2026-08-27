@@ -28,13 +28,31 @@ behavior from entering the shared semantic path.
 
 ### Default UI evidence
 
-The accepted 16-case aggregate is `b82606bed0adc486` after protocol version 8
-added bounded client working-directory context to `Hello` and the control case
-received a version-neutral name. The existing server-owned status row,
+The current accepted 16-case aggregate is `b217356f473bf48e`. Protocol version
+9 deliberately changed the wire magic and therefore the hashed control-protocol
+frame; three consecutive Windows release runs produced the new aggregate. The
+bounded client working-directory context in `Hello`, server-owned status row,
 connected box-drawing borders, active-pane emphasis, and stable full-terminal
-window-list centering remain in the multiple-client scene fixture.
+window-list centering remain in the portable fixtures.
 `EXPECTED_DIFFERENCES` remains empty; hosted Windows, Linux, and macOS runners
 must produce the same aggregate.
+
+### Physical presentation and input evidence
+
+Protocol version 9 adds sequenced render output and exact physical
+acknowledgements without changing the OS-neutral terminal model. Shared codec,
+server, and client tests cover sequence validation, one frame in flight,
+coalescing to the latest grid, independent clients, terminal-write failure,
+and key/paste progress while a presentation worker is blocked. Core replay
+tests require coherent row updates and exact final cells, cursor state, and
+terminal modes across 512 deterministic mixed mutations.
+
+Native input regressions preserve a leading `&` byte and ordered mouse
+down-drag-up and wheel events in both platform adapters. Server tests then
+verify rapid history clamping, one application report per wheel event,
+selection highlighting, exact clipboard bytes, and unprefixed punctuation
+passthrough. These are shared semantic requirements; platform conditionals may
+only normalize native event mechanics before the protocol boundary.
 
 ### Phase 7 shared-semantics evidence
 

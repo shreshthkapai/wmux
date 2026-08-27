@@ -67,6 +67,12 @@ decode protocol messages into `ServerEvent` values, consume bounded outbound
 queues, and report `ClientWritable` events after completed writes. These I/O
 tasks cannot access server state.
 
+`ClientWritable` releases only outbound byte accounting. It does not certify a
+physical terminal update and cannot unlock another render. A validated protocol
+v9 `OutputAck` becomes the server-internal `OutputPresented` owner message; only
+that matching sequence opens the per-client presentation gate. Neither event
+mutates core state outside the state-owner loop.
+
 ConPTY IOCP readers emit `PlatformEvent` values into a bounded queue owned by
 their pane and notify the owner when data becomes ready. The owner converts
 those semantic events into terminal-engine mutations even with zero attached

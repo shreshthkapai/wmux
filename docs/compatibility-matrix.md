@@ -1,7 +1,9 @@
-# Beta-Core Compatibility Matrix
+# Compatibility Matrix
 
-This matrix records evidence for the nonvisual Phase 8 beta core. It does not
-cover UI polish, themes, packaging, or public release artifacts.
+This matrix records the evidence level for wmux's portable semantics and native
+platform integrations. A released feature is not assumed to have identical
+native mechanics on every operating system; each status describes what was
+actually executed.
 
 Every status cell uses one of these terms:
 
@@ -15,7 +17,7 @@ Configuring a CI job is not `CI-verified`. Until the new workflow completes on
 an actual macOS runner, macOS runtime rows remain `manual-pending` or
 `compile-only`.
 
-## Automated beta-core evidence
+## Automated core evidence
 
 | Contract | Windows | Linux | macOS |
 | --- | --- | --- | --- |
@@ -31,6 +33,9 @@ an actual macOS runner, macOS runtime rows remain `manual-pending` or
 | Stable malformed-input corpus replay | `verified` | `verified` | `compile-only` |
 | Sanitizer-backed fuzz smoke | `manual-pending` | `verified` | `manual-pending` |
 | Full comparable release performance gate | `verified` | `manual-pending` | `manual-pending` |
+| Sequenced presentation and slow-sink convergence | `verified` | `manual-pending` | `manual-pending` |
+| Coherent row and final-cursor replay | `verified` | `manual-pending` | `manual-pending` |
+| Printable punctuation and ordered native mouse events | `verified` | `manual-pending` | `manual-pending` |
 
 Windows uses authenticated named pipes, SID identity, ConPTY, and Job Objects.
 Linux uses protected AF_UNIX sockets, `SO_PEERCRED`, PTYs, and process groups.
@@ -62,5 +67,6 @@ combinations remain explicit manual acceptance work.
 | iTerm2 | `manual-pending` | `manual-pending` |
 | VS Code integrated terminal | `manual-pending` | `manual-pending` |
 
-See [beta-core-gate.md](beta-core-gate.md) for the commands and fingerprints
-and [known-differences.md](known-differences.md) for discrepancy classification.
+The historical Phase 8 commands and fingerprints remain in
+[beta-core-gate.md](beta-core-gate.md). See
+[known-differences.md](known-differences.md) for discrepancy classification.

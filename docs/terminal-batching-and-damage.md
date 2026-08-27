@@ -82,9 +82,11 @@ older than the retained generation range require a full redraw.
 ## Client Consumption
 
 Each attached client stores its own consumed generation per visible pane. A
-generation is consumed only after that client's output queue accepts the
-rendered frame. A blocked client keeps its old baseline while other clients
-continue rendering. No renderer clears pane state globally.
+generation and candidate baseline advance only after that client's output queue
+accepts the complete rendered frame. The client may then have exactly one
+physical transaction in flight. Until its sequence is acknowledged, newer
+generations remain authoritative pending work and no successor diff is built.
+Other clients continue rendering. No renderer clears pane state globally.
 
 The existing client-scoped cell baseline remains the final correctness check
 for terminal output diffing. Generations avoid unnecessary scene work and
@@ -107,6 +109,12 @@ restored or the 8 ms ceiling expires. This coalesces split hide/draw/show reads
 without delaying PTY parsing, application input, or a deliberately hidden
 cursor beyond the ceiling.
 
+After a transaction is built, physical presentation has its own independent
+gate. Slow terminal writes cannot block parsing, screen mutation, commands, or
+input forwarding. At most one render is outstanding per client, so sustained
+streaming and rapid scroll state changes converge directly to the newest grid
+instead of replaying a queue of stale visual frames.
+
 ## Correctness Gates
 
 The benchmark crate retains the previous parser model under `cfg(test)` only.
@@ -114,7 +122,12 @@ Every deterministic replay frame is applied to both parsers,
 then all visible cells, cursor state, and relevant modes are compared. Core
 tests cover split UTF-8, malformed and oversized CSI, wide cells, alternate
 screens, synchronized output, journal rollover, and generation assignment.
-Server tests verify independent generation consumption by two clients.
+Renderer tests also replay 512 deterministic mixed updates and require every
+emitted transaction to reconstruct the exact authoritative cells and cursor
+state. They assert that each changed row completes before the next row begins
+and that a transaction emits at most one cursor hide/show pair. Server tests
+verify independent generation consumption by two clients and coalescing until
+physical acknowledgement.
 
 ## Parser dependency
 

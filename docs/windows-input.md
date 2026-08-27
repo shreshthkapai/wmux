@@ -4,9 +4,9 @@ The Windows attach client uses a two-stage input model:
 
 ```text
 Windows console event reader
-  -> structured key, paste, and resize events
+  -> structured key, paste, mouse, and resize events
   -> wmux prefix/key-table handling
-  -> versioned IPC key or paste message
+  -> versioned IPC semantic message
   -> authoritative pane mode translation
   -> ConPTY input
 ```
@@ -19,6 +19,12 @@ console paste records, so wmux converts native paste shortcuts into one
 Clipboard-open contention is retried briefly and never closes the attach
 client. Terminals that emit `Event::Paste` are accepted directly. Paste
 payloads never pass through the wmux prefix-key state machine.
+
+Printable punctuation retains both its semantic character and exact UTF-8
+application bytes. In particular, a plain leading `&` reaches the active pane
+as one `0x26` byte whether typed or pasted. Only prefix followed by `&` invokes
+the configured window action. Shift metadata from the keyboard layout does not
+turn an unprefixed printable symbol into a multiplexer command.
 
 The server retains paste as a semantic event until it reads the active pane's
 authoritative bracketed-paste mode. It then emits either the payload or
@@ -33,6 +39,11 @@ sequence, and both Ctrl+J and Ctrl+Enter produce line feed. This gives
 multiline terminal applications the same default chord across native Windows
 and Unix attach clients. Shift+Enter and other modified Enter events retain
 their identity through CSI-u encoding when the terminal host reports them.
+
+Mouse input is normalized without changing event order, cell coordinates,
+button identity, or Shift/Alt/Control modifiers. Down, drag, up, and wheel
+events use the same OS-neutral protocol representation as the Unix client, so
+selection and application-mouse policy remain server-owned.
 
 The pane screen also tracks private input mode `9001` as authoritative terminal
 state. When a pane enables that mode, the server translates each routed

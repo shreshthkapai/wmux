@@ -99,9 +99,20 @@ rectangle. Numeric cursor, erase, color, and style parameters are serialized
 directly into the frame buffer without temporary formatting allocations.
 
 Rendering is transactional. A candidate baseline is committed only after the
-client's bounded outbound queue accepts the frame. A blocked client therefore
-keeps its last known baseline and consumed generations while later pane damage
-coalesces. Other clients continue independently.
+client's bounded outbound queue accepts the frame. That frame then holds the
+client's one-slot physical-presentation gate until its exact sequence is
+acknowledged. Later pane damage continues updating authoritative grids but
+cannot build an obsolete successor transaction. When the gate opens, all
+accumulated generations become one current diff. Other clients continue
+independently.
+
+Changed rows are serialized coherently from left to right. A row completes its
+text, style changes, and destructive erase before rendering moves to another
+row; erases are never collected into a transaction-wide tail that can expose a
+mixed scene. Cursor position, shape, and visibility are finalized once after
+all row work. Deterministic mixed-update replay covers clears, overwrites,
+styles, wide Unicode, combining marks, cursor changes, and bracketed-paste
+state against the authoritative grid.
 
 Cursor state is also transactional. On hosts without synchronized output, pane
 painting and destructive erases run with the physical cursor hidden. On hosts
@@ -128,8 +139,8 @@ There is no fixed repaint tick.
   window is published after a 1 ms redraw-cycle deferral, coalescing split PTY
   reads from one TUI action.
 - Structural changes and synchronized-output commits are immediate.
-- Blocked clients do not create expired-deadline spin loops; accumulated
-  damage is rendered when `ClientWritable` arrives.
+- Clients with an unacknowledged physical frame do not create expired-deadline
+  spin loops; accumulated damage is rendered after the matching `OutputAck`.
 
 Application synchronized output (`DECSET 2026`) is held until reset or the
 existing safety timeout. Generations emitted while held are not consumed by a
@@ -142,11 +153,12 @@ whole `Screen` and prevents transient clear frames from reaching clients.
 
 ## Terminal capabilities
 
-IPC protocol version 6 carries terminal capability bits in `Hello` and
-`HelloOk`. The server emits complete unframed render transactions. The client
-owns the physical host terminal and wraps each accepted transaction in one
-locked synchronized-output write when support was advertised. Specialized
-scroll operations remain
-server-selected per client. The Windows client recognizes Windows Terminal and
-known `TERM_PROGRAM` hosts; `WMUX_SYNCHRONIZED_OUTPUT=1` or `0` provides an
-explicit override for terminals whose environment is not identifiable.
+IPC protocol version 9 carries terminal capability bits in `Hello` and
+`HelloOk`, sequences every non-empty render, and acknowledges only a completed
+host-terminal write. The server emits complete unframed render transactions.
+The client owns the physical host terminal and wraps each accepted transaction
+in one locked synchronized-output write when support was advertised.
+Specialized scroll operations remain server-selected per client. The Windows
+client recognizes Windows Terminal and known `TERM_PROGRAM` hosts;
+`WMUX_SYNCHRONIZED_OUTPUT=1` or `0` provides an explicit override for terminals
+whose environment is not identifiable.

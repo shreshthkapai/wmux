@@ -76,6 +76,32 @@ bits, unknown key tags, invalid Unicode scalars, nonzero fixed-key values, and
 out-of-range function keys are rejected. The raw suffix is not interpreted by
 the protocol and may be empty.
 
+## Physical render presentation
+
+`Output.sequence` is scoped to one client connection. The server starts at
+zero, advances without wrapping, and allows at most one unacknowledged output
+transaction for an attached client. An empty diff does not consume a sequence.
+
+The client sends `OutputAck` only after its terminal backend has successfully
+written the complete render transaction. Draining the server's IPC writer is
+only byte-accounting progress; it is not proof that the terminal has presented
+the frame. The client performs the terminal write on one persistent
+presentation worker, so key, paste, mouse, resize, and IPC handling continue
+while a host terminal write is delayed.
+
+While an acknowledgement is outstanding, PTY output continues to mutate the
+authoritative server grid and input continues to reach pane processes. The
+server does not build or queue obsolete successor renders. After the matching
+acknowledgement, all accumulated generations are rendered once from the
+acknowledged client baseline to the latest authoritative scene.
+
+An acknowledgement with no matching output, a duplicate acknowledgement, or
+a future sequence disconnects only that client. A client that receives a
+second `Output` before completing the first treats the stream as malformed. A
+failed physical terminal write sends no acknowledgement and closes the
+attachment; pane processes and server-owned sessions remain independent of
+that disposable client.
+
 ## Handshake and identity
 
 The first client frame must be `Hello` with version 9. A compatible server

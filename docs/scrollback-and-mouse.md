@@ -25,7 +25,7 @@ path.
 ## Structured Input
 
 Platform backends produce `wmux_platform::MouseEvent` values with zero-based
-cell coordinates, event kind, button, and modifiers. Protocol version 6 carries
+cell coordinates, event kind, button, and modifiers. Protocol version 9 carries
 that event as a fixed-size frame. No platform console records or pre-encoded
 mouse escape strings cross the boundary.
 
@@ -78,6 +78,15 @@ Mouse wheel input is translated into cursor navigation only when the
 application explicitly requests alternate scroll and its alternate screen is
 active. Applications that request mouse input receive it; remaining wheel input
 is multiplexer history navigation.
+
+Every wheel, press, drag, and release event is processed in arrival order even
+when physical rendering is behind. History offsets clamp at their authoritative
+limit, repeated wheel-down reaches the live view exactly, and application mouse
+tracking emits one ordered report for every wheel event. Visual updates may
+coalesce behind a client's one-frame presentation gate, but mouse events,
+selection state, clipboard payloads, and pane input are never dropped or
+merged. Platform regression tests preserve complete down-drag-up sequences,
+coordinates, buttons, and modifiers on both native input backends.
 
 Normal keyboard input and paste that are routed to a pane clear only the
 originating client's historical offset for that pane and request an immediate
