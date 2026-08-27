@@ -536,12 +536,18 @@ async fn attach_io_loop(
                 }
                 completion.result.map_err(PlatformError::into_io)?;
                 presentation_in_flight = None;
-                send_async_message(
+                if let Err(error) = send_async_message(
                     &mut *writer,
                     Message::OutputAck {
                         sequence: completion.sequence,
                     },
-                ).await?;
+                ).await {
+                    if is_peer_disconnect(&error) {
+                        done.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
             input = input_rx.recv() => {
                 let input = input.ok_or_else(|| io::Error::new(
@@ -650,6 +656,17 @@ fn classify_attached_inbound(message: Option<Message>) -> AttachedInbound {
         Some(Message::Shutdown) | None => AttachedInbound::Exit,
         Some(_) => AttachedInbound::CommandComplete,
     }
+}
+
+fn is_peer_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 async fn send_key(writer: &mut (impl AsyncWrite + Unpin), event: WireKeyEvent) -> io::Result<()> {
@@ -1566,6 +1583,42 @@ mod tests {
         assert_eq!(writes.lock().unwrap().as_slice(), [b"frame".to_vec()]);
         inbound_tx.send(Ok(Some(Message::Shutdown))).await.unwrap();
         assert!(attach.await.unwrap().is_ok());
+        drop(input_tx_guard);
+    }
+
+    #[tokio::test]
+    async fn server_close_after_final_frame_is_a_clean_disposable_client_exit() {
+        let (client, server) = tokio::io::duplex(512);
+        drop(server);
+        let (reader, mut writer) = tokio::io::split(client);
+        drop(reader);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (input_tx_guard, input_rx) = tokio::sync::mpsc::channel(1);
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 5,
+                bytes: b"final frame".to_vec(),
+            })))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            attach_io_loop(
+                &mut writer,
+                inbound_rx,
+                input_rx,
+                Arc::new(AtomicBool::new(false)),
+                TerminalSize::new(80, 24),
+                TerminalCapabilities::default(),
+                Arc::new(NoopTerminal),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_ok());
+        drop(inbound_tx);
         drop(input_tx_guard);
     }
 

@@ -786,7 +786,10 @@ async fn detach(stream: &mut DuplexStream) -> Result<(), StressError> {
         match tokio::time::timeout(remaining, read_message(stream)).await {
             Ok(Ok(Some(Message::CommandOk(_)))) => return Ok(()),
             Ok(Ok(Some(Message::Output { sequence, .. }))) => {
-                write_message(stream, Message::OutputAck { sequence }).await?;
+                // The detach command may already have removed this disposable
+                // client after queuing its final response. Presentation still
+                // completes locally, but the acknowledgement is then moot.
+                let _ = write_message(stream, Message::OutputAck { sequence }).await;
             }
             Ok(Ok(Some(Message::Clipboard(_)))) => {}
             Ok(Ok(Some(other))) => {
