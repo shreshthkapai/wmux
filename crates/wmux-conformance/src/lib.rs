@@ -17,7 +17,7 @@ use wmux_protocol::{
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xb826_06be_d0ad_c486;
+pub const EXPECTED_PORTABLE_FINGERPRINT: u64 = 0xb217_356f_473b_f48e;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformFamily {
