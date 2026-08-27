@@ -228,7 +228,7 @@ hold the fake terminal write, inject `TerminalInput::Key`, observe
 
 - [ ] **Step 2: Run the focused client tests and confirm RED**
 
-Run: `cargo test -p wmux-client presentation --lib`
+Run: `cargo test -p wmux presentation --lib`
 
 Expected: compilation or assertions fail because output is written inline and no acknowledgement exists.
 
@@ -263,7 +263,7 @@ through the existing async select loop while physical output is blocked.
 
 - [ ] **Step 4: Run client tests and confirm GREEN**
 
-Run: `cargo test -p wmux-client --lib`
+Run: `cargo test -p wmux --lib`
 
 Expected: acknowledgement ordering, failure isolation, and concurrent input tests pass.
 
@@ -513,7 +513,7 @@ Run: `cargo test -p wmux-unix --lib`
 
 Run: `cargo test -p wmux-windows --lib`
 
-Run: `cargo test -p wmux-client --lib`
+Run: `cargo test -p wmux --lib`
 
 Run: `cargo test -p wmux-core --lib`
 

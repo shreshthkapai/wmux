@@ -1,3 +1,5 @@
+mod presentation;
+
 use std::{
     fs::{self, OpenOptions},
     future::Future,
@@ -28,6 +30,8 @@ use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
     WireKeyCode, WireKeyEvent, WireKeyModifiers, FRAME_HEADER_LEN, MAX_CLIENT_CWD_BYTES, VERSION,
 };
+
+use crate::presentation::{PresentationRequest, PresentationWorker};
 
 pub fn run_with_platform(
     transport: Arc<dyn ClientTransport>,
@@ -476,6 +480,9 @@ async fn attach_io_loop(
     terminal: Arc<dyn TerminalBackend>,
 ) -> io::Result<()> {
     let _input_stop = InputStopGuard(Arc::clone(&done));
+    let (presentation_tx, mut presentation_rx) = async_mpsc::channel(1);
+    let presentation = PresentationWorker::spawn(Arc::clone(&terminal), presentation_tx)?;
+    let mut presentation_in_flight = None;
     let mut resize_check = tokio::time::interval(Duration::from_millis(500));
     resize_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -487,11 +494,20 @@ async fn attach_io_loop(
                     "terminal IPC reader stopped unexpectedly",
                 ))??;
                 match classify_attached_inbound(inbound) {
-                    AttachedInbound::Output { sequence: _, bytes } => {
-                        terminal.write_render_transaction(
-                            &bytes,
-                            capabilities.contains(TerminalCapabilities::SYNCHRONIZED_OUTPUT),
-                        ).map_err(PlatformError::into_io)?;
+                    AttachedInbound::Output { sequence, bytes } => {
+                        if presentation_in_flight.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "server sent a render before the previous presentation completed",
+                            ));
+                        }
+                        presentation.present(PresentationRequest {
+                            sequence,
+                            bytes,
+                            synchronized_output: capabilities
+                                .contains(TerminalCapabilities::SYNCHRONIZED_OUTPUT),
+                        })?;
+                        presentation_in_flight = Some(sequence);
                     }
                     AttachedInbound::Clipboard(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
@@ -506,6 +522,26 @@ async fn attach_io_loop(
                         return Ok(());
                     }
                 }
+            }
+            completion = presentation_rx.recv() => {
+                let completion = completion.ok_or_else(|| io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "terminal presentation worker stopped unexpectedly",
+                ))?;
+                if presentation_in_flight != Some(completion.sequence) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal presentation completion sequence mismatch",
+                    ));
+                }
+                completion.result.map_err(PlatformError::into_io)?;
+                presentation_in_flight = None;
+                send_async_message(
+                    &mut *writer,
+                    Message::OutputAck {
+                        sequence: completion.sequence,
+                    },
+                ).await?;
             }
             input = input_rx.recv() => {
                 let input = input.ok_or_else(|| io::Error::new(
@@ -1016,14 +1052,15 @@ mod tests {
         io,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc, Mutex,
+            Arc, Condvar, Mutex,
         },
+        time::Duration,
     };
     use wmux_cli::StartupPolicy;
     use wmux_core::{parse_command_text, Command, ControlRecord, PaneId};
     use wmux_platform::{
         PlatformError, PlatformErrorKind, PlatformResult, TerminalBackend, TerminalInput,
-        TerminalModeGuard, TerminalSize,
+        TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers, TerminalModeGuard, TerminalSize,
     };
     use wmux_protocol::{
         Message, TerminalCapabilities, WireKeyCode, WireKeyEvent, WireKeyModifiers,
@@ -1132,6 +1169,13 @@ mod tests {
         size: TerminalSize,
     }
 
+    struct FailingRenderTerminal;
+
+    struct BlockingRenderTerminal {
+        started: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
     impl TerminalBackend for RecordingTerminal {
         fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
             Ok(Box::new(()))
@@ -1148,9 +1192,10 @@ mod tests {
 
         fn write_render_transaction(
             &self,
-            _bytes: &[u8],
+            bytes: &[u8],
             _synchronized_output: bool,
         ) -> PlatformResult<()> {
+            self.writes.lock().unwrap().push(bytes.to_vec());
             Ok(())
         }
 
@@ -1160,6 +1205,76 @@ mod tests {
 
         fn size(&self) -> PlatformResult<TerminalSize> {
             Ok(self.size)
+        }
+    }
+
+    impl TerminalBackend for FailingRenderTerminal {
+        fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
+            Ok(Box::new(()))
+        }
+
+        fn read_input(&self) -> PlatformResult<Option<TerminalInput>> {
+            Ok(None)
+        }
+
+        fn write_output(&self, _bytes: &[u8]) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_render_transaction(
+            &self,
+            _bytes: &[u8],
+            _synchronized_output: bool,
+        ) -> PlatformResult<()> {
+            Err(PlatformError::new(
+                PlatformErrorKind::Disconnected,
+                "present test frame",
+                "scripted render failure",
+            ))
+        }
+
+        fn write_clipboard_text(&self, _text: &str) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> PlatformResult<TerminalSize> {
+            Ok(TerminalSize::new(80, 24))
+        }
+    }
+
+    impl TerminalBackend for BlockingRenderTerminal {
+        fn enter(&self) -> PlatformResult<Box<dyn TerminalModeGuard>> {
+            Ok(Box::new(()))
+        }
+
+        fn read_input(&self) -> PlatformResult<Option<TerminalInput>> {
+            Ok(None)
+        }
+
+        fn write_output(&self, _bytes: &[u8]) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn write_render_transaction(
+            &self,
+            _bytes: &[u8],
+            _synchronized_output: bool,
+        ) -> PlatformResult<()> {
+            self.started.store(true, Ordering::SeqCst);
+            let (lock, ready) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Ok(())
+        }
+
+        fn write_clipboard_text(&self, _text: &str) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> PlatformResult<TerminalSize> {
+            Ok(TerminalSize::new(80, 24))
         }
     }
 
@@ -1401,6 +1516,238 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn presentation_acknowledgement_follows_the_terminal_write() {
+        let (client, mut server) = tokio::io::duplex(512);
+        let (reader, mut writer) = tokio::io::split(client);
+        drop(reader);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(2);
+        let (input_tx_guard, input_rx) = tokio::sync::mpsc::channel(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Arc::new(RecordingTerminal {
+            writes: Arc::clone(&writes),
+            size: TerminalSize::new(80, 24),
+        });
+        let done = Arc::new(AtomicBool::new(false));
+
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 42,
+                bytes: b"frame".to_vec(),
+            })))
+            .await
+            .unwrap();
+        let attach = tokio::spawn(async move {
+            attach_io_loop(
+                &mut writer,
+                inbound_rx,
+                input_rx,
+                done,
+                TerminalSize::new(80, 24),
+                TerminalCapabilities::default(),
+                terminal,
+            )
+            .await
+        });
+        let acknowledgement =
+            tokio::time::timeout(Duration::from_secs(1), read_async_message(&mut server))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(acknowledgement, Some(Message::OutputAck { sequence: 42 }));
+        assert_eq!(writes.lock().unwrap().as_slice(), [b"frame".to_vec()]);
+        inbound_tx.send(Ok(Some(Message::Shutdown))).await.unwrap();
+        assert!(attach.await.unwrap().is_ok());
+        drop(input_tx_guard);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_presentation_sends_no_acknowledgement() {
+        let (client, mut server) = tokio::io::duplex(512);
+        let (reader, mut writer) = tokio::io::split(client);
+        drop(reader);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (input_tx_guard, input_rx) = tokio::sync::mpsc::channel(1);
+
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 9,
+                bytes: b"frame".to_vec(),
+            })))
+            .await
+            .unwrap();
+        let attach = tokio::spawn(async move {
+            attach_io_loop(
+                &mut writer,
+                inbound_rx,
+                input_rx,
+                Arc::new(AtomicBool::new(false)),
+                TerminalSize::new(80, 24),
+                TerminalCapabilities::default(),
+                Arc::new(FailingRenderTerminal),
+            )
+            .await
+        });
+
+        let error = attach.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(read_async_message(&mut server).await.unwrap(), None);
+        drop(input_tx_guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_presentation_does_not_block_key_or_paste_input() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let (reader, mut writer) = tokio::io::split(client);
+        drop(reader);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(2);
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(2);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let terminal = Arc::new(BlockingRenderTerminal {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 11,
+                bytes: b"slow frame".to_vec(),
+            })))
+            .await
+            .unwrap();
+        let attach = tokio::spawn(async move {
+            attach_io_loop(
+                &mut writer,
+                inbound_rx,
+                input_rx,
+                Arc::new(AtomicBool::new(false)),
+                TerminalSize::new(80, 24),
+                TerminalCapabilities::default(),
+                terminal,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        input_tx
+            .send(Ok(TerminalInput::Key(TerminalKeyEvent {
+                code: TerminalKeyCode::Char('a'),
+                modifiers: TerminalKeyModifiers::default(),
+                raw: b"a".to_vec(),
+            })))
+            .await
+            .unwrap();
+        input_tx
+            .send(Ok(TerminalInput::Paste("& run".to_string())))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), read_async_message(&mut server))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Message::Key(WireKeyEvent {
+                code: WireKeyCode::Char('a'),
+                modifiers: WireKeyModifiers::NONE,
+                raw: b"a".to_vec(),
+            }))
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), read_async_message(&mut server))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Message::Paste(b"& run".to_vec()))
+        );
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), read_async_message(&mut server))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Message::OutputAck { sequence: 11 })
+        );
+        inbound_tx.send(Ok(Some(Message::Shutdown))).await.unwrap();
+        assert!(attach.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_render_before_completion_is_a_protocol_error() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let (reader, mut writer) = tokio::io::split(client);
+        drop(reader);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (input_tx_guard, input_rx) = tokio::sync::mpsc::channel(1);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let terminal = Arc::new(BlockingRenderTerminal {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 1,
+                bytes: b"first".to_vec(),
+            })))
+            .await
+            .unwrap();
+        let attach = tokio::spawn(async move {
+            attach_io_loop(
+                &mut writer,
+                inbound_rx,
+                input_rx,
+                Arc::new(AtomicBool::new(false)),
+                TerminalSize::new(80, 24),
+                TerminalCapabilities::default(),
+                terminal,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        inbound_tx
+            .send(Ok(Some(Message::Output {
+                sequence: 2,
+                bytes: b"second".to_vec(),
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            inbound_tx.send(Ok(Some(Message::Shutdown))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_one();
+        let error = attach.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_async_message(&mut server).await.unwrap(), None);
+        drop(input_tx_guard);
     }
 
     #[tokio::test]
