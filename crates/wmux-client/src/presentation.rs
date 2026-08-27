@@ -91,8 +91,10 @@ mod tests {
         TerminalModeGuard, TerminalSize,
     };
 
+    type RecordedWrites = Arc<Mutex<Vec<(Vec<u8>, bool)>>>;
+
     struct ScriptedTerminal {
-        writes: Arc<Mutex<Vec<(Vec<u8>, bool)>>>,
+        writes: RecordedWrites,
         fail: bool,
     }
 
