@@ -1,3 +1,5 @@
+mod presentation;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
@@ -38,6 +40,8 @@ use wmux_protocol::{
     decode_frame_header, decode_frame_payload_owned, EncodedFrame, Message, TerminalCapabilities,
     WireKeyCode, WireKeyEvent, FRAME_HEADER_LEN, MAX_FRAME, VERSION,
 };
+
+use crate::presentation::PresentationGate;
 
 mod theme_runtime;
 
@@ -1448,6 +1452,7 @@ impl RenderSnapshotCache {
 struct ClientView {
     outbound: async_mpsc::Sender<Outbound>,
     queued_bytes: usize,
+    presentation: PresentationGate,
     size: TerminalSize,
     render_state: RenderState,
     attached: bool,
@@ -1499,6 +1504,7 @@ impl ClientView {
         Self {
             outbound,
             queued_bytes: 0,
+            presentation: PresentationGate::new(),
             size,
             render_state: RenderState::new(size.cols, size.rows),
             attached: false,
