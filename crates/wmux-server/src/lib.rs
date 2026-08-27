@@ -6063,8 +6063,11 @@ mod tests {
     }
 
     #[test]
-    fn server_owned_key_unbound_utf8_and_paste_reach_the_pane_once() {
+    fn server_owned_key_and_paste_preserve_leading_ampersand_exactly_once() {
         let (mut owner, client, pane) = attached_owner();
+        owner
+            .handle_wire_key_at(client, wire_char('&', WireKeyModifiers::SHIFT, b"&"), 0)
+            .unwrap();
         owner
             .handle_wire_key_at(
                 client,
@@ -6075,13 +6078,17 @@ mod tests {
         owner
             .handle_event(ServerEvent::ClientInput {
                 client,
-                input: wmux_core::ClientInput::Paste(b"abc".to_vec()),
+                input: wmux_core::ClientInput::Paste(b"& run".to_vec()),
             })
             .unwrap();
 
         assert_eq!(
             owner.runtime.test_inputs,
-            [(pane, "λ".as_bytes().to_vec()), (pane, b"abc".to_vec())]
+            [
+                (pane, b"&".to_vec()),
+                (pane, "λ".as_bytes().to_vec()),
+                (pane, b"& run".to_vec()),
+            ]
         );
     }
 
@@ -6536,6 +6543,65 @@ mod tests {
     }
 
     #[test]
+    fn rapid_wheel_scrollback_clamps_and_returns_to_live_view_exactly() {
+        let mut owner = ServerOwner::new_test(WmuxConfig::default());
+        let created = owner.runtime.state.create_session("rapid-scroll", 20, 3);
+        let mut output = String::new();
+        for line in 0..64 {
+            output.push_str(&format!("line-{line:02}\r\n"));
+        }
+        owner
+            .runtime
+            .apply_pty_output(created.pane, output.as_bytes());
+        owner.runtime.take_history_growth();
+        let max_offset = owner
+            .runtime
+            .state
+            .pane_mut(created.pane)
+            .unwrap()
+            .screen
+            .max_viewport_offset(20);
+        assert!(max_offset > 20);
+
+        let client = owner.runtime.state.add_client();
+        owner
+            .runtime
+            .state
+            .attach_client(client, created.session)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut view = ClientView::new(tx, TerminalCapabilities::default());
+        view.attached = true;
+        view.size = TerminalSize::new(20, 3);
+        owner.clients.insert(client, view);
+
+        for _ in 0..20 {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: mouse(MouseEventKind::ScrollUp, 1, 1),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            owner.clients[&client].scroll_offsets[&created.pane],
+            max_offset
+        );
+
+        for _ in 0..20 {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: mouse(MouseEventKind::ScrollDown, 1, 1),
+                })
+                .unwrap();
+        }
+        assert!(!owner.clients[&client]
+            .scroll_offsets
+            .contains_key(&created.pane));
+    }
+
+    #[test]
     fn wheel_scrolls_history_finalized_above_an_inline_agent_viewport() {
         let mut owner = ServerOwner::new_test(WmuxConfig::default());
         let created = owner
@@ -6657,14 +6723,20 @@ mod tests {
         view.size = TerminalSize::new(20, 3);
         owner.clients.insert(client, view);
 
-        owner
-            .handle_event(ServerEvent::ClientMouse {
-                client,
-                event: mouse(MouseEventKind::ScrollUp, 1, 1),
-            })
-            .unwrap();
+        for _ in 0..20 {
+            owner
+                .handle_event(ServerEvent::ClientMouse {
+                    client,
+                    event: mouse(MouseEventKind::ScrollUp, 1, 1),
+                })
+                .unwrap();
+        }
 
         assert!(owner.clients[&client].scroll_offsets.is_empty());
+        assert_eq!(
+            owner.runtime.test_inputs,
+            vec![(created.pane, b"\x1b[<64;2;2M".to_vec()); 20]
+        );
         assert!(owner
             .runtime
             .state

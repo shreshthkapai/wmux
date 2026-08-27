@@ -164,12 +164,12 @@ mod tests {
             b"\x1b[A"
         );
         assert_eq!(
-            ClientInput::Paste(b"abc".to_vec()).into_pty_bytes(false),
-            b"abc"
+            ClientInput::Paste(b"& run".to_vec()).into_pty_bytes(false),
+            b"& run"
         );
         assert_eq!(
-            ClientInput::Paste(b"abc".to_vec()).into_pty_bytes(true),
-            b"\x1b[200~abc\x1b[201~"
+            ClientInput::Paste(b"& run".to_vec()).into_pty_bytes(true),
+            b"\x1b[200~& run\x1b[201~"
         );
     }
 }

@@ -1515,6 +1515,34 @@ mod tests {
     }
 
     #[test]
+    fn ampersand_is_pane_input_unless_the_prefix_is_active() {
+        let mut state = ServerState::new();
+        let client = state.add_client();
+        let ampersand =
+            || KeyEvent::new(KeyCode::character('&', KeyModifiers::SHIFT), b"&".to_vec());
+
+        assert_eq!(
+            route_key(&mut state, client, InputMode::Normal, ampersand(), 0),
+            InputRoute::PaneBytes(b"&".to_vec())
+        );
+        assert_eq!(
+            route_key(
+                &mut state,
+                client,
+                InputMode::Normal,
+                KeyEvent::new(KeyCode::ctrl('b'), vec![0x02]),
+                1,
+            ),
+            InputRoute::Consumed
+        );
+        assert!(matches!(
+            route_key(&mut state, client, InputMode::Normal, ampersand(), 2),
+            InputRoute::Commands(commands)
+                if matches!(&commands[0], Command::ConfirmBefore { .. })
+        ));
+    }
+
+    #[test]
     fn repeatable_binding_keeps_prefix_and_nonrepeatable_key_retries_root() {
         let mut state = ServerState::new();
         let client = state.add_client();

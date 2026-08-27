@@ -1043,8 +1043,8 @@ mod tests {
         attach_io_loop, attached_command, attached_inner, classify_attached_inbound,
         client_current_dir_text, connect_with_startup_policy, control_io_loop, encode_command_argv,
         escape_control_bytes, format_control_record, format_effective_config, handshake_read_error,
-        no_server_message, protocol_error, read_async_message, read_inbound_messages, retry_delays,
-        send_key, wire_key_event, write_async_message, AttachedInbound,
+        no_server_message, paste_bytes, protocol_error, read_async_message, read_inbound_messages,
+        retry_delays, send_key, wire_key_event, write_async_message, AttachedInbound,
     };
     use std::{
         cell::Cell,
@@ -1067,6 +1067,11 @@ mod tests {
     };
 
     struct NoopTerminal;
+
+    #[test]
+    fn pasted_leading_ampersand_is_preserved_while_newlines_are_normalized() {
+        assert_eq!(paste_bytes("& run\r\nnext\n"), b"& run\rnext\r");
+    }
 
     #[test]
     fn client_working_directory_must_be_absolute() {

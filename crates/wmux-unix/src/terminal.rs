@@ -434,6 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn leading_ampersand_keeps_its_character_and_raw_byte() {
+        let input = normalize_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('&'),
+            KeyModifiers::SHIFT,
+        )));
+
+        assert_eq!(
+            input,
+            Some(TerminalInput::Key(TerminalKeyEvent {
+                code: TerminalKeyCode::Char('&'),
+                modifiers: TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT),
+                raw: b"&".to_vec(),
+            }))
+        );
+    }
+
+    #[test]
     fn bracketed_paste_remains_a_distinct_semantic_event() {
         assert_eq!(
             normalize_event(Event::Paste("line one\nline two".to_string())),
@@ -459,6 +476,88 @@ mod tests {
                 column: 7,
                 row: 3,
             }))
+        );
+    }
+
+    #[test]
+    fn mouse_drag_and_wheel_sequence_keeps_order_and_identity() {
+        let inputs = [
+            (
+                CrosstermMouseEventKind::Down(CrosstermMouseButton::Left),
+                2,
+                4,
+                KeyModifiers::NONE,
+            ),
+            (
+                CrosstermMouseEventKind::Drag(CrosstermMouseButton::Left),
+                8,
+                4,
+                KeyModifiers::SHIFT,
+            ),
+            (
+                CrosstermMouseEventKind::Up(CrosstermMouseButton::Left),
+                8,
+                4,
+                KeyModifiers::SHIFT,
+            ),
+            (
+                CrosstermMouseEventKind::ScrollUp,
+                8,
+                4,
+                KeyModifiers::CONTROL,
+            ),
+            (CrosstermMouseEventKind::ScrollDown, 8, 4, KeyModifiers::ALT),
+        ];
+
+        let actual = inputs.map(|(kind, column, row, modifiers)| {
+            normalize_event(Event::Mouse(CrosstermMouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            }))
+            .expect("mouse event is supported")
+        });
+
+        assert_eq!(
+            actual,
+            [
+                TerminalInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 2,
+                    row: 4,
+                }),
+                TerminalInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                    column: 8,
+                    row: 4,
+                }),
+                TerminalInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                    column: 8,
+                    row: 4,
+                }),
+                TerminalInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    button: MouseButton::None,
+                    modifiers: MouseModifiers::new(MouseModifiers::CONTROL),
+                    column: 8,
+                    row: 4,
+                }),
+                TerminalInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    button: MouseButton::None,
+                    modifiers: MouseModifiers::new(MouseModifiers::ALT),
+                    column: 8,
+                    row: 4,
+                }),
+            ]
         );
     }
 

@@ -678,6 +678,99 @@ mod tests {
     }
 
     #[test]
+    fn leading_ampersand_keeps_its_character_and_raw_byte() {
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('&'), KeyModifiers::SHIFT)),
+            Some(TerminalKeyEvent {
+                code: TerminalKeyCode::Char('&'),
+                modifiers: TerminalKeyModifiers::new(TerminalKeyModifiers::SHIFT),
+                raw: b"&".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn mouse_drag_and_wheel_sequence_keeps_order_and_identity() {
+        let inputs = [
+            (
+                CrosstermMouseEventKind::Down(CrosstermButton::Left),
+                2,
+                4,
+                KeyModifiers::NONE,
+            ),
+            (
+                CrosstermMouseEventKind::Drag(CrosstermButton::Left),
+                8,
+                4,
+                KeyModifiers::SHIFT,
+            ),
+            (
+                CrosstermMouseEventKind::Up(CrosstermButton::Left),
+                8,
+                4,
+                KeyModifiers::SHIFT,
+            ),
+            (
+                CrosstermMouseEventKind::ScrollUp,
+                8,
+                4,
+                KeyModifiers::CONTROL,
+            ),
+            (CrosstermMouseEventKind::ScrollDown, 8, 4, KeyModifiers::ALT),
+        ];
+
+        let actual = inputs.map(|(kind, column, row, modifiers)| {
+            mouse_event(CrosstermMouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            })
+        });
+
+        assert_eq!(
+            actual,
+            [
+                MouseEvent {
+                    kind: MouseEventKind::Down,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
+                    column: 2,
+                    row: 4,
+                },
+                MouseEvent {
+                    kind: MouseEventKind::Drag,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                    column: 8,
+                    row: 4,
+                },
+                MouseEvent {
+                    kind: MouseEventKind::Up,
+                    button: MouseButton::Left,
+                    modifiers: MouseModifiers::new(MouseModifiers::SHIFT),
+                    column: 8,
+                    row: 4,
+                },
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    button: MouseButton::None,
+                    modifiers: MouseModifiers::new(MouseModifiers::CONTROL),
+                    column: 8,
+                    row: 4,
+                },
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    button: MouseButton::None,
+                    modifiers: MouseModifiers::new(MouseModifiers::ALT),
+                    column: 8,
+                    row: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn encodes_ctrl_b_as_prefix_byte() {
         assert_eq!(
             encode_key_bytes(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
