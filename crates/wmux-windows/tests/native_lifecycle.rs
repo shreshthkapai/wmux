@@ -203,7 +203,7 @@ async fn wait_for_command_ok(stream: &mut BoxedIpcStream) -> String {
                 Some(Message::CommandOk(message)) => return message,
                 Some(Message::CommandErr(error)) => panic!("command failed: {error}"),
                 Some(Message::Output { sequence, .. }) => {
-                    write_message(stream, Message::OutputAck { sequence }).await;
+                    acknowledge_output(stream, sequence).await;
                 }
                 Some(Message::Clipboard(_)) => {}
                 Some(message) => panic!("unexpected command response: {message:?}"),
@@ -221,7 +221,7 @@ async fn wait_for_output(stream: &mut BoxedIpcStream, marker: &[u8]) {
         loop {
             match read_message(stream).await {
                 Some(Message::Output { sequence, bytes }) => {
-                    write_message(stream, Message::OutputAck { sequence }).await;
+                    acknowledge_output(stream, sequence).await;
                     output.extend_from_slice(&bytes);
                     if output.windows(marker.len()).any(|window| window == marker) {
                         return;
@@ -250,7 +250,7 @@ async fn wait_for_pid_marker(stream: &mut BoxedIpcStream, marker: &[u8]) -> u32 
         loop {
             match read_message(stream).await {
                 Some(Message::Output { sequence, bytes }) => {
-                    write_message(stream, Message::OutputAck { sequence }).await;
+                    acknowledge_output(stream, sequence).await;
                     output.extend_from_slice(&bytes);
                     if let Some(pid) = parse_pid_marker(&output, marker) {
                         return pid;
@@ -296,7 +296,7 @@ async fn wait_for_shutdown(stream: &mut BoxedIpcStream) {
             match read_message(stream).await {
                 Some(Message::Shutdown) | None => return,
                 Some(Message::Output { sequence, .. }) => {
-                    write_message(stream, Message::OutputAck { sequence }).await;
+                    acknowledge_output(stream, sequence).await;
                 }
                 Some(Message::Clipboard(_) | Message::CommandOk(_)) => {}
                 Some(Message::CommandErr(error)) => panic!("shutdown command failed: {error}"),
@@ -348,14 +348,34 @@ async fn read_message(stream: &mut BoxedIpcStream) -> Option<Message> {
 }
 
 async fn write_message(stream: &mut BoxedIpcStream, message: Message) {
+    try_write_message(stream, message)
+        .await
+        .expect("protocol frame writes");
+}
+
+async fn acknowledge_output(stream: &mut BoxedIpcStream, sequence: u64) {
+    if let Err(error) = try_write_message(stream, Message::OutputAck { sequence }).await {
+        assert!(
+            is_peer_disconnect(&error),
+            "presentation acknowledgement writes: {error}"
+        );
+    }
+}
+
+async fn try_write_message(stream: &mut BoxedIpcStream, message: Message) -> io::Result<()> {
     let frame = EncodedFrame::from_message(message);
-    stream
-        .write_all(frame.header())
-        .await
-        .expect("protocol header writes");
-    stream
-        .write_all(frame.payload())
-        .await
-        .expect("protocol payload writes");
-    stream.flush().await.expect("protocol frame flushes");
+    stream.write_all(frame.header()).await?;
+    stream.write_all(frame.payload()).await?;
+    stream.flush().await
+}
+
+fn is_peer_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
 }
