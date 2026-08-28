@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.17] - 2026-08-28
+
+### Fixed
+
+- Resizing or splitting a pane now preserves independently right-aligned
+  regions on the active input line, preventing Windows pseudoconsole repaints
+  from wrapping a trailing prompt decoration onto a later row.
+
 ## [1.0.16] - 2026-08-28
 
 ### Fixed

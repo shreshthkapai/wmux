@@ -9,9 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-wmux-config = { path = "../crates/wmux-config", version = "=1.0.16" }
-wmux-core = { path = "../crates/wmux-core", version = "=1.0.16" }
-wmux-protocol = { path = "../crates/wmux-protocol", version = "=1.0.16" }
+wmux-config = { path = "../crates/wmux-config", version = "=1.0.17" }
+wmux-core = { path = "../crates/wmux-core", version = "=1.0.17" }
+wmux-protocol = { path = "../crates/wmux-protocol", version = "=1.0.17" }
 
 [[bin]]
 name = "protocol_frame"
