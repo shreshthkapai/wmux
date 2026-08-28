@@ -5396,10 +5396,22 @@ mod tests {
                 Some(Message::CommandOk(_)) => return output,
                 Some(Message::CommandErr(error)) => panic!("command {command:?} failed: {error}"),
                 Some(Message::Output { sequence, bytes }) => {
-                    write_async_message(stream, Message::OutputAck { sequence })
-                        .await
-                        .unwrap();
                     output.extend(bytes);
+                    if let Err(error) =
+                        write_async_message(stream, Message::OutputAck { sequence }).await
+                    {
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::NotConnected
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) {
+                            return output;
+                        }
+                        panic!("output acknowledgement failed during {command:?}: {error}");
+                    }
                 }
                 Some(other) => panic!("command {command:?} returned {other:?}"),
                 None => panic!("server closed while running {command:?}"),
