@@ -58,7 +58,7 @@ pub use render::{
 };
 pub use screen::{
     CursorStyle, DamageBatch, DamageOperation, DamageStatus, InsertDeleteKind, MouseTrackingMode,
-    Screen, MAX_TITLE_BYTES,
+    ResizeRepaintAnchor, Screen, MAX_TITLE_BYTES,
 };
 pub use state::{Client, Pane, PaneResize, ServerState, Session, SessionGroup, Window, Winlink};
 pub use target::{

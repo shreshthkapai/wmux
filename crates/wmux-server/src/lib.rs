@@ -28,7 +28,8 @@ use wmux_core::{
     CommandSource, ControlNotification, ControlRecord, CopyMode, CopyModeResult, InputMode,
     InputRoute, Job, JobContinuation, JobId, KeyCode, KeyEvent, KeyModifiers, Line, PaneId,
     PaneSceneOverrides, PaneViewport, QueuedCommand, RenderCapabilities, RenderState,
-    RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style, UiFrame,
+    ResizeRepaintAnchor, RetainedPaneFrame, ServerEvent, ServerState, StructuralScene, Style,
+    UiFrame,
 };
 use wmux_platform::{
     AcceptedConnection, BoxedIpcStream, JobBackend, JobEvent, JobRequest, MouseButton, MouseEvent,
@@ -884,11 +885,12 @@ impl Runtime {
         {
             return Ok(false);
         }
-        let Some(retained_frame) = self
-            .state
-            .pane(pane_id)
-            .map(|pane| RetainedPaneFrame::capture(pane_id, &pane.screen))
-        else {
+        let Some((retained_frame, repaint_anchor)) = self.state.pane(pane_id).map(|pane| {
+            (
+                RetainedPaneFrame::capture(pane_id, &pane.screen),
+                pane.screen.capture_resize_repaint_anchor(),
+            )
+        }) else {
             return Ok(false);
         };
         let Some(platform) = self.platform_panes.get_mut(&pane_id) else {
@@ -908,6 +910,7 @@ impl Runtime {
                 quiet_until: now + RESIZE_REPAINT_QUIET,
                 max_until: now + RESIZE_REPAINT_MAX,
                 retained_frame,
+                repaint_anchor,
             },
         );
         Ok(true)
@@ -1057,10 +1060,13 @@ impl Runtime {
     }
 
     fn release_resize_repaint_hold(&mut self, pane_id: PaneId) -> bool {
-        if self.resize_repaint_holds.remove(&pane_id).is_none() {
+        let Some(hold) = self.resize_repaint_holds.remove(&pane_id) else {
             return false;
-        }
+        };
         if let Some(pane) = self.state.pane_mut(pane_id) {
+            if let Some(anchor) = hold.repaint_anchor.as_ref() {
+                pane.screen.reconcile_resize_repaint(anchor);
+            }
             pane.screen.mark_full_damage();
         }
         true
@@ -1284,6 +1290,7 @@ struct ResizeRepaintHold {
     quiet_until: Instant,
     max_until: Instant,
     retained_frame: RetainedPaneFrame,
+    repaint_anchor: Option<ResizeRepaintAnchor>,
 }
 
 #[derive(Clone, Copy)]
@@ -7837,6 +7844,31 @@ mod tests {
             .damage_journal()
             .back()
             .is_some_and(|batch| batch.operations.contains(&wmux_core::DamageOperation::Full)));
+    }
+
+    #[test]
+    fn resize_hold_reconciles_a_reflowed_cursor_line_edge_region() {
+        let mut runtime = Runtime::with_config(WmuxConfig::default());
+        let created = runtime.state.create_session("edge", 12, 3);
+        runtime.add_test_platform_pane(created.pane, TerminalSize::new(12, 3));
+        runtime.apply_pty_output(
+            created.pane,
+            b"\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+        runtime.state.resize_window(created.window, 8, 3).unwrap();
+        runtime.apply_pending_pane_resizes().unwrap();
+
+        runtime.apply_pty_output(
+            created.pane,
+            b"\x1b[H\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+        let quiet_until = runtime.resize_repaint_holds[&created.pane].quiet_until;
+        assert!(runtime.expire_repaint_holds(quiet_until));
+
+        let screen = &runtime.state.pane(created.pane).unwrap().screen;
+        assert_eq!(screen.render_line(0).unwrap().text(), ">   XYZW");
+        assert_eq!(screen.render_line(1).unwrap().text(), "");
+        assert_eq!(screen.cursor(), (0, 1));
     }
 
     #[test]

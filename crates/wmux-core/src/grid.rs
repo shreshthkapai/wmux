@@ -673,6 +673,91 @@ pub struct Grid {
     history_cache: Vec<HistoryCacheEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CursorLineEdgeAnchor {
+    pub(crate) left: Vec<Cell>,
+    pub(crate) right: Vec<Cell>,
+}
+
+impl CursorLineEdgeAnchor {
+    fn is_spacer(cell: &Cell) -> bool {
+        cell.text().is_single_char(' ') && cell.width() == 1 && !cell.is_continuation()
+    }
+
+    fn split(line: &Line, cursor_col: u16) -> Option<Self> {
+        let old_cols = usize::from(line.cols());
+        if line.is_wrapped() || old_cols == 0 {
+            return None;
+        }
+        if Self::is_spacer(line.cell(line.cols().saturating_sub(1))?) {
+            return None;
+        }
+
+        let mut longest_gap = (0, 0);
+        let mut run_start = None;
+        for col in usize::from(cursor_col)..old_cols {
+            let spacer = line.cell(col as u16).is_some_and(Self::is_spacer);
+            match (run_start, spacer) {
+                (None, true) => run_start = Some(col),
+                (Some(start), false) => {
+                    if col.saturating_sub(start) > longest_gap.1 - longest_gap.0 {
+                        longest_gap = (start, col);
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        let (gap_start, right_start) = longest_gap;
+        let gap = right_start.saturating_sub(gap_start);
+        if gap < 2 || usize::from(cursor_col) > gap_start {
+            return None;
+        }
+
+        Some(Self {
+            left: (0..gap_start)
+                .filter_map(|col| line.cell(col as u16).cloned())
+                .collect(),
+            right: (right_start..old_cols)
+                .filter_map(|col| line.cell(col as u16).cloned())
+                .collect(),
+        })
+    }
+
+    fn capture(line: &Line, cursor_col: u16, new_cols: u16) -> Option<Self> {
+        let anchor = Self::split(line, cursor_col)?;
+        let new_cols = usize::from(new_cols.max(1));
+        if new_cols >= usize::from(line.cols())
+            || anchor
+                .left
+                .len()
+                .saturating_add(1)
+                .saturating_add(anchor.right.len())
+                > new_cols
+        {
+            return None;
+        }
+        Some(anchor)
+    }
+
+    pub(crate) fn capture_current(line: &Line, cursor_col: u16) -> Option<Self> {
+        Self::split(line, cursor_col)
+    }
+
+    fn render(&self, cols: u16, generation: u64) -> Line {
+        let mut line = Line::blank(cols);
+        for (col, cell) in self.left.iter().cloned().enumerate() {
+            line.replace_cell(col as u16, cell);
+        }
+        let right_start = usize::from(cols).saturating_sub(self.right.len());
+        for (offset, cell) in self.right.iter().cloned().enumerate() {
+            line.replace_cell((right_start + offset) as u16, cell);
+        }
+        line.set_generation(generation);
+        line
+    }
+}
+
 impl PartialEq for Grid {
     fn eq(&self, other: &Self) -> bool {
         self.cols == other.cols
@@ -880,6 +965,10 @@ impl Grid {
         let mut cursor_col = cursor_col.min(old_cols.saturating_sub(1)) as usize;
 
         if cols != old_cols {
+            let cursor_line_anchor = self
+                .visible
+                .get(cursor_row)
+                .and_then(|line| CursorLineEdgeAnchor::capture(line, cursor_col as u16, cols));
             let old_visible_len = self.visible.len();
             let mut old_lines = Vec::with_capacity(old_visible_len + self.below.len() + 8);
             let history_boundary_rows = self.take_incomplete_history_tail(old_cols, &mut old_lines);
@@ -888,7 +977,10 @@ impl Grid {
             let (top_wrap_col, top_wrap_row) = wrap_position(&old_lines, 0, history_boundary_rows);
             let cursor_abs = history_boundary_rows.saturating_add(cursor_row);
             let (wrap_col, wrap_row) = wrap_position(&old_lines, cursor_col, cursor_abs);
-            let mut reflowed = reflow_lines(&old_lines, cols);
+            let anchored_row = cursor_line_anchor
+                .as_ref()
+                .map(|anchor| (history_boundary_rows.saturating_add(cursor_row), anchor));
+            let mut reflowed = reflow_lines_with_anchor(&old_lines, cols, anchored_row);
             if reflowed.len() < rows as usize {
                 let missing = rows as usize - reflowed.len();
                 for _ in 0..missing {
@@ -1160,12 +1252,30 @@ fn display_width(cells: &[Cell]) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn reflow_lines(lines: &[Line], cols: u16) -> Vec<Line> {
-    let mut logical_lines = Vec::new();
+    reflow_lines_with_anchor(lines, cols, None)
+}
+
+fn reflow_lines_with_anchor(
+    lines: &[Line],
+    cols: u16,
+    anchor: Option<(usize, &CursorLineEdgeAnchor)>,
+) -> Vec<Line> {
+    let mut logical_lines: Vec<(Vec<Cell>, u64)> = Vec::new();
     let mut current = Vec::new();
     let mut generation = 0;
+    let mut reflowed = Vec::new();
 
-    for line in lines {
+    for (row, line) in lines.iter().enumerate() {
+        if anchor.is_some_and(|(anchor_row, _)| anchor_row == row) && current.is_empty() {
+            let (_, anchor) = anchor.expect("checked above");
+            for (logical, logical_generation) in logical_lines.drain(..) {
+                reflow_logical_line(&logical, cols, logical_generation, &mut reflowed);
+            }
+            reflowed.push(anchor.render(cols, line.generation()));
+            continue;
+        }
         current.extend(line.content_cells());
         generation = generation.max(line.generation());
         if !line.is_wrapped() {
@@ -1177,7 +1287,6 @@ fn reflow_lines(lines: &[Line], cols: u16) -> Vec<Line> {
         logical_lines.push((current, generation));
     }
 
-    let mut reflowed = Vec::new();
     for (logical, generation) in logical_lines {
         reflow_logical_line(&logical, cols, generation, &mut reflowed);
     }

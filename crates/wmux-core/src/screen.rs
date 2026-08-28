@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::grid::GraphemeAppend;
+use crate::grid::{CursorLineEdgeAnchor, GraphemeAppend};
 use crate::{scalar_width, Cell, Color, Grid, Line, Style};
 use wmux_platform::{MouseButton, MouseEvent, MouseEventKind, MouseModifiers};
 
@@ -135,6 +135,14 @@ pub struct DamageStatus {
     pub current_generation: u64,
     pub retained_batches: usize,
     pub requires_full_redraw: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResizeRepaintAnchor {
+    row: u16,
+    cursor: (u16, u16),
+    line: Line,
+    edge: CursorLineEdgeAnchor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1131,6 +1139,83 @@ impl Screen {
         }
     }
 
+    pub fn capture_resize_repaint_anchor(&self) -> Option<ResizeRepaintAnchor> {
+        if self.alternate_active {
+            return None;
+        }
+        let line = self.primary.line(self.cursor_row)?;
+        let edge = CursorLineEdgeAnchor::capture_current(line, self.cursor_col)?;
+        Some(ResizeRepaintAnchor {
+            row: self.cursor_row,
+            cursor: self.cursor(),
+            line: line.clone(),
+            edge,
+        })
+    }
+
+    pub fn reconcile_resize_repaint(&mut self, anchor: &ResizeRepaintAnchor) -> bool {
+        if self.alternate_active || self.cursor() != anchor.cursor || anchor.row >= self.rows() {
+            return false;
+        }
+        let Some(current) = self.primary.line(anchor.row) else {
+            return false;
+        };
+        if anchor
+            .edge
+            .left
+            .iter()
+            .enumerate()
+            .any(|(col, expected)| current.cell(col as u16).is_none_or(|cell| cell != expected))
+        {
+            return false;
+        }
+
+        let cols = usize::from(self.primary.cols());
+        let rows = usize::from(self.primary.rows());
+        let suffix = &anchor.edge.right;
+        if suffix.is_empty() || suffix.len() > cols.saturating_mul(rows) {
+            return false;
+        }
+        let first = usize::from(anchor.row).saturating_mul(cols);
+        let last = cols.saturating_mul(rows).saturating_sub(suffix.len());
+        let Some(start) = (first..=last).find(|start| {
+            suffix.iter().enumerate().all(|(offset, expected)| {
+                let index = start + offset;
+                self.primary
+                    .line((index / cols) as u16)
+                    .and_then(|line| line.cell((index % cols) as u16))
+                    .is_some_and(|cell| cell == expected)
+            })
+        }) else {
+            return false;
+        };
+
+        let owns_update = !self.update_active;
+        if owns_update {
+            self.begin_update();
+        }
+        for offset in 0..suffix.len() {
+            let index = start + offset;
+            let row = (index / cols) as u16;
+            let col = (index % cols) as u16;
+            if let Some(line) = self.primary.line_mut(row) {
+                line.clear_range(col, col.saturating_add(1));
+            }
+            if let Some(changed) = self.pending_primary_rows.get_mut(usize::from(row)) {
+                *changed = true;
+            }
+        }
+        if let Some(line) = self.primary.line_mut(anchor.row) {
+            *line = anchor.line.clone();
+        }
+        self.mark_dirty(anchor.row);
+        self.record_damage(DamageOperation::Full);
+        if owns_update {
+            let _ = self.finish_update();
+        }
+        true
+    }
+
     fn advance(&mut self, width: u8) {
         let width = u16::from(width);
         if self.cursor_col + width >= self.cols() {
@@ -1341,5 +1426,79 @@ mod tests {
 
         assert_eq!(screen.generation(), generation);
         assert_eq!(screen.damage_journal(), &journal);
+    }
+
+    #[test]
+    fn resize_keeps_a_right_edge_region_on_the_active_input_line() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(12, 3);
+        engine.feed(
+            &mut screen,
+            b"\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+
+        screen.resize(8, 3);
+
+        assert_eq!(screen.render_line(0).unwrap().text(), ">   XYZW");
+        assert_eq!(screen.render_line(1).unwrap().text(), "");
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn resize_repaint_reconciles_a_reflowed_right_edge_region() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(12, 3);
+        engine.feed(
+            &mut screen,
+            b"\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+        screen.resize(8, 3);
+        let anchor = screen.capture_resize_repaint_anchor().unwrap();
+
+        engine.feed(
+            &mut screen,
+            b"\x1b[H\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+        assert_eq!(screen.render_line(1).unwrap().text(), "XYZW");
+
+        assert!(screen.reconcile_resize_repaint(&anchor));
+        assert_eq!(screen.render_line(0).unwrap().text(), ">   XYZW");
+        assert_eq!(screen.render_line(1).unwrap().text(), "");
+        assert_eq!(screen.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn resize_preserves_normal_reflow_when_the_cursor_is_past_the_spacer() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(12, 3);
+        engine.feed(
+            &mut screen,
+            b"\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;10H",
+        );
+
+        screen.resize(8, 3);
+
+        assert_eq!(screen.render_line(0).unwrap().text(), ">");
+        assert_eq!(screen.render_line(1).unwrap().text(), "XYZW");
+    }
+
+    #[test]
+    fn resize_repaint_does_not_restore_over_changed_input() {
+        let mut engine = TerminalEngine::new();
+        let mut screen = Screen::new(12, 3);
+        engine.feed(
+            &mut screen,
+            b"\x1b[32m>       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+        screen.resize(8, 3);
+        let anchor = screen.capture_resize_repaint_anchor().unwrap();
+        engine.feed(
+            &mut screen,
+            b"\x1b[H\x1b[32m!       \x1b[48;5;4mXYZW\x1b[0m\x1b[1;2H",
+        );
+
+        assert!(!screen.reconcile_resize_repaint(&anchor));
+        assert_eq!(screen.render_line(0).unwrap().text(), "!");
+        assert_eq!(screen.render_line(1).unwrap().text(), "XYZW");
     }
 }

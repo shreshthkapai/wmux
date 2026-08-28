@@ -30,6 +30,14 @@ Primary-screen width changes use the lazy scrollback contract documented in
 resize transaction; only active viewport content and an unfinished logical
 line at its upper boundary are reflowed.
 
+An unwrapped active input line can contain two independently positioned
+regions: editable content at the left and a decorated region at the right
+edge, separated by a long run of spaces. When both regions fit at the new
+width, core preserves the left region and keeps the edge region right-aligned
+instead of treating the positioning gap as ordinary text to reflow. The rule
+is cursor-scoped and does not change reflow for completed output or wrapped
+application lines.
+
 Layout is resolved first and pane resize immediately returns when dimensions
 are unchanged. Pane geometry remains separate from PTY resize dispatch, and
 the explicit delta avoids an all-pane PTY resize pass.
@@ -63,6 +71,12 @@ forever. Releasing a hold marks the authoritative pane fully damaged, so every
 client independently transitions from its retained frame to the latest stable
 grid. Client-capable terminals wrap that transition in synchronized output.
 No intermediate application clear/blank frame is published.
+
+Windows pseudoconsoles may repaint their pre-resize buffer as ordinary VT
+output after a width change. At hold release, wmux reconciles a captured
+cursor-line edge region only when the cursor, left region, and complete edge
+region still match. This removes resize-induced wrapping without replacing
+unrelated output or guessing from a particular prompt glyph.
 
 The unsynchronized quiet interval is four milliseconds. A client sends its
 physical terminal size before its attach command, so the initial authoritative
