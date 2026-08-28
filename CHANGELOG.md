@@ -7,6 +7,14 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.16] - 2026-08-28
+
+### Fixed
+
+- Windows-native panes that enable private input mode 9001 now receive the
+  shifted digit row as its real virtual-key, scan-code, Unicode, and Shift
+  records instead of unsupported generic packet keys.
+
 ## [1.0.15] - 2026-08-28
 
 ### Changed
