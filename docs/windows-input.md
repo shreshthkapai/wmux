@@ -11,14 +11,19 @@ Windows console event reader
   -> ConPTY input
 ```
 
-`wmux-windows` uses crossterm's Windows event parser rather than maintaining a
-second hand-written `INPUT_RECORD` decoder. This preserves keyboard-layout and
-UTF-16 surrogate handling. Crossterm's native Win32 parser does not aggregate
-console paste records, so wmux converts native paste shortcuts into one
-`CF_UNICODETEXT` event. It supports `Ctrl+V` and `Ctrl+Shift+V`.
-Clipboard-open contention is retried briefly and never closes the attach
-client. Terminals that emit `Event::Paste` are accepted directly. Paste
-payloads never pass through the wmux prefix-key state machine.
+`wmux-windows` reads Unicode `INPUT_RECORD` values directly with
+`ReadConsoleInputW` and normalizes them before IPC. For printable keys, the
+record's translated `UnicodeChar` is authoritative; virtual-key codes are used
+for navigation, function keys, and control combinations that carry no printable
+character. This keeps keyboard-layout output intact, including the shifted
+digit row, IME-only text records, and UTF-16 surrogate pairs. The decoder also
+owns native mouse-button transitions and resize records, so the complete
+Windows client input boundary is deterministic and unit-testable.
+
+Native paste shortcuts become one `CF_UNICODETEXT` event. Wmux supports
+`Ctrl+V` and `Ctrl+Shift+V`; clipboard-open contention is retried briefly and
+never closes the attach client. Paste payloads never pass through the wmux
+prefix-key state machine.
 
 Printable punctuation retains both its semantic character and exact UTF-8
 application bytes. In particular, a plain leading `&` reaches the active pane
