@@ -7,6 +7,23 @@ All notable changes to wmux are documented in this file. The project follows
 
 No changes yet.
 
+## [1.0.15] - 2026-08-28
+
+### Changed
+
+- Attached clients acknowledge physically completed render transactions, while
+  the server keeps at most one frame in flight per client and continues
+  processing terminal output and user input against the latest scene.
+- Changed terminal rows are emitted as coherent row updates, reducing partial
+  visual states during rapidly updating full-screen applications.
+
+### Fixed
+
+- Windows native console input now preserves the complete shifted digit row,
+  including `!`, `@`, `#`, `$`, `%`, `^`, `&`, `*`, `(`, and `)`.
+- Closing or detaching after the final presented frame now exits cleanly instead
+  of reporting a presentation-channel failure.
+
 ## [1.0.14] - 2026-08-27
 
 ### Fixed
