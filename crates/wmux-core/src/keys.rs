@@ -501,9 +501,11 @@ impl KeyEvent {
 
     pub fn win32_input_bytes(&self) -> Option<Vec<u8>> {
         let modifiers = self.code.modifiers();
+        let mut inferred_shift = false;
         let (virtual_key, scan_code, unicode, enhanced) = match self.code.bare_key() {
             BareKey::Char(character) => {
-                let virtual_key = win32_character_virtual_key(character);
+                let (virtual_key, scan_code, shifted) = win32_character_key(character);
+                inferred_shift = shifted;
                 let unicode = if modifiers.contains(KeyModifiers::CONTROL) {
                     self.raw
                         .iter()
@@ -522,7 +524,7 @@ impl KeyEvent {
                     };
                     u16::try_from(character as u32).ok()?
                 };
-                (virtual_key, 0, unicode, false)
+                (virtual_key, scan_code, unicode, false)
             }
             BareKey::Space => (
                 0x20,
@@ -574,7 +576,7 @@ impl KeyEvent {
         if modifiers.contains(KeyModifiers::CONTROL) {
             control_state |= 0x0008;
         }
-        if modifiers.contains(KeyModifiers::SHIFT) {
+        if modifiers.contains(KeyModifiers::SHIFT) || inferred_shift {
             control_state |= 0x0010;
         }
         if enhanced {
@@ -602,26 +604,36 @@ impl KeyEvent {
     }
 }
 
-fn win32_character_virtual_key(character: char) -> u16 {
+fn win32_character_key(character: char) -> (u16, u16, bool) {
     if character.is_ascii_alphabetic() {
-        return character.to_ascii_uppercase() as u16;
+        return (character.to_ascii_uppercase() as u16, 0, false);
     }
     if character.is_ascii_digit() {
-        return character as u16;
+        return (character as u16, 0, false);
     }
     match character {
-        ';' | ':' => 0xba,
-        '=' | '+' => 0xbb,
-        ',' | '<' => 0xbc,
-        '-' | '_' => 0xbd,
-        '.' | '>' => 0xbe,
-        '/' | '?' => 0xbf,
-        '`' | '~' => 0xc0,
-        '[' | '{' => 0xdb,
-        '\\' | '|' => 0xdc,
-        ']' | '}' => 0xdd,
-        '\'' | '"' => 0xde,
-        _ => 0xe7,
+        '!' => (0x31, 0x02, true),
+        '@' => (0x32, 0x03, true),
+        '#' => (0x33, 0x04, true),
+        '$' => (0x34, 0x05, true),
+        '%' => (0x35, 0x06, true),
+        '^' => (0x36, 0x07, true),
+        '&' => (0x37, 0x08, true),
+        '*' => (0x38, 0x09, true),
+        '(' => (0x39, 0x0a, true),
+        ')' => (0x30, 0x0b, true),
+        ';' | ':' => (0xba, 0, false),
+        '=' | '+' => (0xbb, 0, false),
+        ',' | '<' => (0xbc, 0, false),
+        '-' | '_' => (0xbd, 0, false),
+        '.' | '>' => (0xbe, 0, false),
+        '/' | '?' => (0xbf, 0, false),
+        '`' | '~' => (0xc0, 0, false),
+        '[' | '{' => (0xdb, 0, false),
+        '\\' | '|' => (0xdc, 0, false),
+        ']' | '}' => (0xdd, 0, false),
+        '\'' | '"' => (0xde, 0, false),
+        _ => (0xe7, 0, false),
     }
 }
 
@@ -1247,6 +1259,39 @@ mod tests {
         assert_eq!(KeyCode::parse("F24").unwrap().to_string(), "F24");
         assert!(KeyCode::parse("F25").is_err());
         assert!(KeyCode::parse(&"x".repeat(MAX_KEY_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn win32_input_reconstructs_shifted_digit_row_after_binding_normalization() {
+        for (character, expected) in [
+            ('!', b"\x1b[49;2;33;1;16;1_\x1b[49;2;33;0;16;1_".as_slice()),
+            ('@', b"\x1b[50;3;64;1;16;1_\x1b[50;3;64;0;16;1_".as_slice()),
+            ('#', b"\x1b[51;4;35;1;16;1_\x1b[51;4;35;0;16;1_".as_slice()),
+            ('$', b"\x1b[52;5;36;1;16;1_\x1b[52;5;36;0;16;1_".as_slice()),
+            ('%', b"\x1b[53;6;37;1;16;1_\x1b[53;6;37;0;16;1_".as_slice()),
+            ('^', b"\x1b[54;7;94;1;16;1_\x1b[54;7;94;0;16;1_".as_slice()),
+            ('&', b"\x1b[55;8;38;1;16;1_\x1b[55;8;38;0;16;1_".as_slice()),
+            ('*', b"\x1b[56;9;42;1;16;1_\x1b[56;9;42;0;16;1_".as_slice()),
+            (
+                '(',
+                b"\x1b[57;10;40;1;16;1_\x1b[57;10;40;0;16;1_".as_slice(),
+            ),
+            (
+                ')',
+                b"\x1b[48;11;41;1;16;1_\x1b[48;11;41;0;16;1_".as_slice(),
+            ),
+        ] {
+            let event = KeyEvent::new(
+                KeyCode::character(character, KeyModifiers::NONE),
+                character.to_string().into_bytes(),
+            );
+
+            assert_eq!(
+                event.win32_input_bytes().as_deref(),
+                Some(expected),
+                "wrong Windows-native record for {character:?}"
+            );
+        }
     }
 
     #[test]
