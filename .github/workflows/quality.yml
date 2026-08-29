@@ -24,7 +24,7 @@ jobs:
     name: Quality and workspace tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -58,7 +58,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-15]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
       - name: Cache Cargo
@@ -91,7 +91,7 @@ jobs:
           - os: macos-15
             package: wmux-unix
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -150,7 +150,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-15]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
       - name: Cache Cargo
@@ -170,7 +170,7 @@ jobs:
     name: Sanitizer fuzz smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install pinned nightly Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -216,7 +216,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-15]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@1.96.0
       - name: Cache Cargo
