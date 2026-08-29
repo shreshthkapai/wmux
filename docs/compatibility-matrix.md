@@ -1,53 +1,48 @@
 # Compatibility Matrix
 
 This matrix records the evidence level for wmux's portable semantics and native
-platform integrations. A released feature is not assumed to have identical
-native mechanics on every operating system; each status describes what was
-actually executed.
+platform integrations. Consistent behavior does not require identical native
+mechanics on every operating system.
 
-Every status cell uses one of these terms:
+Status terms:
 
-- `verified`: executed successfully in the current local evidence run;
-- `CI-verified`: executed successfully by the repository-root workflow;
-- `compile-only`: cross-compiled successfully, without native execution;
-- `manual-pending`: runtime or interactive acceptance has not been executed;
-- `unsupported`: deliberately outside the current product contract.
+- `CI-verified`: executed successfully on a hosted runner for that OS;
+- `verified`: executed successfully in a documented local or manual check;
+- `manual-pending`: interactive host acceptance has not been recorded;
+- `not-run`: the check intentionally runs on another supported host.
 
-Configuring a CI job is not `CI-verified`. Until the new workflow completes on
-an actual macOS runner, macOS runtime rows remain `manual-pending` or
-`compile-only`.
+## Automated release evidence
 
-## Automated core evidence
+The [v1.0.17 quality run](https://github.com/shreshthkapai/wmux/actions/runs/33201827599)
+passed on the release commit.
 
 | Contract | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| Portable protocol conformance | `verified` | `verified` | `compile-only` |
-| Workspace and shared-runtime tests | `verified` | `verified` | `compile-only` |
-| Native transport authentication | `verified` | `verified` | `compile-only` |
-| Native PTY input, output, resize, and exit | `verified` | `verified` | `compile-only` |
-| Abrupt disconnect and authoritative reattach | `verified` | `verified` | `manual-pending` |
-| Native pane and descendant cleanup | `verified` | `verified` | `manual-pending` |
-| Endpoint cleanup and same-endpoint restart | `verified` | `verified` | `manual-pending` |
-| Exact terminal-mode save and restore tests | `verified` | `verified` | `compile-only` |
-| Deterministic stress gate | `verified` | `verified` | `manual-pending` |
-| Stable malformed-input corpus replay | `verified` | `verified` | `compile-only` |
-| Sanitizer-backed fuzz smoke | `manual-pending` | `verified` | `manual-pending` |
-| Full comparable release performance gate | `verified` | `manual-pending` | `manual-pending` |
-| Sequenced presentation and slow-sink convergence | `verified` | `manual-pending` | `manual-pending` |
-| Coherent row and final-cursor replay | `verified` | `manual-pending` | `manual-pending` |
-| Printable punctuation and ordered native mouse events | `verified` | `manual-pending` | `manual-pending` |
+| Portable protocol conformance | `CI-verified` | `CI-verified` | `CI-verified` |
+| Shared runtime tests | `CI-verified` | `CI-verified` | `CI-verified` |
+| Native transport authentication | `CI-verified` | `CI-verified` | `CI-verified` |
+| Native PTY input, output, resize, and exit | `CI-verified` | `CI-verified` | `CI-verified` |
+| Abrupt disconnect and authoritative reattach | `CI-verified` | `CI-verified` | `CI-verified` |
+| Native pane and descendant cleanup | `CI-verified` | `CI-verified` | `CI-verified` |
+| Endpoint cleanup and same-endpoint restart | `CI-verified` | `CI-verified` | `CI-verified` |
+| Terminal-mode save and restore | `CI-verified` | `CI-verified` | `CI-verified` |
+| Deterministic stress gate | `CI-verified` | `CI-verified` | `CI-verified` |
+| Malformed-input corpus replay | `CI-verified` | `CI-verified` | `CI-verified` |
+| Sanitizer-backed fuzz smoke | `not-run` | `CI-verified` | `not-run` |
+| Full release performance gate | `CI-verified` | `CI-verified` | `CI-verified` |
+| Sequenced presentation and slow-sink convergence | `CI-verified` | `CI-verified` | `CI-verified` |
+| Coherent row and final-cursor replay | `CI-verified` | `CI-verified` | `CI-verified` |
+| Printable punctuation and ordered native mouse events | `CI-verified` | `CI-verified` | `CI-verified` |
 
 Windows uses authenticated named pipes, SID identity, ConPTY, and Job Objects.
 Linux uses protected AF_UNIX sockets, `SO_PEERCRED`, PTYs, and process groups.
-macOS uses protected AF_UNIX sockets, `getpeereid`, PTYs, and process groups;
-both `x86_64-apple-darwin` and `aarch64-apple-darwin` compile, but that is not
-native runtime evidence.
+macOS uses protected AF_UNIX sockets, `getpeereid`, PTYs, and process groups.
 
 ## Interactive terminal acceptance
 
-Automated terminal guards prove exact saved-mode restoration on recoverable
-paths. They cannot identify or validate the enclosing terminal host, so these
-combinations remain explicit manual acceptance work.
+Automated terminal guards prove saved-mode restoration on recoverable paths.
+They do not identify or validate every enclosing terminal host and shell
+combination, so those combinations remain explicit manual acceptance work.
 
 | Windows host | PowerShell 7 | Windows PowerShell | cmd.exe |
 | --- | --- | --- | --- |
@@ -67,6 +62,6 @@ combinations remain explicit manual acceptance work.
 | iTerm2 | `manual-pending` | `manual-pending` |
 | VS Code integrated terminal | `manual-pending` | `manual-pending` |
 
-The historical Phase 8 commands and fingerprints remain in
-[beta-core-gate.md](beta-core-gate.md). See
-[known-differences.md](known-differences.md) for discrepancy classification.
+See [cross-os-conformance.md](cross-os-conformance.md) for the tested semantic
+contract and [known-differences.md](known-differences.md) for native-mechanism
+differences.

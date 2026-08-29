@@ -1376,7 +1376,7 @@ mod tests {
 
     #[test]
     fn replays_cmd_startup_without_prompt_gap() {
-        const PROMPT: &str = "C:\\Users\\shres\\mux\\wmux>";
+        const PROMPT: &str = "C:\\Users\\dev\\project>";
         let mut engine = TerminalEngine::new();
         let mut screen = Screen::new(80, 24);
 

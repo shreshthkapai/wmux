@@ -34,7 +34,8 @@ pub struct ExpectedDifference {
 }
 
 /// Semantic differences must be registered here instead of hidden in
-/// platform-conditional assertions. Phase 5 freezes an empty registry.
+/// platform-conditional assertions. The release contract keeps this registry
+/// empty unless a documented, observable difference is accepted.
 pub const EXPECTED_DIFFERENCES: &[ExpectedDifference] = &[];
 
 pub fn expected_difference(
@@ -1031,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_five_has_one_empty_centralized_difference_registry() {
+    fn release_contract_has_one_empty_centralized_difference_registry() {
         assert!(EXPECTED_DIFFERENCES.is_empty());
         for platform in [
             PlatformFamily::Windows,

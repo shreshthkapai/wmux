@@ -957,7 +957,7 @@ mod tests {
     use super::{run_suite, StressProfile};
 
     #[test]
-    fn stress_suite_covers_every_beta_core_scenario() {
+    fn stress_suite_covers_every_release_scenario() {
         let report = run_suite(StressProfile::Ci).expect("CI stress suite passes");
 
         assert_eq!(

@@ -268,32 +268,12 @@ Killing a pane/window/session/server must clean up child processes reliably.
 Every inherited handle must be intentional. Handle ownership must be explicit
 and idempotent.
 
-## Implementation Order
+## Change Discipline
 
-Follow the execution plan. Do not jump to UI polish before the persistent
-virtual terminal server exists.
-
-1. Workspace foundation and crate boundaries.
-2. Versioned IPC.
-3. Server runtime and serialized command queue.
-4. Windows ConPTY shell prototype.
-5. Internal screen/grid/parser.
-6. Renderer and redraw diffing.
-7. Sessions/windows/panes object model.
-8. Layouts and splits.
-9. Key tables and prefix.
-10. Command parser and target resolution.
-11. Options, formats, and status.
-12. Copy mode.
-13. Paste buffers and clipboard.
-14. Config, hooks, and notifications.
-15. Jobs and async shell commands.
-16. Control mode.
-17. Advanced modes and UI.
-18. Windows hardening and performance.
-19. Unix backend.
-20. Cross-OS consistency.
-21. Release polish.
+Preserve the dependency direction from platform mechanics through the
+server-owned terminal model to disposable client rendering. Product polish
+must not bypass persistent state, versioned IPC, command serialization, or
+the virtual terminal model.
 
 ## Testing Expectations
 

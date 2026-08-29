@@ -5,7 +5,12 @@ All notable changes to wmux are documented in this file. The project follows
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+- Removed internal development artifacts and obsolete prerelease terminology
+  from the public repository.
+- Refreshed cross-platform verification evidence, release documentation,
+  changelog links, and quality-workflow naming for the current v1 release.
 
 ## [1.0.17] - 2026-08-28
 
@@ -246,7 +251,20 @@ No changes yet.
   live server state migration is not implemented.
 - Windows ARM64 and package-manager repositories are not included in v1.0.0.
 
-[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/shreshthkapai/wmux/compare/v1.0.17...HEAD
+[1.0.17]: https://github.com/shreshthkapai/wmux/compare/v1.0.16...v1.0.17
+[1.0.16]: https://github.com/shreshthkapai/wmux/compare/v1.0.15...v1.0.16
+[1.0.15]: https://github.com/shreshthkapai/wmux/compare/v1.0.14...v1.0.15
+[1.0.14]: https://github.com/shreshthkapai/wmux/compare/v1.0.13...v1.0.14
+[1.0.13]: https://github.com/shreshthkapai/wmux/compare/v1.0.12...v1.0.13
+[1.0.12]: https://github.com/shreshthkapai/wmux/compare/v1.0.11...v1.0.12
+[1.0.11]: https://github.com/shreshthkapai/wmux/compare/v1.0.10...v1.0.11
+[1.0.10]: https://github.com/shreshthkapai/wmux/compare/v1.0.9...v1.0.10
+[1.0.9]: https://github.com/shreshthkapai/wmux/compare/v1.0.8...v1.0.9
+[1.0.8]: https://github.com/shreshthkapai/wmux/compare/v1.0.7...v1.0.8
+[1.0.7]: https://github.com/shreshthkapai/wmux/compare/v1.0.6...v1.0.7
+[1.0.6]: https://github.com/shreshthkapai/wmux/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/shreshthkapai/wmux/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/shreshthkapai/wmux/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/shreshthkapai/wmux/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/shreshthkapai/wmux/compare/v1.0.1...v1.0.2

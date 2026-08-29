@@ -1,6 +1,6 @@
 # Windows IPC and Daemon Lifecycle Model
 
-Phase 3 hardens wmux's Windows control plane without moving platform policy
+wmux hardens its Windows control plane without moving platform policy
 into the core. The server remains the sole state owner; this document defines
 how Windows discovers that server, authenticates clients, starts it outside a
 terminal tab's lifetime, and shuts it down without bypassing the owner loop.
@@ -107,7 +107,7 @@ exit marker.
 - Server exit closes the endpoint and lock only after control replies drain or
   the bounded shutdown deadline expires.
 
-## Phase 3 verification record
+## Verification record
 
 Native tests use unique instance suffixes and bounded waits. They verify the
 owner-only DACL and token SID comparison, first-pipe exclusion, stale and live
@@ -122,7 +122,7 @@ test timed out because the pseudoconsole remained owned after process exit, and
 the server coalescing test lost a concrete exit code when a generic indication
 arrived afterward. The fix closes the ConPTY endpoint on the first process exit,
 drains buffered output, prefers the concrete status, and drops the completed
-platform pane. Other Phase 3 race tests passed as characterization and did not
+platform pane. Other lifecycle race tests passed as characterization and did not
 trigger speculative implementation changes.
 
 ## Primary platform references

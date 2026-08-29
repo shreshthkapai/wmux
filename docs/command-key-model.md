@@ -1,6 +1,6 @@
 # Command, Target, and Key Model
 
-Phase 4 moves multiplexer policy into OS-neutral, server-owned core. Clients
+Multiplexer policy lives in OS-neutral, server-owned core. Clients
 normalize terminal input and retain its original bytes, but they do not parse
 commands, interpret the prefix, resolve targets, or mutate mux state. The
 serialized server owner remains the only state mutator.
@@ -23,8 +23,8 @@ line, and column information.
 Parsing is bounded to 1 MiB of input, 4,096 tokens, 256 commands, and 64 KiB
 per token. Diagnostics are bounded, and a list is validated atomically before
 anything enters the command queue. Environment/tilde expansion, formats,
-conditionals, and brace blocks remain intentionally deferred to their roadmap
-phases.
+conditionals, and brace blocks use their dedicated parsing and expansion
+subsystems rather than this command lexer.
 
 ## Targets
 
@@ -72,7 +72,8 @@ tolerating layout-dependent Windows console modifier reporting.
 ## Tables, routing, prompts, and confirmation
 
 The server owns sorted compact binding tables with binary-search lookup.
-Phase 4 provides `root`, `prefix`, and `copy-mode` tables, a `C-b` prefix, and
+The default model provides `root`, `prefix`, and `copy-mode` tables, a `C-b`
+prefix, and
 a 500 ms repeat window. The prefix table waits indefinitely for the next key;
 the repeat window applies only after a repeatable binding. `bind-key`,
 `unbind-key`, and `list-keys`
@@ -156,13 +157,13 @@ assert no panic, bounded diagnostics, and no partial state mutation. The
 parsed command; its checked-in corpus includes quoted chains and malformed
 escapes.
 
-The portable conformance suite now has 13 cases. Its command cases exercise
+The portable conformance suite includes command cases that exercise
 parsing, qualified target resolution, binding mutation, prefix and repeat
 routing, exact send-key bytes, session switching, client refresh, and both
-confirmation decisions. The accepted fingerprint is
-`00b763c726b9d162`.
+confirmation decisions. The accepted full-suite fingerprint is recorded in
+[cross-os-conformance.md](cross-os-conformance.md).
 
-The Phase 4 exit run executes formatting, clippy with warnings denied, all 274
+The release-quality run executes formatting, clippy with warnings denied,
 workspace tests, fuzz-target compilation and clippy, release conformance, the
-complete release performance gate, whitespace validation, native-import audit,
-and client-policy audit. The two source audits produce no matches.
+complete performance gate, whitespace validation, native-import audit, and
+client-policy audit.

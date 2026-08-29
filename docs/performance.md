@@ -312,7 +312,7 @@ from a 35.6 us median to 44.8 us; no resize code changed, and both remain far
 below the 5 ms gate. The full release performance gate and all correctness and
 conformance tests remain mandatory.
 
-## Phase 5 Platform Dispatch Gate
+## Platform Dispatch Gate
 
 The frozen `PtyBackend` seam is measured directly through a trait object. The
 full workload submits 10,000,000 deterministic resize requests, checks every
@@ -325,7 +325,7 @@ zero semantic violations. The enforced floor is 20,000,000 operations/second.
 This is adapter-dispatch evidence, not an end-to-end PTY throughput comparison;
 the existing parser, render, backlog, queue, and latency gates remain required.
 
-## Phase 6 Final Performance Gate
+## Unix Backend Performance Gate
 
 The final Windows release gate on 2026-08-22 passed every existing threshold
 without changing a workload or floor. Selected results from the uncontended
@@ -348,13 +348,13 @@ run were:
 | `platform-dispatch` | 148,047,914 operations/second |
 
 `platform-dispatch` completed its 10,000,000 semantic requests in 67.546 ms
-with zero measured allocations or violations. Phase 6 adds native Unix I/O
+with zero measured allocations or violations. Native Unix I/O remains
 behind that unchanged dispatch boundary; it does not move descriptors,
 readiness polling, or process mechanics into any measured shared hot path.
 
-## Phase 7 Final Performance Gate
+## Job and Control-Mode Performance Gate
 
-The Phase 7 Windows full release gate on 2026-08-22 passed every existing
+The job and control-mode Windows release gate on 2026-08-22 passed every existing
 threshold without changing a workload or floor. Selected results were:
 
 | Scenario | Result |
@@ -377,12 +377,12 @@ threshold without changing a workload or floor. Selected results were:
 zero measured allocations or violations. Protocol-v7 control output retains
 the pane-output allocation through encoding and slices emitted records to 64
 KiB, while the server reserves reply capacity inside its existing bounded
-per-client queue. Phase 7 shell jobs execute outside the state-owner loop and
+per-client queue. Shell jobs execute outside the state-owner loop and
 return bounded chunks through the unchanged semantic platform dispatch seam.
 
-## Phase 8 Beta-Core Performance Gate
+## Release Stress Performance Gate
 
-The Phase 8 Windows full release gate on 2026-08-22 passed every existing
+The release stress performance gate on 2026-08-22 passed every existing
 threshold without changing a workload or floor. Selected results were:
 
 | Scenario | Result |
@@ -408,9 +408,9 @@ threshold without changing a workload or floor. Selected results were:
 The detached-output workload ended with queue depth zero and 1.53 MiB peak
 live memory; eight-client rendering peaked at 1.43 MiB with queue depth eight.
 The stress gate separately verifies correctness and bounds under 32 panes, 32
-clients, a stalled client, 100,000 history lines, and a 16 MiB paste. Exact
-Phase 8 commands and fingerprints are recorded in
-[beta-core-gate.md](beta-core-gate.md).
+clients, a stalled client, 100,000 history lines, and a 16 MiB paste. The
+deterministic stress scenarios and commands are documented by the `wmux-stress`
+harness and [performance-gates.md](performance-gates.md).
 
 ## Physical Presentation And Coherent-Row Gate
 

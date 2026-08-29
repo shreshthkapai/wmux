@@ -47,7 +47,8 @@ directory. Restart the shell if `wmux` is not immediately on `PATH`.
 | macOS | Intel | `x86_64-apple-darwin` |
 | macOS | Apple Silicon | `aarch64-apple-darwin` |
 
-Windows ARM64 and package-manager repositories are not part of v1.0.0.
+Windows ARM64 builds and package-manager repositories are not currently
+provided.
 
 ## Quick start
 

@@ -16,3 +16,8 @@ wmux*.lock
 
 # Local isolated worktrees.
 /.worktrees/
+
+# Personal agent state and local wmux configuration.
+/.agents/
+/.codex/
+/config.wmux

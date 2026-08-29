@@ -15,7 +15,7 @@ body:
     attributes:
       label: wmux version
       description: Paste the complete output of `wmux --version`.
-      placeholder: wmux 1.0.0
+      placeholder: wmux 1.0.17
     validations:
       required: true
   - type: dropdown

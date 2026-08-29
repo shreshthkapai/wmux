@@ -1193,7 +1193,7 @@ fn multiple_clients_workload(config: WorkloadConfig, suite: Suite) -> Report {
     )
 }
 
-fn phase_4_iterations(suite: Suite) -> (u64, u64, usize, u64) {
+fn command_hot_path_iterations(suite: Suite) -> (u64, u64, usize, u64) {
     match suite {
         Suite::Smoke => (100_000, 50_000, 50_000, 10_000),
         Suite::Full => (10_000_000, 5_000_000, 1_000_000, 250_000),
@@ -1201,7 +1201,7 @@ fn phase_4_iterations(suite: Suite) -> (u64, u64, usize, u64) {
 }
 
 fn key_unbound_workload(suite: Suite) -> Report {
-    let (routes, _, _, _) = phase_4_iterations(suite);
+    let (routes, _, _, _) = command_hot_path_iterations(suite);
     let mut state = ServerState::new();
     let client = state.add_client();
     let key = KeyCode::character('q', KeyModifiers::NONE);
@@ -1239,7 +1239,7 @@ fn key_unbound_workload(suite: Suite) -> Report {
 }
 
 fn key_prefix_binding_workload(suite: Suite) -> Report {
-    let (_, pairs, _, _) = phase_4_iterations(suite);
+    let (_, pairs, _, _) = command_hot_path_iterations(suite);
     let mut state = ServerState::new();
     let client = state.add_client();
     let prefix = KeyCode::ctrl('b');
@@ -1293,7 +1293,7 @@ fn key_prefix_binding_workload(suite: Suite) -> Report {
 
 fn command_queue_workload(suite: Suite) -> Report {
     const CLIENTS: usize = 8;
-    let (_, _, commands, _) = phase_4_iterations(suite);
+    let (_, _, commands, _) = command_hot_path_iterations(suite);
     let mut queue = CommandQueue::default();
     for client_index in 0..CLIENTS {
         let mut remaining = commands / CLIENTS + usize::from(client_index < commands % CLIENTS);
@@ -1343,7 +1343,7 @@ fn command_queue_workload(suite: Suite) -> Report {
 }
 
 fn command_text_workload(suite: Suite) -> Report {
-    let (_, _, _, lists) = phase_4_iterations(suite);
+    let (_, _, _, lists) = command_hot_path_iterations(suite);
     let fixture = "list-sessions; select-window -t +1; send-keys -l x; refresh-client".to_string();
     let input_bytes = fixture.len() as u64 * lists;
     measure("command-text", suite, input_bytes, lists, move || {
@@ -1921,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_4_hot_path_workloads_are_required() {
+    fn command_hot_path_workloads_are_required() {
         for required in [
             "key-unbound",
             "key-prefix-binding",

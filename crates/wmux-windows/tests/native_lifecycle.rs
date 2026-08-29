@@ -20,7 +20,7 @@ use wmux_windows::platform::{WindowsClientTransport, WindowsServerPlatform};
 
 #[test]
 fn native_lifecycle_endpoints_are_explicitly_isolated() {
-    let instance = format!("phase8-native-{}", std::process::id());
+    let instance = format!("release-native-{}", std::process::id());
     let other_instance = format!("{instance}-other");
 
     let _server = WindowsServerPlatform::for_instance(&instance)
@@ -42,7 +42,7 @@ async fn real_windows_lifecycle_survives_client_loss_and_cleans_process_trees() 
         .duration_since(UNIX_EPOCH)
         .expect("test clock is after Unix epoch")
         .as_nanos();
-    let instance = format!("phase8-native-{}-{nonce}", std::process::id());
+    let instance = format!("release-native-{}-{nonce}", std::process::id());
     run_lifecycle(&instance).await;
     run_restart(&instance).await;
 }

@@ -1,6 +1,6 @@
 # Frozen Platform Contract
 
-Phase 5 freezes the OS boundary used by the persistent server and disposable
+This document freezes the OS boundary used by the persistent server and disposable
 clients. Shared multiplexer behavior lives in `wmux-core`, `wmux-server`, and
 `wmux-client`; native mechanisms live behind four modules in `wmux-platform`:
 
@@ -108,14 +108,15 @@ create -> attach -> type -> split -> resize -> detach
 ```
 
 The deterministic portable suite has a `platform-lifecycle` case and one
-central `EXPECTED_DIFFERENCES` registry. The registry remains empty in Phase 6.
+central `EXPECTED_DIFFERENCES` registry. The registry remains empty.
 Platform-specific assertions may test mechanics, but shared semantic exceptions
 must be registered with the affected platform, observable contract, rationale,
 and evidence issue.
 
 ## Non-interactive shell jobs
 
-Phase 7 adds a distinct job backend for `run-shell`, `if-shell`, hooks, and
+The platform contract includes a distinct job backend for `run-shell`,
+`if-shell`, hooks, and
 later format expansion. `PlatformJobId` is an opaque wmux token, never a PID or
 native handle. A spawn supplies a shell command, optional working directory,
 and explicit environment changes. Adapters combine output into bounded chunks,
@@ -136,7 +137,7 @@ this document, and the aggregate fingerprint. No shared crate may import
 Windows or Unix APIs, native crates, handles, descriptors, SIDs, UIDs, signals,
 or runtime-specific native objects.
 
-## Phase 5 verification evidence
+## Platform-boundary verification evidence
 
 The final Windows verification on 2026-08-21 produced:
 
@@ -157,7 +158,7 @@ Extra in-scope work was limited to making benchmark allocation measurement
 per-thread and refreshing the fuzz lockfile after `wmux-platform` gained its
 OS-neutral Tokio stream dependency.
 
-## Phase 6 verification evidence
+## Unix-backend verification evidence
 
 The final local verification on 2026-08-22 produced:
 
@@ -180,16 +181,16 @@ The final local verification on 2026-08-22 produced:
   `platform-dispatch` completing 10,000,000 operations in 67.546 ms at
   148,047,914 operations/second with zero allocations and zero violations.
 
-The Linux/macOS `native-unix` CI matrix is configured, but no remote runner was
-available during this local pass. Native macOS execution therefore remains
-CI-gated rather than reported as verified.
+The later v1.0.17 hosted quality run executed the portable, native lifecycle,
+stress, and performance jobs successfully on Linux and macOS. Current evidence
+levels are recorded in [compatibility-matrix.md](compatibility-matrix.md).
 
 Narrow extra work was limited to entering the configured Tokio runtime when a
 state-owner thread registers a PTY and marking both freshly allocated PTY
 descriptors close-on-exec. This prevents concurrent child launches from holding
 another pane's PTY open past process-group termination.
 
-## Phase 7 verification evidence
+## Job and control-mode verification evidence
 
 The final local verification on 2026-08-22 produced:
 
@@ -215,9 +216,9 @@ combined bounded output, group termination, and the same descriptor sanitation
 as pane and daemon children. Shared job IDs, limits, command suspension,
 capture, hooks, and control records remain OS-neutral.
 
-## Phase 8 verification evidence
+## Release stress verification evidence
 
-The Phase 8 local gate on 2026-08-22 produced:
+The release stress gate on 2026-08-22 produced:
 
 - 350 Windows and 354 Linux workspace tests with strict workspace clippy;
 - identical 16-case portable aggregate `d5670ad858ef5735` twice on both hosts;
@@ -239,9 +240,8 @@ focused regression protects the ordering contract. Client error cleanup and
 the Windows crate's cross-target gate were also tightened. These changes do
 not move native state into shared crates or alter the frozen platform API.
 
-Actual native macOS execution remains pending. The authoritative evidence and
-status vocabulary are recorded in [beta-core-gate.md](beta-core-gate.md),
-[compatibility-matrix.md](compatibility-matrix.md), and
+Current native macOS execution evidence and status vocabulary are recorded in
+[compatibility-matrix.md](compatibility-matrix.md) and
 [known-differences.md](known-differences.md).
 
 On Unix, a socket path that remains after its listener exits is semantically an

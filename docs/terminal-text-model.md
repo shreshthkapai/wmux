@@ -72,13 +72,13 @@ Titles are capped at 512 UTF-8 bytes without splitting a scalar.
 DCS/SOS/PM/APC payloads remain discard-only. Malformed or oversized input must
 return to printable ground state without panic.
 
-The Phase 2 gate runs focused Unicode tests, the complete workspace suite,
+The terminal-text gate runs focused Unicode tests, the complete workspace suite,
 deterministic cross-OS conformance, protocol/terminal fuzz-target compilation,
 and the unchanged release performance thresholds. Sanitizer-backed cargo-fuzz
 execution uses nightly Rust on a supported Unix-like host because cargo-fuzz
 does not support Windows.
 
-## Phase 2 Verification Evidence
+## Initial Verification Evidence
 
 Verified on Windows on 2026-08-20 with Rust 1.96.0. The relevant locked
 dependencies are `unicode-segmentation` 1.13.3, `unicode-width` 0.2.2, `vte`
